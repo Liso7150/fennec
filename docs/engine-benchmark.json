@@ -1,0 +1,2357 @@
+{
+  "measured_at": "2026-11-12",
+  "model": "Qwen3.6-35B-A3B (qwen3_5_moe, 40 layers, 256 experts top-8)",
+  "host": {
+    "cpu": "Intel Core Ultra 7 155H, 16 cores / 22 logical",
+    "ram_gb": 31.5,
+    "dgpu": "NVIDIA GeForce RTX 4060 Laptop, 8 GiB",
+    "igpu": "Intel Arc Graphics (shared)",
+    "npu": "Intel AI Boost",
+    "os": "Windows 11 26300"
+  },
+  "note": "Decode throughput and end-to-end latency on the same checkpoint. Every engine ran on this one machine; threads capped at 8 for Fennec so the host stayed usable. rabbit is CPU-only by design. Colibri CPU is listed because it is the honest floor Fennec's device tier has to beat. Fennec's rows are the shipped int4 checkpoint, and each quotes the MEDIAN run of its repeats (5 CUDA, 3 Vulkan, 1 CPU) with the observed spread alongside; every column of a row comes from that one log. Fennec is not the fastest engine here: Colibri's Vulkan tier still leads on throughput, TTFT and total latency, by 1.71x at Fennec's median. Fennec's CUDA tier is now level with fox (11.71 against 12.00 tok/s, and ahead of it on TTFT by 13.5x and on total latency by 4.0x) and loads 2.5x faster than Colibri. IMPORTANT: every Fennec number published before 2026-11-12's decode-fidelity fix was measured on a wrong greedy continuation and is retracted — see fennec_decode_fidelity. The corrected device hit rate is 30.1%, not 39.3%.",
+  "latency_note": "total_latency_ms = ttft_ms + tpot_ms * output_tokens, normalised to 32 output tokens for every engine so the comparison is like for like. Fennec's ttft_ms and tpot_ms are measured directly: the prompt is walked one position at a time, the step at index prompt_len-1 emits the first output token, TTFT is the sum up to and including it, and TPOT is the mean of the steps after it. Fennec's own wall_ms equals its total_latency_ms because it generated exactly 32 tokens. For the other engines tpot_ms is derived, not instrumented, and the basis is recorded per row: where a run reports both a completion-token count and a TTFT, TPOT is (tokens/tok_s - ttft)/(tokens-1); where it does not, TPOT falls back to 1000/tok_s, which amortises prefill across every token and therefore overstates the true decode-only cost. Derived values are marked and should be read as approximate.",
+  "engines": [
+    {
+      "name": "Colibri (Vulkan)",
+      "repo": "JustVugg/colibri",
+      "lang": "Python + Vulkan",
+      "tok_s": 20.06,
+      "ttft_ms": 470.0,
+      "tpot_ms": 43.18,
+      "output_tokens": 32,
+      "total_latency_ms": 1851.8,
+      "tpot_basis": "derived: (64/20.06 - 0.47)/63, from a run reporting 64 completion tokens and TTFT 0.47 s",
+      "load_s": 29.7,
+      "device_hit_pct": 58.5,
+      "tier": "CPU + GPU",
+      "evidence": "benchmarks/results-engine-devices.json, median of 2 runs of 64 tokens"
+    },
+    {
+      "name": "fox (Vulkan)",
+      "repo": "ferrumox/fox",
+      "lang": "Rust + llama.cpp",
+      "tok_s": 12.0,
+      "ttft_ms": 11414.0,
+      "tpot_ms": 83.33,
+      "output_tokens": 32,
+      "total_latency_ms": 14080.6,
+      "tpot_basis": "derived: 1000/12.0, full-run average. The recorded TTFT (11.414 s) exceeds the 8.45 s generation span, so the two came from different measurements and no decode-only split can be recovered.",
+      "load_s": 2.47,
+      "device_hit_pct": null,
+      "tier": "CPU + GPU",
+      "evidence": "engine-bench/bench_fox_vulkan2.log:1844, 101 tokens in 8.45 s, Q4_K_M GGUF, --moe-cpu"
+    },
+    {
+      "name": "Fennec 2.5.0 (CUDA)",
+      "repo": "Liso7150/fennec",
+      "lang": "Rust",
+      "tok_s": 11.71,
+      "tok_s_range": [
+        10.79,
+        12.16
+      ],
+      "n_runs": 5,
+      "ttft_ms": 842.824,
+      "ttft_ms_range": [
+        842.824,
+        857.027
+      ],
+      "tpot_ms": 82.369,
+      "tpot_ms_range": [
+        77.695,
+        90.998
+      ],
+      "output_tokens": 32,
+      "total_latency_ms": 3478.617,
+      "total_latency_ms_range": [
+        3343.265,
+        3765.797
+      ],
+      "tpot_basis": "measured directly, decode-only mean over the 32 steps after the prompt",
+      "load_s": 11.8,
+      "load_s_range": [
+        11.4,
+        11.9
+      ],
+      "device_hit_pct": 30.1,
+      "tier": "CPU + GPU",
+      "evidence": "engine-bench/logs/rep-cuda3.log, the median of 5 runs (rev-bench-cuda.log, rev-bench-cuda2.log, rep-cuda3.log, rep-cuda4.log, rep-cuda5.log). Shipped default, no tuning flags: budget read off the card (7.77 GiB usable), lm_head uploaded before the expert pool, host experts borrowed zero-copy from the mapping. 40 greedy tokens over all 40 layers, 8 threads: 77.5 ms stack + 7.9 ms lm_head; 3855 device / 8945 host routed picks, 33460 dispatches in 3640 submits, CPU overlapped 1465.0 ms, wall 3478.6 ms. Driver API + hand-written PTX, no CUDA toolkit, no MSVC. Every run reported dev_hits 3855 exactly."
+    },
+    {
+      "name": "Fennec 2.5.0 (Vulkan)",
+      "repo": "Liso7150/fennec",
+      "lang": "Rust",
+      "tok_s": 10.61,
+      "tok_s_range": [
+        10.54,
+        11.23
+      ],
+      "n_runs": 3,
+      "ttft_ms": 1005.16,
+      "ttft_ms_range": [
+        862.062,
+        1005.16
+      ],
+      "tpot_ms": 88.499,
+      "tpot_ms_range": [
+        86.09,
+        91.451
+      ],
+      "output_tokens": 32,
+      "total_latency_ms": 3837.133,
+      "total_latency_ms_range": [
+        3616.932,
+        3854.622
+      ],
+      "tpot_basis": "measured directly, decode-only mean over the 32 steps after the prompt",
+      "load_s": 15.4,
+      "load_s_range": [
+        14.5,
+        15.4
+      ],
+      "device_hit_pct": 30.1,
+      "tier": "CPU + GPU",
+      "evidence": "engine-bench/logs/rep-vk3.log, the median of 3 runs (rev-bench-vulkan.log, rep-vk2.log, rep-vk3.log). Shipped default, no tuning flags: budget read off the card (7.77 GiB usable), lm_head uploaded before the expert pool, host experts borrowed zero-copy from the mapping. 40 greedy tokens over all 40 layers, 8 threads: 84.2 ms stack + 10.1 ms lm_head; 3855 device / 8945 host routed picks, 33460 dispatches in 3700 submits, CPU overlapped 1651.5 ms, wall 3837.1 ms. Every run reported dev_hits 3855 exactly."
+    },
+    {
+      "name": "Colibri (CPU)",
+      "repo": "JustVugg/colibri",
+      "lang": "Python",
+      "tok_s": 3.93,
+      "ttft_ms": 3800.0,
+      "tpot_ms": 198.17,
+      "output_tokens": 32,
+      "total_latency_ms": 10141.4,
+      "tpot_basis": "derived: (64/3.93 - 3.8)/63, from a run reporting 64 completion tokens and TTFT 3.8 s",
+      "load_s": 10.0,
+      "device_hit_pct": 0.0,
+      "tier": "CPU only",
+      "evidence": "benchmarks/results-engine-devices.json, COLI_VULKAN unset"
+    },
+    {
+      "name": "Fennec 2.5.0 (CPU)",
+      "repo": "Liso7150/fennec",
+      "lang": "Rust",
+      "tok_s": 3.0,
+      "n_runs": 1,
+      "ttft_ms": 2947.9796,
+      "tpot_ms": 329.4997,
+      "output_tokens": 32,
+      "total_latency_ms": 13491.9709,
+      "tpot_basis": "measured directly, decode-only mean over the 32 steps after the prompt",
+      "load_s": 5.4,
+      "device_hit_pct": 0.0,
+      "tier": "CPU only",
+      "evidence": "engine-bench/logs/rev-bench-cpu.log, 40 greedy tokens over all 40 layers, 8 threads, --cpu: 189.5 ms stack + 143.3 ms lm_head, 16.88 GiB FQ4 host pool borrowed from the mapping, wall 13491.97 ms. One run: the CPU tier has no device to contend with and its spread is dominated by the same host-expert kernel the GPU rows use."
+    },
+    {
+      "name": "rabbit (CPU)",
+      "repo": "ferrumox/rabbit",
+      "lang": "Rust",
+      "tok_s": 0.71,
+      "ttft_ms": null,
+      "tpot_ms": 1408.45,
+      "output_tokens": 32,
+      "total_latency_ms": null,
+      "tpot_basis": "derived: 1000/0.71, full-run average. No TTFT was recorded, so total latency cannot be computed.",
+      "load_s": 6.4,
+      "device_hit_pct": 0.0,
+      "tier": "CPU only",
+      "evidence": "engine-bench/logs/rabbit-run2-warm.log, 128 tokens in 186.2 s, 16 threads, warm"
+    }
+  ],
+  "fennec_variants": [
+    {
+      "checkpoint": "qwen36-35b (int4 container, group 64)",
+      "backend": "vulkan",
+      "tier": "CPU + GPU",
+      "tok_s": 10.61,
+      "tok_s_range": [
+        10.54,
+        11.23
+      ],
+      "n_runs": 3,
+      "load_s": 15.4,
+      "device_hit_pct": 30.1,
+      "host_gib": 13.08,
+      "device_experts": 2304,
+      "stack_ms": 84.155,
+      "head_ms": 10.091,
+      "cpu_overlap_ms": 1651.472,
+      "ttft_ms": 1005.16,
+      "tpot_ms": 88.499,
+      "total_latency_ms": 3837.133,
+      "device_gib": 7.77,
+      "dispatches": 33460,
+      "submits": 3700,
+      "evidence": "engine-bench/logs/rep-vk3.log, median of 3. Shipped default: no --device flag, budget read off the card, lm_head uploaded first, host experts borrowed zero-copy from the mapping (40/40 layers)."
+    },
+    {
+      "checkpoint": "qwen36-35b (int4 container, group 64)",
+      "backend": "cuda",
+      "tier": "CPU + GPU",
+      "tok_s": 11.71,
+      "tok_s_range": [
+        10.79,
+        12.16
+      ],
+      "n_runs": 5,
+      "load_s": 11.8,
+      "device_hit_pct": 30.1,
+      "host_gib": 13.08,
+      "device_experts": 2304,
+      "stack_ms": 77.485,
+      "head_ms": 7.926,
+      "cpu_overlap_ms": 1464.959,
+      "ttft_ms": 842.824,
+      "tpot_ms": 82.369,
+      "total_latency_ms": 3478.617,
+      "device_gib": 7.77,
+      "dispatches": 33460,
+      "submits": 3640,
+      "evidence": "engine-bench/logs/rep-cuda3.log, median of 5. Shipped default: no --device flag, budget read off the card, lm_head uploaded first, host experts borrowed zero-copy from the mapping (40/40 layers)."
+    },
+    {
+      "checkpoint": "qwen36-35b (int4 container, group 64)",
+      "backend": "cpu",
+      "tier": "CPU only",
+      "tok_s": 3.0,
+      "n_runs": 1,
+      "load_s": 5.4,
+      "device_hit_pct": 0.0,
+      "host_gib": 16.88,
+      "device_experts": 0,
+      "stack_ms": 189.55,
+      "head_ms": 143.347,
+      "cpu_overlap_ms": 0.0,
+      "ttft_ms": 2947.9796,
+      "tpot_ms": 329.4997,
+      "total_latency_ms": 13491.9709,
+      "evidence": "engine-bench/logs/rev-bench-cpu.log"
+    },
+    {
+      "checkpoint": "Qwen3.6-35B-A3B-bf16 + FQ4 sidecar (group 32)",
+      "backend": "vulkan",
+      "tier": "CPU + GPU",
+      "tok_s": 4.93,
+      "load_s": 98.8,
+      "device_hit_pct": 23.6,
+      "host_gib": 14.49,
+      "device_experts": 2327,
+      "stack_ms": 187.7,
+      "head_ms": 15.0,
+      "cpu_overlap_ms": 3518.0,
+      "evidence": "engine-bench/logs/bench-bf16-gpu.log, measured before the group-64 CPU kernel fix AND before fennec_decode_fidelity. Historical only: not comparable to the rows above and not re-run.",
+      "status": "historical, retracted basis"
+    }
+  ],
+  "fennec_current_runs": [
+    {
+      "backend": "cuda",
+      "log": "engine-bench/logs/rev-bench-cuda.log",
+      "tok_s": 10.7896,
+      "ms_per_token": 92.682,
+      "stack_ms": 87.679,
+      "head_ms": 5.003,
+      "ttft_ms": 853.8607,
+      "tpot_ms": 90.998,
+      "total_latency_ms": 3765.7968,
+      "load_s": 11.9,
+      "dev_hits": 3855,
+      "host_hits": 8945,
+      "cpu_overlap_ms": 1787.7377,
+      "submits": 3640,
+      "device_sync_ms": 1069.9363,
+      "fence_ms_per_token": 26.7,
+      "plan_optimism_pct": 195.3
+    },
+    {
+      "backend": "cuda",
+      "log": "engine-bench/logs/rev-bench-cuda2.log",
+      "tok_s": 12.1636,
+      "ms_per_token": 82.212,
+      "stack_ms": 75.821,
+      "head_ms": 6.391,
+      "ttft_ms": 857.0269,
+      "tpot_ms": 77.695,
+      "total_latency_ms": 3343.265,
+      "load_s": 11.4,
+      "dev_hits": 3855,
+      "host_hits": 8945,
+      "cpu_overlap_ms": 1477.1951,
+      "submits": 3640,
+      "device_sync_ms": 1056.8745,
+      "fence_ms_per_token": 26.4,
+      "plan_optimism_pct": 162.0
+    },
+    {
+      "backend": "cuda",
+      "log": "engine-bench/logs/rep-cuda3.log",
+      "tok_s": 11.7081,
+      "ms_per_token": 85.411,
+      "stack_ms": 77.485,
+      "head_ms": 7.926,
+      "ttft_ms": 842.824,
+      "tpot_ms": 82.369,
+      "total_latency_ms": 3478.617,
+      "load_s": 11.8,
+      "dev_hits": 3855,
+      "host_hits": 8945,
+      "cpu_overlap_ms": 1464.959,
+      "submits": 3640,
+      "device_sync_ms": 1189.7,
+      "fence_ms_per_token": 29.7,
+      "plan_optimism_pct": 172.2,
+      "median_run": true
+    },
+    {
+      "backend": "cuda",
+      "log": "engine-bench/logs/rep-cuda4.log",
+      "tok_s": 11.8493,
+      "ms_per_token": 84.393,
+      "stack_ms": 76.725,
+      "head_ms": 7.668,
+      "ttft_ms": 846.35,
+      "tpot_ms": 80.746,
+      "total_latency_ms": 3430.22,
+      "load_s": 11.6,
+      "dev_hits": 3855,
+      "host_hits": 8945,
+      "cpu_overlap_ms": 1492.058,
+      "submits": 3640
+    },
+    {
+      "backend": "cuda",
+      "log": "engine-bench/logs/rep-cuda5.log",
+      "tok_s": 11.4455,
+      "ms_per_token": 87.371,
+      "stack_ms": 79.651,
+      "head_ms": 7.719,
+      "ttft_ms": 849.254,
+      "tpot_ms": 84.876,
+      "total_latency_ms": 3565.28,
+      "load_s": 11.6,
+      "dev_hits": 3855,
+      "host_hits": 8945,
+      "cpu_overlap_ms": 1572.7,
+      "submits": 3640
+    },
+    {
+      "backend": "vulkan",
+      "log": "engine-bench/logs/rev-bench-vulkan.log",
+      "tok_s": 10.5434,
+      "ms_per_token": 94.846,
+      "stack_ms": 84.708,
+      "head_ms": 10.138,
+      "ttft_ms": 928.204,
+      "tpot_ms": 91.4506,
+      "total_latency_ms": 3854.6218,
+      "load_s": 14.5,
+      "dev_hits": 3855,
+      "host_hits": 8945,
+      "cpu_overlap_ms": 1743.547,
+      "submits": 3700,
+      "device_sync_ms": 1272.883,
+      "fence_ms_per_token": 31.8,
+      "plan_optimism_pct": 202.2
+    },
+    {
+      "backend": "vulkan",
+      "log": "engine-bench/logs/rep-vk2.log",
+      "tok_s": 11.2256,
+      "ms_per_token": 89.082,
+      "stack_ms": 81.068,
+      "head_ms": 8.014,
+      "ttft_ms": 862.062,
+      "tpot_ms": 86.09,
+      "total_latency_ms": 3616.932,
+      "load_s": 15.4,
+      "dev_hits": 3855,
+      "host_hits": 8945,
+      "cpu_overlap_ms": 1548.134,
+      "submits": 3700
+    },
+    {
+      "backend": "vulkan",
+      "log": "engine-bench/logs/rep-vk3.log",
+      "tok_s": 10.6105,
+      "ms_per_token": 94.246,
+      "stack_ms": 84.155,
+      "head_ms": 10.091,
+      "ttft_ms": 1005.16,
+      "tpot_ms": 88.499,
+      "total_latency_ms": 3837.133,
+      "load_s": 15.4,
+      "dev_hits": 3855,
+      "host_hits": 8945,
+      "cpu_overlap_ms": 1651.472,
+      "submits": 3700,
+      "device_sync_ms": 1292.5,
+      "fence_ms_per_token": 32.3,
+      "plan_optimism_pct": 200.3,
+      "median_run": true
+    },
+    {
+      "backend": "cpu",
+      "log": "engine-bench/logs/rev-bench-cpu.log",
+      "tok_s": 3.0039,
+      "ms_per_token": 332.896,
+      "stack_ms": 189.55,
+      "head_ms": 143.347,
+      "ttft_ms": 2947.9796,
+      "tpot_ms": 329.4997,
+      "total_latency_ms": 13491.9709,
+      "load_s": 5.4,
+      "dev_hits": 0,
+      "host_hits": 12800,
+      "cpu_overlap_ms": 0.0,
+      "submits": 0,
+      "plan_optimism_pct": -22.6
+    }
+  ],
+  "fennec_current_runs_note": "Nine runs of one build, one checkpoint, 8 threads, 40 layers, 8 prompt tokens, 32 output tokens, no tuning flags. Each GPU run was preceded by a full-length (--tokens 32) warm-up: an 8-token warm-up is not enough after the bf16 golden suite evicts the page cache, and gave a spurious 107.42 ms TPOT with 58.47 ms of host experts. dev_hits is 3855 in all eight GPU runs, which is the proof that the corrected greedy sequence is deterministic and the spread is machine noise, not routing. The noise lives in `moe host experts` (36.63-44.70 ms) and `mixer host` (2.34-5.50 ms); `mixer device` is comparatively steady (23.79-27.60 ms). tok_s here is the full-run average over all 40 steps (1000/ms_per_token), which is the basis the competitor rows use; tpot_ms is decode-only and is the lower number.",
+  "fennec_stage_profile": {
+    "basis": "FENNEC_PROFILE=1, ms/token, WALL time. Every timer wraps its parallel region from the outside, so the nine stages legitimately sum to the stack; they are not CPU time and must not be divided by the thread count.",
+    "cuda_median_run": {
+      "route": 4.31,
+      "moe_submit": 4.99,
+      "moe_host_experts": 36.63,
+      "moe_device_wait": 3.32,
+      "moe_shared_reduce": 0.15,
+      "mixer_device": 23.79,
+      "mixer_host": 5.44,
+      "rmsnorm": 0.17,
+      "residual": 0.05,
+      "accounted": 78.85,
+      "stack": 79.09,
+      "unaccounted": 0.24,
+      "evidence": "engine-bench/logs/rep-cuda3.log"
+    },
+    "vulkan_median_run": {
+      "route": 4.61,
+      "moe_submit": 3.8,
+      "moe_host_experts": 41.29,
+      "moe_device_wait": 5.33,
+      "moe_shared_reduce": 0.14,
+      "mixer_device": 26.98,
+      "mixer_host": 3.13,
+      "rmsnorm": 0.2,
+      "residual": 0.04,
+      "accounted": 85.51,
+      "stack": 85.85,
+      "unaccounted": 0.34,
+      "evidence": "engine-bench/logs/rep-vk3.log"
+    },
+    "cpu_run": {
+      "route": 4.21,
+      "moe_submit": 0.0,
+      "moe_host_experts": 50.05,
+      "moe_device_wait": 0.0,
+      "moe_shared_reduce": 15.68,
+      "mixer_device": 0.0,
+      "mixer_host": 38.07,
+      "rmsnorm": 0.17,
+      "residual": 0.05,
+      "accounted": 108.23,
+      "stack": 191.46,
+      "unaccounted": 83.23,
+      "evidence": "engine-bench/logs/rev-bench-cpu.log",
+      "note": "The CPU-only run leaves 83.23 ms/token unaccounted. That remainder is real and unexplained, not rounding: it is the largest single gap in any profile here and is recorded as an open defect."
+    },
+    "reading": "Host expert work is 46.5% of the CUDA stack and 48.3% of the Vulkan one, against 4.2% and 6.2% waiting on the device. The GPU is idle for most of the token. `mixer host` after the fusion is the 10 full-attention layers, not the delta net — the 30 linear-attention layers are entirely on the device now.",
+    "not_comparable": "Stages before fennec_fused_mixer are NOT comparable to these: the old split path started the MIXER_CPU timer before the second device match, so out_proj and its fence counted as mixer host. Only totals and TPOT cross that change."
+  },
+  "fennec_variants_note": "The int4 container is the checkpoint the suite ships. Both GPU rows are the shipped default on one build: same 8 threads, same 7.77 GiB budget read off the card, same 2304 device experts and the same 30.1% device hit rate, so the pick split is identical and the difference is the device tier alone. CUDA wins end to end — 77.5 vs 84.2 ms of stack and 7.9 vs 10.1 ms of lm_head, 11.71 vs 10.61 tok/s. The head gap is the readback, not the kernel: on the same f16 head CUDA measures 4.8 ms compute + 0.33 ms readback against Vulkan's 5.0 + 2.25, because Vulkan's host-visible coherent arena reads back through an uncached mapping. CUDA also loads faster (11.4-11.9 s against 14.5-15.4 s) because its device upload is 5.5-5.8 s against Vulkan's 8.6-8.7 s. The bf16 row is historical and was measured on the retracted decode basis; it is not comparable and has not been re-run.",
+  "fennec_kernel_fix": {
+    "what": "The AVX2 int4 dot kernel was gated on group == 32. The shipped int4 container uses group 64, so every host expert fell back to the scalar nibble loop.",
+    "before": {
+      "tok_s_gpu": 1.95,
+      "tok_s_cpu": 1.26,
+      "stack_ms_gpu": 487.8,
+      "stack_ms_cpu": 612.8,
+      "cpu_overlap_ms": 14969.3
+    },
+    "after": {
+      "tok_s_gpu": 4.88,
+      "tok_s_cpu": 2.01,
+      "stack_ms_gpu": 176.5,
+      "stack_ms_cpu": 312.1,
+      "cpu_overlap_ms": 3021.8
+    },
+    "evidence_before": "engine-bench/logs/bench-int4-gpu.log, engine-bench/logs/bench-int4-cpu.log",
+    "evidence_after": "engine-bench/logs/bench-int4-gpu-avx2.log, engine-bench/logs/bench-int4-cpu-avx2.log",
+    "note": "Same checkpoint, same machine, same 8 threads. Only the CPU kernel changed: 2.50x on CPU+GPU, 1.60x on CPU alone. The group-32 path is bit-identical, so the bf16 row did not move."
+  },
+  "fennec_cuda_fix": {
+    "what": "The CUDA activation arena was pinned host memory (cuMemHostAlloc), so every kernel read its activations over PCIe. That is a Vulkan idiom: Vulkan's host-visible coherent arena is cheap, CUDA's zero-copy memory is not. Switching to a device-local cuMemAlloc arena with explicit HtoD/DtoH in write/read, plus ld.global.nc on the read-only weight and scale loads, fixed it.",
+    "lm_head_kernel_ms": {
+      "before": 6.7,
+      "after": 4.7,
+      "gb_s_before": 152,
+      "gb_s_after": 215
+    },
+    "decode_stack_ms": {
+      "before": 117.1,
+      "after": 93.6
+    },
+    "decode_tok_s": {
+      "before": 6.18,
+      "after": 7.17
+    },
+    "mixer_device_ms": {
+      "before": 25.53,
+      "after": 14.61
+    },
+    "moe_device_wait_ms": {
+      "before": 9.38,
+      "after": 3.92
+    },
+    "evidence": "engine-bench/logs/test-cuda-nc.log, test-cuda-devarena.log, decode-cuda.log, decode-cuda2.log",
+    "note": "A balanced-tree dot product was also tried and measured worse (142 GB/s against 152 for the dependent FMA chain), so it was reverted: the gemv is memory-bound, not latency-bound. All 7 GPU integration tests pass through FENNEC_BACKEND=cuda at ~1e-7 relative RMS."
+  },
+  "fennec_vram_finding": {
+    "what": "The default --device budget was a flat 8.0 GiB, which on an 8 GiB card commits right up to the physical limit. WDDM then places the allocation that exceeds the process budget in system memory, and the loser is whichever buffer went up last: the lm_head. It is the worst possible loser — 0.95 GiB read once per token, against roughly 224 MiB of expert picks — so every token paid a PCIe round trip for a buffer the kernels believed was local.",
+    "how_it_was_found": "The isolated lm_head test measures 4.8 ms compute + 0.33 ms readback on CUDA and 5.0 + 2.25 on Vulkan, yet decode reported 45.9 ms and 15.7 ms for the same call. The kernel and the transfer were both ruled out by timing them separately (tests/gpu.rs now prints both legs). The only remaining difference was the 7.6 GiB expert pool resident alongside the head, so the budget was swept.",
+    "cuda_sweep": [
+      {
+        "device_gib": 8.0,
+        "held_gib": 7.61,
+        "device_hit_pct": 41.4,
+        "stack_ms": 93.6,
+        "head_ms": 45.9,
+        "ms_per_token": 139.5,
+        "tok_s": 7.17,
+        "total_latency_ms": 5742.66,
+        "evidence": "engine-bench/logs/decode-cuda2.log"
+      },
+      {
+        "device_gib": 7.5,
+        "stack_ms": 108.6,
+        "head_ms": 5.1,
+        "ms_per_token": 113.7,
+        "tok_s": 8.8,
+        "total_latency_ms": 4715.2,
+        "evidence": "engine-bench/logs/decode-cuda-dev7.5.log"
+      },
+      {
+        "device_gib": 7.0,
+        "stack_ms": 105.4,
+        "head_ms": 5.1,
+        "ms_per_token": 110.6,
+        "tok_s": 9.04,
+        "total_latency_ms": 4618.9,
+        "evidence": "engine-bench/logs/decode-cuda-dev7.0.log"
+      },
+      {
+        "device_gib": 6.5,
+        "stack_ms": 113.4,
+        "head_ms": 5.1,
+        "ms_per_token": 118.5,
+        "tok_s": 8.44,
+        "total_latency_ms": 4901.6,
+        "evidence": "engine-bench/logs/decode-cuda-dev6.5.log"
+      },
+      {
+        "device_gib": 6.0,
+        "held_gib": 5.61,
+        "device_hit_pct": 19.2,
+        "stack_ms": 138.2,
+        "head_ms": 5.1,
+        "ms_per_token": 143.4,
+        "tok_s": 6.97,
+        "total_latency_ms": 6140.2,
+        "evidence": "engine-bench/logs/decode-cuda-dev6.log"
+      }
+    ],
+    "vulkan_sweep": [
+      {
+        "device_gib": 8.0,
+        "held_gib": 7.67,
+        "device_hit_pct": 41.4,
+        "stack_ms": 109.5,
+        "head_ms": 15.7,
+        "ms_per_token": 125.2,
+        "tok_s": 7.99,
+        "total_latency_ms": 5174.57,
+        "evidence": "engine-bench/logs/decode-vulkan2.log"
+      },
+      {
+        "device_gib": 7.0,
+        "device_hit_pct": 30.5,
+        "stack_ms": 128.8,
+        "head_ms": 11.2,
+        "ms_per_token": 140.0,
+        "tok_s": 7.14,
+        "total_latency_ms": 5836.5,
+        "evidence": "engine-bench/logs/decode-vulkan-dev7.log"
+      }
+    ],
+    "conclusion": "The cliff is real but it is not backend-neutral. CUDA's head collapses from 45.9 ms to 5.1 ms as soon as the budget leaves headroom, and 7.0 GiB is the best budget-only result (9.04 tok/s against 7.17). Vulkan tolerates a near-full card far better — its head only falls 15.7 to 11.2 ms — so cutting its budget to 7.0 GiB trades 11 points of device hit rate for 4 ms and comes out behind (7.14 against 7.99). A single blanket headroom fraction would therefore regress the Vulkan tier.",
+    "fix": "Two changes, and the second matters more than the first. (1) load_plan uploads the lm_head before the expert pool, so when WDDM demotes the allocation that exceeds the process budget it demotes an expert buffer (~1.7 MiB) instead of the 0.95 GiB head. (2) The default --device budget is read off the card (7.77 GiB usable) rather than assumed to be 8.0 GiB, so nothing is over-committed in the first place. A 0.875 headroom fraction was implemented first, measured, and reverted: it cut the budget too far and regressed Vulkan. Reading the real size is not the same as guessing a fraction of it.",
+    "overcommit_decomposition": [
+      {
+        "backend": "cuda",
+        "config": "head last, flat 8.0 GiB (the old default)",
+        "device_gib": 8.0,
+        "device_experts": 2444,
+        "device_hit_pct": 41.4,
+        "head_ms": 45.9,
+        "stack_ms": 93.6,
+        "ms_per_token": 139.5,
+        "tok_s": 7.17,
+        "total_latency_ms": 5742.66,
+        "evidence": "engine-bench/logs/decode-cuda2.log"
+      },
+      {
+        "backend": "cuda",
+        "config": "head first, true 8.0 GiB",
+        "device_gib": 8.0,
+        "device_experts": 2444,
+        "device_hit_pct": 41.4,
+        "head_ms": 6.5,
+        "stack_ms": 117.3,
+        "ms_per_token": 123.8,
+        "tok_s": 8.08,
+        "total_latency_ms": 5108.19,
+        "evidence": "engine-bench/logs/decode-cuda-true8.log"
+      },
+      {
+        "backend": "cuda",
+        "config": "head first, card-derived 7.77 GiB (shipped)",
+        "device_gib": 7.77,
+        "device_experts": 2304,
+        "device_hit_pct": 39.3,
+        "head_ms": 5.2,
+        "stack_ms": 92.8,
+        "ms_per_token": 98.0,
+        "tok_s": 10.21,
+        "total_latency_ms": 4039.556,
+        "evidence": "engine-bench/logs/decode-cuda-default.log"
+      },
+      {
+        "backend": "vulkan",
+        "config": "head last, flat 8.0 GiB (the old default)",
+        "device_gib": 8.0,
+        "device_experts": 2444,
+        "device_hit_pct": 41.4,
+        "head_ms": 15.7,
+        "stack_ms": 109.5,
+        "ms_per_token": 125.2,
+        "tok_s": 7.99,
+        "total_latency_ms": 5174.57,
+        "evidence": "engine-bench/logs/decode-vulkan2.log"
+      },
+      {
+        "backend": "vulkan",
+        "config": "head first, true 8.0 GiB",
+        "device_gib": 8.0,
+        "device_experts": 2444,
+        "device_hit_pct": 41.4,
+        "head_ms": 10.3,
+        "stack_ms": 118.9,
+        "ms_per_token": 129.2,
+        "tok_s": 7.74,
+        "total_latency_ms": 5275.6,
+        "evidence": "engine-bench/logs/decode-vulkan-true8.log"
+      },
+      {
+        "backend": "vulkan",
+        "config": "head first, card-derived 7.77 GiB (shipped)",
+        "device_gib": 7.77,
+        "device_experts": 2304,
+        "device_hit_pct": 39.3,
+        "head_ms": 9.9,
+        "stack_ms": 108.2,
+        "ms_per_token": 118.1,
+        "tok_s": 8.47,
+        "total_latency_ms": 4847.19,
+        "evidence": "engine-bench/logs/decode-vulkan-default.log"
+      }
+    ],
+    "decomposition_reading": "Over-committing the card is bad on both backends; head-first only changes which buffer pays for it. At a true 8.0 GiB the head goes from 45.9 to 6.5 ms on CUDA, but the stack rises 93.6 to 117.3 ms because the demoted buffers are now experts and every pick of a demoted expert crosses PCIe. Net 139.5 to 123.8 ms, 1.13x. Dropping the budget to the card's real 7.77 GiB removes the demotion entirely: 140 fewer resident experts (2.1 points of hit rate) buy back 25.8 ms of stack, 123.8 to 98.0 ms, another 1.26x. Combined 1.42x on CUDA. On Vulkan head-first alone is neutral-to-slightly-negative (7.99 to 7.74, inside the spread) and essentially the whole 1.06x comes from not over-committing. So the card-derived budget is the load-bearing fix and head-first is insurance for when the budget is still too large — another process holding VRAM, or a card whose usable size is reported optimistically.",
+    "fix_tradeoff": "The shipped default holds 2304 experts in VRAM against 2444 at a flat 8.0 GiB, and the measured device hit rate is 39.3% against 41.4%. Those 140 experts are not worth anything if their buffers are demoted to system memory: giving them up removes the demotion and is worth 25.8 ms/token on CUDA. The planner's predicted device hit rate is still optimistic, since its head reservation does not fully bound what the runtime can upload, and it predicted 51.8% where the runtime achieved 39.3%. Recorded as an open accounting defect, not silently corrected.",
+    "shipped_default": [
+      {
+        "backend": "cuda",
+        "device_gib": 7.77,
+        "device_experts": 2304,
+        "device_hit_pct": 39.3,
+        "stack_ms": 92.8,
+        "head_ms": 5.2,
+        "ms_per_token": 98.0,
+        "tok_s": 10.21,
+        "ttft_ms": 1230.95,
+        "tpot_ms": 87.7689,
+        "total_latency_ms": 4039.556,
+        "load_s": 96.9,
+        "gain_over_old_default": "1.42x throughput (7.17 to 10.21 tok/s), 30% less total latency (5742.7 to 4039.6 ms)",
+        "evidence": "engine-bench/logs/decode-cuda-default.log"
+      },
+      {
+        "backend": "vulkan",
+        "device_gib": 7.77,
+        "device_experts": 2304,
+        "device_hit_pct": 39.3,
+        "stack_ms": 108.2,
+        "head_ms": 9.9,
+        "ms_per_token": 118.1,
+        "tok_s": 8.47,
+        "ttft_ms": 1369.234,
+        "tpot_ms": 108.6861,
+        "total_latency_ms": 4847.19,
+        "load_s": 102.6,
+        "gain_over_old_default": "1.06x throughput (7.99 to 8.47 tok/s), 6% less total latency (5174.6 to 4847.2 ms)",
+        "evidence": "engine-bench/logs/decode-vulkan-default.log"
+      }
+    ],
+    "fix_measured": [
+      {
+        "backend": "cuda",
+        "device_gib": 6.8,
+        "stack_ms": 102.6,
+        "head_ms": 5.2,
+        "ms_per_token": 107.8,
+        "tok_s": 9.28,
+        "ttft_ms": 1439.9,
+        "tpot_ms": 94.65,
+        "total_latency_ms": 4468.7,
+        "device_hit_pct": 29.0,
+        "device_experts": 1714,
+        "gain_over_old_default": "1.30x throughput, 22% less total latency",
+        "evidence": "engine-bench/logs/decode-cuda-headfirst.log"
+      },
+      {
+        "backend": "vulkan",
+        "device_gib": 6.8,
+        "stack_ms": 118.8,
+        "head_ms": 8.2,
+        "ms_per_token": 127.0,
+        "tok_s": 7.87,
+        "ttft_ms": 1515.8,
+        "tpot_ms": 115.82,
+        "total_latency_ms": 5221.9,
+        "device_hit_pct": 29.0,
+        "device_experts": 1714,
+        "gain_over_old_default": "neutral: head 15.7 to 8.2 ms, stack 109.5 to 118.8 ms, 125.2 to 127.0 ms/token. Inside this laptop's run-to-run spread.",
+        "evidence": "engine-bench/logs/decode-vulkan-headfirst.log"
+      }
+    ],
+    "fix_measured_caveat": "These two rows were run with `--device 8.0` on the interim build that also applied a 0.875 headroom fraction, and they are labelled 6.8 GiB rather than 8.0 for two reasons. The fraction alone would give 7.0; the build also gated the budget on Opts::has(\"device\"), which only read valueless flags, so `--device 8.0` was dropped and the default path ran instead: 0.875 x 7.77 = 6.8 GiB. The flag bug is fixed and covered by a parser regression test. The rows are kept because they are real measurements of a real configuration, not because they are the configuration they were labelled as.",
+    "note": "Every row is the same build, the same checkpoint, 8 threads, 40 layers, 8 prompt tokens and 32 output tokens. The sweep brackets the cliff between 7.1 and 7.6 GiB held on an 8 GiB card; it does not establish a universal fraction, and the numbers are one laptop."
+  },
+  "fennec_progress": [
+    {
+      "step": "scalar bf16 gemv",
+      "tok_s": 8.03,
+      "gb_s": 135
+    },
+    {
+      "step": "4 rows/workgroup + uvec4",
+      "tok_s": 8.53,
+      "gb_s": 213
+    },
+    {
+      "step": "spin-then-block fence",
+      "tok_s": 9.16,
+      "gb_s": 213
+    }
+  ],
+  "fennec_progress_note": "4-layer window, 16 new tokens, 8 threads. Not the engine's speed: the same code over all 40 layers measures far lower, because the host expert pool grows from 0.47 GiB to 12.85 GiB. The window is a kernel benchmark, not a projection.",
+  "variance_note": "Run-to-run variance on this laptop is large and any single number misleads. On the CURRENT build, with routing proven identical (dev_hits 3855 in every run), five CUDA runs measured 10.79, 11.45, 11.71, 11.85 and 12.16 tok/s and three Vulkan runs 10.54, 10.61 and 11.23 — a 13% spread on CUDA and 6% on Vulkan, from machine noise alone. The noise is in `moe host experts` (36.63-44.70 ms/token) and `mixer host` (2.34-5.50); `mixer device` is steady by comparison (23.79-27.60). lm_head ranged 5.0-7.9 ms on CUDA and 8.0-10.1 on Vulkan. The Fennec rows quote the median run, with tok_s_range / tpot_ms_range giving the observed spread on one build. Earlier revisions of this note quoted 4.88-8.47 tok/s for Vulkan; that spread was across BUILDS and across the retracted decode basis, and is kept in fennec_vram_finding as history. A claim of beating another engine needs repeated runs, not one: Fennec's CUDA median (11.71) is below fox's 12.00 while its fastest run (12.16) is above, so the honest verdict is a tie, not a win.",
+  "fennec_cli_fix": {
+    "what": "Opts::has() inspected only the valueless-flag list, never the key/value map. The parser puts `--gpu` in flags but `--device 8` in kv, so has(\"device\") was false for every spelling of a valued option. setup() gated the GPU budget on has(\"device\"), which meant --device was silently dropped and every run used the card-derived default.",
+    "how_it_was_found": "`plan --device 8.0 --json` reported device_gib 7.76953125 — the card's usable size, not 8.0. Two runs that should have differed by 0.23 GiB produced byte-identical plans.",
+    "blast_radius": "Only --device was gated on has() with a value; the other has() callers (json, cpu, curve, verbose, allow-remote, no-think, greedy, auto-tier) are valueless flags and behaved correctly. gpu_wanted() already checked both maps explicitly, which is why --gpu 1 worked. No suite benchmark script passes --device, so no archived result was invalidated. The manual VRAM sweep predates the gate and called opts.num(\"device\") directly, so it is valid; the two head-first rows that postdate the gate are relabelled 6.8 GiB in fennec_vram_finding.fix_measured_caveat.",
+    "fix": "has() now returns true if the key is in either map, and gpu_wanted()'s redundant kv check was removed. Two parser regression tests cover both spellings, the indexed --gpu form, and --cpu overriding it.",
+    "evidence": "src/main.rs Opts::has and tests::a_valued_option_is_not_invisible_to_has; engine-bench/logs/plan-dev8.log and plan-default.log show the identical plans that exposed it"
+  },
+  "cuda_competitors": {
+    "question": "Can Colibri, rabbit or fox be measured on the CUDA tier on this machine?",
+    "answer": "No. None of the three can run CUDA here, for three different reasons. Fennec is the only engine in this comparison with a working CUDA tier on this box.",
+    "rabbit": {
+      "verdict": "impossible - no GPU code exists",
+      "evidence": "Cargo.toml has no [features] section at all (49 lines). src/expert_cache.rs:41 states 'any VRAM/CUDA promotion (no CUDA backend here)'. Kernels are x86 SIMD only (src/kernels.rs:92-96, AVX2/AVX-512/VNNI tiers). The only tuning flag is --threads (src/main.rs:99). io-uring is Linux-only (Cargo.toml:33-34).",
+      "consequence": "rabbit's 0.71 tok/s is a CPU-only number and is the only number it can produce."
+    },
+    "fox": {
+      "verdict": "not buildable here - CUDA is gated on a toolkit that is absent",
+      "evidence": "build.rs:316 enables GGML_CUDA only if CUDACXX or `which nvcc` resolves; vendor/llama.cpp/ggml/src/ggml-cuda/CMakeLists.txt:3 find_package(CUDAToolkit), :59 enable_language(CUDA), :37 89-real for Ada. Probes: `where nvcc` absent, `where cl` absent, 'C:/Program Files/NVIDIA GPU Computing Toolkit' absent, both Visual Studio directories absent. cmake is present (WinLibs MinGW) but MinGW gcc is not a valid nvcc host compiler. No ggml-cuda.dll exists anywhere in the suite; the prebuilt set in target/release/build/ferrumox-*/out/bin is ggml-vulkan.dll, ggml-cpu.dll, ggml-base.dll, ggml.dll, libllama.dll, libllama-common.dll, libmtmd.dll. C:/Windows/System32/nvcuda.dll is present, so the driver is there - only the compiler is missing.",
+      "no_igpu_mismeasurement": "fox's published 12.00 tok/s was already on the discrete card: bench_fox_vulkan2.log:61 reads 'using device Vulkan1 (NVIDIA GeForce RTX 4060 Laptop GPU) - 7188 MiB free'. Device 0 is the Intel Arc iGPU (uma:1), device 1 the RTX 4060 (uma:0, NV_coopmat2v). The number is honest."
+    },
+    "colibri": {
+      "verdict": "CUDA exists in source but is not compiled into the shipped binary",
+      "evidence": "The engine is pure C; Python is only a launcher/converter. c/backend_cuda.cu exists alongside backend_vulkan.c and backend_metal.mm, selected at runtime by COLI_CUDA=1 (c/qwen36_tier.c:871), devices by COLI_GPUS/COLI_GPU (:893-894), VRAM budget CUDA_EXPERT_GB (:706). But c/.build-config reads CUDA=0|CUDA_DLL=0|VK=1|XDNA=0 (gcc -O3 -march=x86-64-v3 -fopenmp -DCOLI_VULKAN), and a byte scan of c/qwen36.exe finds no coli_cuda.dll or coli_cuda_init strings.",
+      "consequence": "The 20.06 tok/s baseline is CPU+Vulkan, not CUDA. It is the number to beat, and it was never a CUDA number.",
+      "what_a_cuda_run_would_need": "make qwen36.exe CUDA_DLL=1 plus make cuda-dll (or c/build_cuda.bat, which auto-detects sm_89 for the 4060) to produce coli_cuda.dll beside the exe (c/Makefile:1397-1409,1020-1032). Linux links CUDA=1 directly; Windows refuses it (Makefile:596-597). Both need nvcc and an MSVC host compiler, neither of which is on this box.",
+      "torch_is_irrelevant": "torch 2.15.0+cpu is installed (cuda available False) but appears only in c/tools/convert_*.py, never in inference. There is no torch fallback that would silently use CUDA."
+    },
+    "fennec_cuda": "Fennec's CUDA tier needs no toolkit and no MSVC: it goes through the Driver API with hand-written PTX compiled at runtime by cuModuleLoadDataEx. All 9 GPU integration tests pass on the RTX 4060 at ~1e-7 relative RMS under FENNEC_BACKEND=cuda, including one that moves the device handle to another thread — the pattern `serve` uses and the one that exposed the per-thread context bug."
+  },
+  "colibri_host_expert_mechanism": {
+    "why_it_matters": "Colibri's 43.18 ms TPOT against Fennec's 82.37 ms is not mostly a memory-placement difference. Four mechanisms were read out of the source.",
+    "kernel": "Native C + OpenMP + AVX2. int4 nibbles are dotted directly, never dequantised to f32. Activations are quantised to int8 once per row and the dot is vpdpbusd: xf_dot_i8_avx2, c/expert_ffn.h:254-269. Unsigned nibble x int8 activation, with the -8 weight bias removed as one per-group correction. Experts stay planar int4 in RAM (c/qwen36.c:1666-1701, default on for gs=64 containers; QWEN_EXPERT_KERNEL=0 restores the unpack-to-int8 path).",
+    "kernel_claimed_gain": "c/qwen36.c:1677-1680 records 'activations to int8 once per row, dpbusd against the planar nibbles. Measured on the 35B: expert compute 22.7 to 15.9 ms/token for +0.1% perplexity.' That is the whole expert stack, against Fennec's 36.63 ms for host picks alone.",
+    "work_queue": "All top-8 picks are batched into one (expert, row-chunk) queue, deduped by expert and chunked to 4*T items so every thread works (c/expert_ffn.h:820-898 xf_moe_compute; r16 variant 706-813).",
+    "thread_sizing": "Threads = physical cores, not logical (coli_omp_tune_threads, c/qwen36.c:9351; c/omp_tune.h:102-114). The comment at c/qwen36.c:9344-9348 records +2.3x from sizing alone on a 16C/32T part.",
+    "zero_copy_host_pool": "Every expert lives in a HOST_VISIBLE|HOST_COHERENT Vulkan buffer in system RAM that the device reads directly (host_init, c/vk_tier.c:2653-2707; COLI_VK_TIER_HOST_GB, promote rate COLI_VK_TIER_PROMOTE=32). With COLI_VK_HYBRID the CPU computes some resident pairs in place in that same mapped buffer while the GPU runs its batch (host_pairs, c/vk_tier.c:2051-2128, join at 2400-2410) - no RAM copy, no disk.",
+    "hit_rate_is_understated": "The reported device percentage is T.served/T.routed over routed picks (vkt_report, c/vk_tier.c:3118-3133). Hybrid pairs computed in place by the CPU are marked taken but not counted in T.served (:2368 precedes :2372), so 58.5% device understates GPU-pool coverage and the CPU remainder is far below 166 full-cost picks.",
+    "cold_load": "No mmap: pread + O_DIRECT + fadvise(DONTNEED) (c/st.h:3-5). Startup loads the int8-quantised dense trunk (COLI_DENSE_BITS=8 default, c/qwen36.c:1799) plus only the planner's VRAM set, in a parallel OpenMP warmstart (:9326-9337). Every other expert is lazy: first routed touch reads from disk into an LRU RAM cache (expert_fetch, :4651-4707) with a PILOT prefetch thread 1-3 layers ahead (:6521-6534,7041). TTFT is fast because prefill streams cold experts through device slots and computes them on the GPU (c/vk_tier.c:1003,1278 issue_big; loader callback vk_load, c/qwen36.c:9214).",
+    "no_skipped_experts": "Every pick is computed - device, hybrid in place, or CPU fallback. Failed batches are recomputed (c/vk_tier.c:2433-2445).",
+    "comparison_asymmetries": {
+      "why": "The 20.06 tok/s baseline is not a like-for-like configuration against Fennec's rows. Three differences are disclosed rather than hidden, and none of them is an excuse: Fennec is still behind.",
+      "threads": "Colibri ran 16 threads; Fennec ran 8, a courtesy cap so the machine stayed usable during measurement. Colibri sizes its pool to physical cores (coli_omp_tune_threads) and records +2.3x from sizing alone on a 16C/32T part. This host is a hybrid Core Ultra 7 155H: 6 P-cores (logical 0-11), 8 E-cores (12-19), 2 LP-E (20-21). Fennec has NO thread affinity anywhere - bare std::thread::spawn, and set_threads only sizes the pool - so its 8 workers can land on E-cores. That is a suspected part of the host-expert gap and is unmeasured.",
+      "host_tier": "Colibri ran with COLI_VK_TIER_HOST_GB=4, a 4 GiB host tier, against Fennec's 13.08 GiB. A smaller host tier means more of Colibri's picks are served from the device or computed in place in a mapped buffer, which is cheaper than Fennec's DRAM-resident f32 dot.",
+      "backend": "Colibri's 20.06 is CPU+Vulkan, not CUDA: c/.build-config reads CUDA=0|CUDA_DLL=0|VK=1|XDNA=0. Fennec's best row is CUDA. The comparison is therefore Vulkan-C against Rust-CUDA, which favours Fennec on the device tier and still loses.",
+      "hit_rate_basis": "Colibri's 58.5% is T.served/T.routed over routed picks and excludes hybrid pairs the CPU computed in place in the mapped buffer, so it understates GPU-pool coverage. Fennec's 30.1% counts every device-served pick. The two percentages are not the same statistic."
+    }
+  },
+  "fennec_decode_fidelity": {
+    "what": "RETRACTION. The decode benchmark's loop pushed its argmax on every iteration, including the prompt phase. At t == prompt_len it therefore read toks[prompt_len] = the prediction from position 0, not from the whole prompt, so the timed continuation was not the greedy sequence `serve` produces. Every Fennec throughput number published before this fix was measured on a wrong token sequence.",
+    "fix": "main.rs now pushes only when t + 1 >= prompt_len, matching serve.rs's existing `if t + 1 < ids.len() { continue; }` guard.",
+    "how_it_was_found": "After the fix the CUDA TPOT rose 69.31 -> 90.998 ms, which looked like a 31% regression. It was not noise: dev_hits fell 5030 -> 3855 (39.3% -> 30.1%) while placement was byte-identical (2304 device experts, 7936 host, 10240 resident, 13.078125 GiB FQ4, group 64). The device-hit counter is a pure function of routing, so the sequence had changed. `moe host experts` rose 30.40 -> 44.70 ms/token, which is the whole difference.",
+    "retracted": {
+      "tok_s": 14.43,
+      "device_hit_pct": 39.3,
+      "dev_hits": 5030,
+      "note": "14.43 tok/s and every earlier Fennec GPU row in this file (10.21 CUDA, 8.47 Vulkan, 2.70 CPU) were measured on the invalid continuation. They are kept below as history, not as current results."
+    },
+    "corrected": {
+      "dev_hits": 3855,
+      "host_hits": 8945,
+      "device_hit_pct": 30.1,
+      "note": "The prompt is 8 fixed ids (DEFAULT_PROMPT), so the corrected greedy sequence is deterministic: dev_hits = 3855 reproduced exactly across five runs on two backends."
+    },
+    "consequence": "The gap to Colibri WIDENED, from 1.96x to 1.83x at the slow end of Fennec's spread, because the old Fennec number was invalid rather than because Colibri got faster. Fennec's corrected CUDA tier now straddles fox's 12.00 tok/s instead of clearly losing to it.",
+    "evidence": "engine-bench/logs/rev-bench-cuda.log, rev-bench-cuda2.log, rev-bench-vulkan.log, rep-cuda3.log, rep-cuda4.log, rep-cuda5.log, rep-vk2.log, rep-vk3.log; src/main.rs decode loop"
+  },
+  "fennec_mapped_host_tier": {
+    "what": "The host expert pool used to be a copy: every routed expert's nibbles were read out of the mapping into a fresh Vec, so the process committed the container twice. The pool now borrows the mapping zero-copy and converts the container's two's-complement nibbles to FQ4 offset-binary in the dot kernel itself (one _mm256_xor_si256 per vector pair, via the const-generic dot_rows::<SIGNED>).",
+    "cold_load_s": {
+      "before": 44.6,
+      "after_range": [
+        11.1,
+        12.1
+      ],
+      "gain": "3.7-4.0x"
+    },
+    "commit_gib": {
+      "before_after_host_pool": 18.85,
+      "after_after_host_pool": 7.1,
+      "before_after_device_upload": 21.55,
+      "after_range": [
+        9.85,
+        10.07
+      ]
+    },
+    "load_phases_before": {
+      "host_pool_s": 29.3,
+      "lm_head_s": 1.6,
+      "device_upload_s": 13.6
+    },
+    "load_phases_after": {
+      "host_pool_s": 5.3,
+      "lm_head_s": 0.4,
+      "device_upload_s": 5.3
+    },
+    "placement_unchanged": "2304 device experts, 7936 host, 13.08 GiB FQ4 host matrix in both runs, so this is a load-path change and not a residency change.",
+    "current": {
+      "cuda_load_s_range": [
+        11.4,
+        11.9
+      ],
+      "vulkan_load_s": 14.5,
+      "cpu_load_s": 5.4,
+      "note": "40/40 layers borrowed from the mapping. Vulkan's device upload is slower than CUDA's (8.7 s against 5.5-5.8 s) because its staging path copies through a host-visible buffer."
+    },
+    "published_before": "The last README table quoted 96.9 s CUDA / 102.6 s Vulkan / 81.7 s CPU. Those predate both the parallel host-pool load and the mapped tier.",
+    "caveat": "The before/after decode numbers in these two logs are NOT comparable: both were run before fennec_decode_fidelity, so both report 5030 device hits. Only load_s and the commit figures are used from them.",
+    "evidence": "engine-bench/logs/decode-cuda-cap.log (before), decode-cuda-map2.log and decode-cuda-map3.log (after), decode-vulkan-map3.log, rev-bench-cuda.log, rev-bench-cuda2.log, rev-bench-vulkan.log, rev-bench-cpu.log"
+  },
+  "fennec_fused_mixer": {
+    "what": "The gated delta net's conv and recurrence used to run on the CPU, forcing a device round trip across all 30 linear-attention layers. Both are now device kernels (gdn_conv, gdn_rec) and the whole linear-attention block is one batch: write x, four gemv_half projections, gdn_conv, gdn_rec, gemv_half out_proj, run, read. One h-float write and one h-float read per layer instead of five round trips.",
+    "kernels": "gdn_conv: 256 threads, cd/256 groups, bindings [scratch, conv_w, conv_state, dummy]. gdn_rec: 512 threads, nv groups, bindings [scratch, params, rec_state, dummy], push exactly 8 u32. Shared layout sq[256]@0 sk[256]@1024 so[256]@2048 tmp[512]@3072 = 5120 bytes; G = 512/dv, rows = dk/G. This model has dk = dv = 128, so G = 4 and rows = 32.",
+    "shape_guard": "Falls back to the split path when dk or dv is 0 or > 256, nv is 0, nk is 0, nv % nk != 0, 512 % dv != 0, rows == 0, dk % (512/dv) != 0 or rows % 4 != 0. No silent CPU fallback for a shape the kernel can handle.",
+    "state_ownership": "GdnState.mirrored tracks whether the device holds the current conv/rec state. The fused path uploads on first use and sets it; sync_state reads back and clears it. Chosen over pointer identity because serve.rs calls model.states() per request and a freed Vec's address can be reused. Safe because serve.rs holds the model mutex for the whole generation loop.",
+    "measured": "fused_mixer_matches_the_cpu_mixer_and_its_state passes at ~2.7e-7 relative RMS against a 2e-5 band, on both backends.",
+    "profiler_caveat": "Stage names are NOT comparable across this change. In the old split path the MIXER_CPU timer was started before the second device match, so out_proj and its fence counted as mixer host. After fusion, `mixer host` is the 10 full-attention layers only. Only totals and TPOT are comparable.",
+    "evidence": "src/model.rs step_fused / upload_mixer / sync_state, src/shaders/gdn_conv.comp, gdn_rec.comp, kernels/fennec.ptx, tests/gpu.rs"
+  },
+  "fennec_pinned_arena_reverted": {
+    "what": "NULL RESULT, reverted. An audit read cudagpu.rs's module doc — which claimed a cuMemHostAlloc arena with plain-memcpy accessors — concluded the synchronous HtoD/DtoH copies were a bug, and supplied a patch to make the arena pinned and device-mapped. The doc was stale; the code was already device-local, deliberately.",
+    "measured": {
+      "cuda_tpot_ms": {
+        "device_local": 90.998,
+        "pinned_mapped": 103.378
+      },
+      "cuda_head_ms": {
+        "device_local": 5.003,
+        "pinned_mapped": 8.268
+      },
+      "cuda_stack_ms": {
+        "device_local": 87.679,
+        "pinned_mapped": 97.696
+      },
+      "vulkan_tpot_ms_unaffected": 85.633
+    },
+    "why": "CUDA zero-copy is a Vulkan idiom that does not transfer. The gemv re-reads the same x once per row, so a mapped arena puts every one of those reads on PCIe. The lm_head regression 5.0 -> 8.3 ms is the canary, and it is the same direction fennec_cuda_fix already recorded from a prior session (6.7 ms pinned against 4.7 device-local).",
+    "action": "cuda.rs reverted to net zero change; cudagpu.rs's arena code restored to cuMemAlloc + explicit write/read. The real defect was the doc, which is rewritten to state device-local and cite the measurement. Kept from the episode: a cols % group guard in upload_q4 on both backends.",
+    "lesson": "The project's own measured artifacts outrank a source-only inference. Check docs/engine-benchmark.json before applying an audit's performance patch.",
+    "evidence": "engine-bench/logs/fix-bench-cuda.log (pinned), rev-bench-cuda.log (device-local), build-revert2.log, rev-test-cuda.log, rev-test-vulkan.log"
+  },
+  "fennec_correctness_fixes": {
+    "what": "Ten correctness defects found by a read-only audit and fixed, each verified on both backends. Two were critical.",
+    "critical": [
+      "serve.rs: a prompt at or past max_ctx panicked mid-forward inside the model mutex, poisoning it for every later request. Now refused with an error, and max_new is clamped to what fits (returning finish_reason 'length' when nothing fits).",
+      "serve.rs: streaming decoded one token at a time with a lossy UTF-8 conversion, so a multi-byte character split across two tokens became a permanent U+FFFD. Now the raw bytes are accumulated and only the valid prefix is emitted (Tokenizer::decode_bytes)."
+    ],
+    "others": [
+      "main.rs: the decode-fidelity bug — see fennec_decode_fidelity.",
+      "main.rs: printed 'CUDA and Metal are not implemented' whenever COLI_CUDA or COLI_METAL was set, which is false on both counts. Deleted.",
+      "main.rs: a .coli_usage histogram for a different model was accepted and would silently drop layers or index past the expert table. Now refused unless layers and experts both match the config.",
+      "safetensors.rs: DType::F64 did `raw as f64 as f32`, numeric-casting the bit pattern instead of reinterpreting it. Now f64::from_bits(raw) as f32.",
+      "safetensors.rs: slice_f32 accepted a backwards range. Now an error.",
+      "sched.rs: the scale-byte estimate used floor division where Q4::ngroups uses div_ceil, underestimating scales for a short final group. No effect on this model (2048/64 and 512/64 are exact).",
+      "model.rs: the fused path's `normed` offset is now rounded to 16 bytes, because CUDA's half gemv reads x as v4.f32. A no-op at nv = 32, a real fix for an odd nv.",
+      "gpu.rs / cudagpu.rs: upload_q4 now refuses cols % group != 0 rather than letting the shader read the next row's scale."
+    ],
+    "regression_test": "tests/tokenizer.rs streaming_a_token_at_a_time_keeps_split_characters_intact asserts the naive per-token decode really did produce U+FFFD, so it proves the bug rather than only exercising the fix. It is the 76th test.",
+    "not_fixed": "Shards::open still does not validate that shape.product() * dtype.size() equals the header's byte span. Recorded, not papered over.",
+    "evidence": "engine-bench/logs/fix-test-cuda.log (76/76), fix-test-vulkan.log (8/8), rev-test-cuda.log (76/76), rev-test-vulkan.log (8/8)"
+  },
+  "fennec_test_matrix": {
+    "total": 77,
+    "breakdown": {
+      "unit_lib": 47,
+      "unit_bin": 2,
+      "golden": 13,
+      "gpu": 9,
+      "tokenizer": 6,
+      "doc": 0
+    },
+    "cuda": "77/77 with FENNEC_BACKEND=cuda",
+    "vulkan": "9/9 GPU integration tests with FENNEC_BACKEND=vulkan; --nocapture prints 'device 0: NVIDIA GeForce RTX 4060 Laptop GPU (NVIDIA) on Vulkan (SPIR-V)' nine times, which is the backend proof a captured run does not show",
+    "build": "cargo build --release --offline -j 6, zero warnings",
+    "backend_selection": "tests/gpu.rs reads FENNEC_GPU as the ranked device index (0 = discrete NVIDIA, 1 = Intel Arc) and FENNEC_BACKEND as an explicit backend. An unparseable backend or a failed open panics rather than skipping, so a green run cannot hide a backend that never opened.",
+    "golden_oracle": "The default golden run (no FENNEC_GOLDEN_MODEL) is the tight oracle against the bf16 export the fixtures came from. Setting FENNEC_GOLDEN_MODEL widens the bands to 3e-2 / 2.5e-1 — and a forward-slash spelling of the same directory also widens them, because the comparison is a string match. Do not read a widened run as a tight pass.",
+    "evidence": "engine-bench/logs/ctx-test-cuda.log (77/77), ctx-test-vulkan.log (9/9 with backend proof), build-ctxfix.log (clean); earlier rev-test-cuda.log, rev-test-vulkan.log, final-test-vulkan-nc.log, build-revert2.log"
+  },
+  "fennec_serve_context_fix": {
+    "what": "A CUDA context is current per thread. serve loads the model on one thread and answers each request on a std::thread::spawn worker (serve.rs:603) holding Arc<Mutex<Model>>. The first device call on a request thread died with 'CUDA write_buf 239: cuMemcpyHtoD: invalid device context' at model.rs:997, and the client saw ConnectionResetError WinError 10054.",
+    "why_it_hid": "decode and every integration test are single-threaded, so 76/76 green hid a defect that made the CUDA tier unusable under the only entry point the suite actually spawns. The HTTP contract test found it, not the unit suite.",
+    "fix": "Cuda::bind() calls cuCtxSetCurrent at the top of all seven driver entry points (function, alloc, free, write, read, launch, sync). cuCtxSetCurrent was already resolved but had only been used in Drop. Re-setting the already-current context is a thread-local compare inside the driver, not a mode switch.",
+    "regression_test": "the_device_works_after_the_handle_moves_to_another_thread — runs a gemv on the opening thread, moves the Gpu into a spawned thread and runs it there, then moves it back. Gpu is Send but not Sync, so the test moves the handle rather than using thread::scope.",
+    "verification": {
+      "cuda": "30 passed, 0 failed — tools/smoke_serve.py against serve --gpu 0 --backend cuda. Device tier proven on: 'compute device: NVIDIA GeForce RTX 4060 Laptop GPU on CUDA (NVIDIA driver API, PTX)', 2304 experts in VRAM / 7936 in RAM, load phases host pool 5.1 s | lm_head 0.5 s | device upload 6.3 s, loaded in 12.1 s, 10.04 GiB committed after upload.",
+      "vulkan": "30 passed, 0 failed — same script against serve --gpu 0 --backend vulkan. 'compute device: NVIDIA GeForce RTX 4060 Laptop GPU on Vulkan (SPIR-V)', 2304 experts in VRAM / 7936 in RAM, host pool 5.3 s | lm_head 0.7 s | device upload 8.4 s, loaded in 14.4 s.",
+      "evidence": "engine-bench/logs/smoke-cuda-gpu-ctxfix.log, smoke-vk-gpu-ctxfix.log, serve-cuda-gpu-ctxfix.log, serve-vk-gpu-ctxfix.log"
+    },
+    "retracted_first_attempt": "The first smoke runs were launched with --backend cuda / --backend vulkan but WITHOUT --gpu, and both silently loaded CPU-only: 'device upload 0.0 s', '0 experts in VRAM', 7.2 s and 5.5 s loads. Those 30/30 results are withdrawn as evidence for this fix — they never touched the device. --backend selects which backend the tier uses; --gpu or --auto-tier is what turns the tier on. Logs serve-cuda-ctxfix.log / serve-vk-ctxfix.log are kept only as the record of that mistake.",
+    "lesson": "A green contract test is only evidence for the path it actually exercised. Check the load banner for a non-zero device upload before believing a GPU test passed."
+  },
+  "ort_tensorrt_verdict": {
+    "request": "Replace Cuda with ort, then 'use it as wrapper for everything also use TensorRT or TensorRT RTX if available', citing https://ort.pyke.io/perf/execution-providers",
+    "date": "2026-11-12",
+    "decision": "Not adopted. The measured CUDA tier stays. No ort dependency was added and no code was changed.",
+    "sources": "The user's own linked page plus /setup/linking and /setup/cargo-features on ort.pyke.io, read verbatim; live nvidia-smi, fennec probe, and filesystem scans.",
+    "blockers": {
+      "tensorrt_not_available": "Neither classic TensorRT nor TensorRT RTX is installed. A name search for tensorrt|nvinfer|nvonnxparser across Program Files, Program Files (x86), the whole DriverStore FileRepository, ProgramData and D: returned only the two files this investigation had just downloaded itself. The NVIDIA installs present are NVIDIA App, NvTelemetry and PhysX — no TensorRT package and no NVIDIA GPU Computing Toolkit directory. See ort_nvrtx_verdict for the TensorRT RTX specifics.",
+      "cuda_ep_runtime_absent": "RETRACTED 2026-11-13: the runtime is NOT absent. The earlier claim quoted the ort crate's 'CUDA >= 13.2 / cuDNN >= 9.23' wording, which matches nothing official — ORT 1.27+ PyPI GPU packages are built against CUDA 13.0 and need CUDA 13.0+ / cuDNN 9.x. We installed onnxruntime-gpu 1.32.0 plus the NVIDIA CUDA 13 / cuDNN 9 redistributable wheels into a local directory (no system install, no permanent PATH change) and MEASURED the CUDA EP under Smart App Control: providers Tensorrt+CUDA+CPU, every capi DLL and .pyd Authenticode Valid, lm_head f16 4.983 ms vs Fennec's CUDA 5.24 ms (level). See benchmarks/results-ort-gpu-lane.json. What remains true: no nvcc/cl/CUDA Toolkit on PATH, only the driver's nvcuda.dll — which is why Fennec uses the Driver API with hand-written PTX and no ~2 GB runtime. The CPU EP wheel (1.31.1) registers only Azure+CPU and has no F16 MatMul kernel; it folds the F16 weights to F32.",
+      "no_onnx_model": "Zero .onnx files under the model root. The shipped checkpoint is 43 int4-packed safetensors shards: a 256-expert MoE with a custom gated-delta-net linear-attention block that no stock exporter handles. The only non-safetensors model present is an OpenVINO IR embedder (bge-base-en-v1.5-int8-ov, .xml/.bin).",
+      "npu_blocked_below_ort": "SCOPE CORRECTED 2026-11-12: the refusal covers DirectML only, not every ORT EP. Live probe: Intel(R) AI Boost, graphics=false generic_ml=true, D3D12CreateDevice refused 0x887a0004 DXGI_ERROR_UNSUPPORTED. ORT's DirectML EP creates a D3D12 device, so it sits above that refusal and cannot reach the NPU. ORT's OpenVINO EP does NOT go through D3D12 and is not covered by this blocker — see openvino_npu_measured and ort_openvino_verdict. The earlier wording 'no ONNX Runtime execution provider can reach it either' was wrong and is retracted.",
+      "no_tiered_residency": "ORT owns its session allocator. It cannot express 2304 experts in VRAM / 8945 in RAM / cold experts streamed from NVMe, which is the whole design. Same reason TensorRT was rejected earlier.",
+      "offline_build": "ort is absent from Cargo.toml, Cargo.lock and the offline registry cache; there is no vendor/ and no .cargo/config.toml. download-binaries and copy-dylibs are DEFAULT features, so adding ort fetches from pyke's CDN at build time and breaks the documented cargo build --release --offline. crates.io is reachable (HTTP 200), so a fetch is possible but changes the build contract."
+    },
+    "not_a_blocker": "Compute capability. An earlier suspicion that sm_89 was unsupported was WRONG: the docs list '8.x (sm_80, RTX 30xx/40xx)' and nvidia-smi reports the RTX 4060 Laptop as compute_cap 8.9, which that bucket covers. Recorded so the false blocker is not repeated.",
+    "silent_fallback_trap": "The docs warn 'ort will silently fail and fall back to executing on the CPU if all execution providers fail to register.' On this box every GPU EP would fail to register, so an ort wrapper without .error_on_failure() would silently run CPU-only at 3.00 tok/s while appearing to work. That is the most dangerous part of the request, not the missing crate.",
+    "cost_of_complying": "Removing CUDA drops decode from 11.71 tok/s to 3.00 (3.90x) and contradicts the earlier instruction 'Make sure it runs CUDA (or TensorRT) when it detects Nvidia, stay with vulcan for amd and with metal for apple chips'.",
+    "what_would_change_it": "An ONNX export of this MoE, plus a vendored ort to preserve the offline build. The CUDA 13.0+ / cuDNN 9.x runtime is no longer a blocker — it was obtained from PyPI wheels and the CUDA EP measured here (2026-11-13). Even then ORT's allocator would have to be reconciled with tiered residency before it could match the current tier."
+  },
+  "unmeasured": {
+    "metal": "The Metal path is implemented via MoltenVK (portability enumeration + portability subset) and compiles for aarch64-apple-darwin and x86_64-apple-darwin, with 6 unit tests. No Apple hardware was available, so it has never been executed or benchmarked.",
+    "amd": "Vulkan is the AMD path and the vendor policy selects it, but no AMD device was present on this machine. Unmeasured."
+  },
+  "openvino_npu_measured": {
+    "what": "The NPU is usable. The earlier 'NPU blocked' verdict was wrong in scope: D3D12CreateDevice returning 0x887a0004 rules out DirectML only. OpenVINO's NPU plugin talks to Intel's npu.inf driver directly and never goes through D3D12.",
+    "date": "2026-11-12",
+    "runtime": "OpenVINO 2026.4.1-22982-e213a147257-releases/2026/4, installed as a Python package; core.available_devices = ['CPU', 'GPU.0', 'GPU.1', 'NPU']",
+    "device_names": {
+      "CPU": "Intel Core Ultra 7 155H",
+      "GPU.0": "Intel(R) Arc(TM) Graphics (iGPU), DEVICE_TYPE INTEGRATED, DEVICE_ARCHITECTURE 'GPU: vendor=0x8086 arch=v12.71.4'",
+      "GPU.1": "NVIDIA GeForce RTX 4060 Laptop GPU (dGPU), DEVICE_TYPE DISCRETE, DEVICE_ARCHITECTURE 'GPU: vendor=0x10de arch=v8.9.0'",
+      "NPU": "Intel AI Boost, PnP Status OK, Class ComputeAccelerator, PCI\\VEN_8086&DEV_7D1D"
+    },
+    "model": "embed/bge-base-en-v1.5-int8-ov/openvino_model.xml, the suite's real int8 embedder, reshaped to static [1,128] on all three int64 inputs (input_ids, attention_mask, token_type_ids); output last_hidden_state [1,128,768]",
+    "protocol": "10 warm-up inferences then 50 timed iterations, median reported; per-node profiling enabled on both GPUs",
+    "results_median_ms": {
+      "CPU": {
+        "compile_s": 0.42,
+        "infer_ms": 32.16,
+        "min_ms": 28.18,
+        "max_ms": 61.23
+      },
+      "NPU": {
+        "compile_s": 0.26,
+        "infer_ms": 12.75,
+        "min_ms": 12.64,
+        "max_ms": 13.12,
+        "speedup_vs_cpu": 2.52
+      },
+      "GPU.0": {
+        "compile_s": 1.14,
+        "infer_ms": 11.48,
+        "min_ms": 10.93,
+        "max_ms": 12.49,
+        "speedup_vs_cpu": 2.8
+      },
+      "GPU.1": {
+        "compile_s": 0.86,
+        "infer_ms": 239.09,
+        "min_ms": 238.18,
+        "max_ms": 241.51,
+        "slowdown_vs_cpu": 7.43
+      }
+    },
+    "fidelity_real_text": {
+      "method": "transformers AutoTokenizer on 5 real sentences, padding='max_length', max_length=128; cosine vs the CPU output",
+      "NPU": {
+        "min": 0.999732,
+        "mean": 0.999838,
+        "per_sentence": [
+          0.9997,
+          0.9999,
+          0.9999,
+          0.9998,
+          0.9999
+        ]
+      },
+      "GPU.0": {
+        "min": 0.999722,
+        "mean": 0.999826
+      }
+    },
+    "multi_and_hetero": {
+      "MULTI:NPU,CPU": {
+        "compile_s": 6.73,
+        "infer_ms": 17.05
+      },
+      "MULTI:GPU.0,CPU": {
+        "compile_s": 1.33,
+        "infer_ms": 11.5
+      },
+      "HETERO:NPU,CPU": {
+        "compile_s": 7.12,
+        "infer_ms": 17.1
+      },
+      "AUTO:NPU,CPU": {
+        "compile_s": 0.45,
+        "infer_ms": 41.51
+      },
+      "note": "All four compile and run. The NPU requires static shapes; the earlier MULTI/HETERO timings used 1 warm-up + 20 iterations and are less settled than the 50-iteration single-device medians above."
+    },
+    "nvidia_is_a_kernel_selection_fallback_not_a_glitch": {
+      "question": "The user asked whether the RTX 4060 being slower than CPU must be a glitch. It is not.",
+      "evidence": "Per-node exec_type profiling of the same graph on both GPUs. The same 72 FullyConnectedCompressed MatMul nodes run 'fully_connected_gpu_bf_tiled__f16' on GPU.0 for 8.44 ms total, but 'fully_connected_gpu_bfyx_ref__f32' on GPU.1 for 233.78 ms total — 27.7x. '_ref' is the scalar reference OpenCL kernel. Attention also degrades from 'ocl::sdpa::opt__f16' (12 nodes, 0.49 ms) to 'gemm_ref__f32' (24 nodes, 1.61 ms) plus 'softmax_gpu_ref__f32' (12 nodes, 0.33 ms). The NVIDIA path runs f32 where the Intel path runs f16.",
+      "mechanism": "DEVICE_ARCHITECTURE reports the Arc as vendor=0x8086 arch=v12.71.4 (a real Xe uArch) and the NVIDIA as vendor=0x10de arch=v8.9.0 — the CUDA compute capability read as if it were an Intel uArch. The kernel selector keys off Intel uArch, matches nothing, and falls through to the reference kernels.",
+      "ruled_out": {
+        "cpu_fallback": "compiled_model.get_property(execution_devices) returns ['GPU.1']; the graph really is on the NVIDIA card",
+        "lazy_init": "10 warm-ups precede the 50 timed iterations and the first five timed values are 239.1, 238.9, 238.7, 239.1, 238.6 ms — no decay curve",
+        "noise": "min 238.18 / median 239.09 / max 241.51 ms over 50 iterations, a +/-0.7% spread",
+        "compile_cost": "compile is 0.86 s and is measured separately from inference"
+      },
+      "consequence": "OpenVINO is not a way to drive the NVIDIA card. The LLM stays on Fennec's own CUDA/Vulkan tier (11.71 / 10.61 tok/s measured)."
+    },
+    "retracted": [
+      "'The NPU is unusable / compute is refused by the driver' — wrong in scope. Only DirectML is refused. Corrected in README.md, in ort_tensorrt_verdict.blockers.npu_blocked_below_ort, and in project memory.",
+      "NPU cosine 0.830 and GPU.0 cosine 0.824 — measured on RANDOM token ids, which are out of distribution for an int8-calibrated model. On real tokenized text the same devices give 0.9998. Not a device defect."
+    ],
+    "evidence": "engine-bench/ov_gpu1_diag.py; logs/ov-gpu1-diag.log (first pass, 50 iterations); logs/ov-gpu-diag2.log (both GPUs profiled, exec_type tables)",
+    "rust_binding_path": {
+      "crate": "openvino 0.11.1 (27 versions on crates.io), feature runtime-linking -> openvino-sys/runtime-linking = ['libloading']",
+      "why_it_works_here": "openvino-sys build.rs:31 skips linking when runtime-linking or dynamic-linking is set; src/linking/runtime.rs uses libloading to dlopen openvino_c.dll. No MSVC, no import lib, no target-triple match, and no C or C++ authored in this project.",
+      "libraries_already_installed": "openvino_c.dll 0.2 MB and openvino_c.lib 0.1 MB beside openvino.dll 16.5 MB, openvino_intel_npu_plugin.dll 7.6 MB, openvino_intel_npu_compiler.dll 100.3 MB, plus cpu/gpu/hetero/auto plugins",
+      "model_format_advantage": "Reads the OpenVINO IR already on disk. No ONNX export needed, which matters because there are zero .onnx files under the model root.",
+      "cost": "Absent from the offline registry cache, so it must be vendored to keep 'cargo build --release --offline' true. Not yet added as a dependency."
+    }
+  },
+  "ort_openvino_verdict": {
+    "request": "use ONNX Runtime to cover OpenVINO, features = ['openvino']; never write or compile C or C++",
+    "date": "2026-11-12",
+    "decision": "Not adoptable on this toolchain. The goal is reachable from pure Rust via the openvino crate instead — see openvino_npu_measured.rust_binding_path.",
+    "the_pasted_caveat_is_right_here_but_for_a_different_reason": "The brief said 'OpenVINO requires compiling ONNX Runtime from source'. A prebuilt OpenVINO EP DOES exist, so that is not generally true. It is effectively true on this box because the prebuilt is MSVC-static-only and this project targets x86_64-pc-windows-gnu.",
+    "feature_exists": "ort 2.0.0-rc.15 exposes 'openvino' -> ['ort-sys/openvino']; ort-sys declares openvino = [] (a marker feature consumed by build/download/resolve.rs). Verified from the crates.io sparse index, not from prose.",
+    "wrapper_supports_npu": "ort src/ep/openvino.rs documents with_device_type accepting 'CPU', 'NPU', 'GPU', 'GPU.0', 'GPU.1' and 'HETERO:NPU,GPU', plus with_cache_dir, with_num_threads, with_num_streams, with_precision, with_opencl_throttling, with_qdq_optimizer, with_dynamic_shapes. It uses the V2 key/value API, so it is not limited to the old CPU_FP32/GPU_FP16 enum in OrtOpenVINOProviderOptions.",
+    "prebuilt_binary": {
+      "url": "https://cdn.pyke.io/0/pyke:ort-rs/ms@1.31.0/x86_64-pc-windows-msvc+openvino.tar.lzma2",
+      "http_status": 200,
+      "bytes": 22337016,
+      "sha256_expected": "4b5e871b6e443cc2e9e4de269a5e592aa1f1e645201942160ce45732541bcbf1",
+      "sha256_verified": true,
+      "uncompressed_bytes": 325590016,
+      "contents": [
+        {
+          "name": "onnxruntime.lib",
+          "mb": 309.2,
+          "note": "static MSVC library"
+        },
+        {
+          "name": "onnxruntime_providers_openvino.dll",
+          "mb": 1.29
+        },
+        {
+          "name": "onnxruntime_providers_shared.dll",
+          "mb": 0.01
+        }
+      ],
+      "ep_dll_imports": [
+        "openvino.dll",
+        "onnxruntime_providers_shared.dll",
+        "msvcp140.dll",
+        "vcruntime140.dll",
+        "vcruntime140_1.dll",
+        "api-ms-win-crt-*"
+      ],
+      "ep_dll_npu_strings": [
+        "NPU",
+        "NPU.",
+        "NPUW"
+      ],
+      "note": "The OpenVINO runtime itself is not bundled; the EP DLL imports openvino.dll and expects it to be supplied."
+    },
+    "why_load_dynamic_does_not_save_it": "This was my own hypothesis and the tarball refuted it. ort's load-dynamic feature enables ort-sys/disable-linking, and build/main.rs:25 returns early on that cfg, skipping resolve_dist entirely — so the target mismatch would be bypassed. But load-dynamic needs an onnxruntime.dll to dlopen, and this distribution ships only a 309 MB static onnxruntime.lib. There is no DLL to load.",
+    "target_mismatch": {
+      "active_toolchain": "stable-x86_64-pc-windows-gnu (default)",
+      "installed_targets": [
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+        "x86_64-pc-windows-gnu"
+      ],
+      "dist_table_rows_for_this_target": 0,
+      "failure_mode": "build/download/resolve.rs finds no candidates and logs 'no prebuilt binaries available for target x86_64-pc-windows-gnu / note: you may have to compile ONNX Runtime from source and link ort to your custom build'",
+      "msvc_available": false
+    },
+    "remaining_blockers_even_with_msvc": [
+      "Zero .onnx files under the model root. ORT cannot read OpenVINO IR, so the embedder would need exporting; torch is installed but onnx, onnxruntime and optimum are all absent.",
+      "The LLM is 43 int4-packed safetensors shards with a custom gated-delta-net MoE block; no stock exporter handles it.",
+      "ORT owns its session allocator and cannot express tiered expert residency.",
+      "ort and ort-sys are absent from the offline registry cache; download-binaries and copy-dylibs are default features, so adding ort breaks cargo build --release --offline."
+    ],
+    "what_would_change_it": "An MSVC toolchain (link.exe + the MSVC CRT) or an onnxruntime.dll built with the OpenVINO EP, plus an ONNX export of the embedder. Neither is present, and a source build is C++ — explicitly ruled out by the user.",
+    "evidence": "engine-bench/cache/ort-sys-src (build/main.rs, build/download/resolve.rs, build/download/dist.tsv, build/download/extract.rs); engine-bench/cache/ort-src/ort-2.0.0-rc.15/src/ep/openvino.rs; engine-bench/cache/ort-openvino-prebuilt (downloaded, hash-verified, contents listed); logs/crates-ort.json and logs/crates-ort-sys.json"
+  },
+  "ort_nvrtx_verdict": {
+    "request": "add TensorRT RTX to the ort wrapper; the docs widget lists NVIDIA / TensorRT RTX / 'Ready to use' / features = ['nvrtx']",
+    "date": "2026-11-12",
+    "decision": "The feature is real and the wrapper is complete, but it cannot run on this box: the TensorRT RTX runtime DLLs are not installed and not bundled, and the prebuilt is MSVC-static-only against a GNU toolchain. Not added.",
+    "what_ready_to_use_means": "It means the ort side needs no ONNX Runtime source build — a prebuilt distribution exists. It does NOT mean the NVIDIA TensorRT RTX runtime is included. The EP DLL imports it and expects it to be installed separately.",
+    "feature_exists": "ort 2.0.0-rc.15 exposes 'nvrtx' -> ['ort-sys/nvrtx']. Wrapper is ep::NVRTX, CANONICAL_NAME 'NvTensorRtRtxExecutionProvider', SHORT_NAME 'NvTensorRtRtx'.",
+    "wrapper_options": [
+      "with_device_id",
+      "with_cuda_graph",
+      "with_max_workspace",
+      "with_max_shared_mem",
+      "with_profile_min_shapes",
+      "with_profile_max_shapes",
+      "with_profile_opt_shapes",
+      "with_multi_profile",
+      "with_runtime_cache_path",
+      "unsafe with_compute_stream"
+    ],
+    "prebuilt_binary": {
+      "url": "https://cdn.pyke.io/0/pyke:ort-rs/ms@1.31.0/x86_64-pc-windows-msvc+nvrtx,directml.tar.lzma2",
+      "bytes": 34075400,
+      "sha256_expected": "ab4cf4ca5592de532999d8e5229a8d7ab0bfa03508c012c443a852f8c678c3f2",
+      "sha256_verified": true,
+      "uncompressed_bytes": 401694208,
+      "contents": [
+        {
+          "name": "onnxruntime.lib",
+          "mb": 364.71,
+          "note": "static MSVC library; again no onnxruntime.dll"
+        },
+        {
+          "name": "DirectML.dll",
+          "mb": 17.67,
+          "note": "bundled"
+        },
+        {
+          "name": "onnxruntime_providers_nv_tensorrt_rtx.dll",
+          "mb": 0.69
+        },
+        {
+          "name": "onnxruntime_providers_shared.dll",
+          "mb": 0.01
+        }
+      ],
+      "note": "This is a combined nvrtx+directml distribution, so one binary would carry both EPs. There is no openvino+nvrtx combination in dist.tsv."
+    },
+    "ep_dll_dependencies": {
+      "tensorrt_rtx_1_4.dll": "ABSENT — the TensorRT RTX runtime itself, must be installed from NVIDIA",
+      "tensorrt_onnxparser_rtx_1_4.dll": "ABSENT — the RTX ONNX parser, must be installed from NVIDIA",
+      "nvcudart_hybrid64.dll": "PRESENT, 1,163,496 B, in C:\\Windows\\System32\\DriverStore\\FileRepository\\nvmii.inf_amd64_385185352e2ca7be — ships with the display driver",
+      "nvcuda.dll": "PRESENT, driver 621.14",
+      "msvcp140.dll / vcruntime140.dll / vcruntime140_1.dll": "MSVC CRT, required by the static MSVC distribution"
+    },
+    "absence_verified_by": "A filename search for tensorrt|nvinfer|nvonnxparser across C:\\Program Files\\NVIDIA Corporation, C:\\Program Files (x86)\\NVIDIA Corporation, the entire DriverStore FileRepository, C:\\ProgramData\\NVIDIA Corporation and D: returned exactly two files, both created by this investigation (the extracted EP DLL and ort's tensorrt.rs). The only NVIDIA installs present are NVIDIA App, NvTelemetry and PhysX.",
+    "target_mismatch": "dist.tsv lists nvrtx for x86_64-pc-windows-msvc (rows 'nvrtx,directml' and 'cuda13,tensorrt,nvrtx,directml') and x86_64-unknown-linux-gnu. There is no x86_64-pc-windows-gnu row, which is this project's active toolchain, and no msvc target is installed. Same blocker as the OpenVINO EP, and load-dynamic cannot bypass it because the dist ships no onnxruntime.dll.",
+    "remaining_blockers": [
+      "No TensorRT RTX runtime installed (two DLLs above).",
+      "No ONNX model: zero .onnx files under the model root; the LLM is 43 int4-packed safetensors shards with a custom gated-delta-net MoE block.",
+      "TensorRT RTX compiles a graph into an engine and owns its memory, so it cannot express tiered expert residency any more than classic TensorRT could.",
+      "ort/ort-sys absent from the offline registry cache; adding them breaks cargo build --release --offline."
+    ],
+    "what_would_change_it": "Install NVIDIA's TensorRT RTX package (supplying tensorrt_rtx_1_4.dll and tensorrt_onnxparser_rtx_1_4.dll), provide an MSVC toolchain or an onnxruntime.dll built with the nvrtx EP, and export the model to ONNX. The CUDA runtime dependency is already satisfied by the driver.",
+    "evidence": "engine-bench/cache/ort-src/ort-2.0.0-rc.15/src/ep/nvrtx.rs; engine-bench/cache/ort-nvrtx-prebuilt (downloaded, hash-verified, contents and PE import strings listed); engine-bench/cache/ort-sys-src/ort-sys-2.0.0-rc.15/build/download/dist.tsv rows 14, 15, 19"
+  },
+  "colibri_backend_surface": {
+    "question": "Does Colibri have an ONNX/ORT or Burn+CubeCL path to benchmark?",
+    "date": "2026-11-12",
+    "answer": "No. Neither exists anywhere in the checkout, so those two cells cannot be run for Colibri at all.",
+    "evidence": {
+      "grep": "onnxruntime|onnx|\\bort\\b|cubecl|\\bburn\\b over *.c *.h *.toml *.md *.json *.py *.txt",
+      "hits": 6,
+      "all_hits_are_the_english_word_burn": [
+        "c/colibri.c:14109 setenv(\"GOMP_SPINCOUNT\",\"200000\",0); /* spin briefly, then yield so long disk waits do not burn a core */",
+        "c/omp_tune.h:269 ... so a wait on the disk does not burn a core",
+        "c/openai_server.py:3434 ... burn the whole token budget before",
+        "c/openai_server.py:8140 ... do not burn bandwidth just to keep a socket warm",
+        "docs/tuning.md:77 ... so a disk wait does not burn a core",
+        "c/gliner_decide_tiny/tokenizer.json and web/package-lock.json: substring matches inside token/dependency tables"
+      ],
+      "build_config_verbatim": "gcc|-D_FILE_OFFSET_BITS=64 -O3 -march=x86-64-v3 -fopenmp ... -DCOLI_VULKAN|-lm -fopenmp -static -lpsapi |CUDA=0|CUDA_DLL=0|ARCH=x86-64-v3|CUDA_ARCH=native|METAL=0|HIP=0|HIP_DLL=0|HIP_ARCH=native|VK=1|XDNA=0"
+    },
+    "backends_that_do_exist": {
+      "cpu": "gcc + OpenMP, the default dependency-free build",
+      "vulkan": "VK=1, the tier the published 20.06 tok/s row used",
+      "cuda": "CUDA=1, c/backend_cuda.cu via nvcc, Linux x86-64 only, refused elsewhere with an early $(error)",
+      "hip": "HIP=1 via hipcc (Linux, ROCm 7.2 tested) or HIP_DLL=1 on Windows needing the HIP SDK plus an MSVC x64 host toolchain",
+      "metal": "METAL=1, macOS only, c/backend_metal.mm compiled by clang++ -x objective-c++, shader compiled at runtime so no Xcode offline metal compiler is needed",
+      "xdna2": "optional AMD Ryzen AI NPU lane, Windows only, off by default, needs coli_xdna.dll plus qualified .xclbin artifacts built with MSVC and the XRT SDK"
+    },
+    "metal_is_real_not_a_stub": {
+      "makefile_targets": [
+        "metal-test",
+        "glm53-metal-check",
+        "gemm-test",
+        "qwen36-metal-test"
+      ],
+      "qwen36_metal_gate": "c/Makefile:1192 'Apple gate: qwen36 routed experts through the MLX affine path, Metal vs' a CPU reference",
+      "qwen36_metal_test_deps": "tests/test_qwen36_qpack_metal.c qwen36_qpack.c qpack.c backend_metal.o $(VK_OBJ), -DCOLI_METAL -DQWEN36_QPACK -framework Metal -framework Foundation -lc++",
+      "macos_only_refusal": "c/Makefile:693 $(error METAL=1 is supported only on macOS)",
+      "this_box": "METAL=0 in c/.build-config; Windows cannot build or run it"
+    },
+    "cuda_and_hip_are_not_buildable_here": "no nvcc, no hipcc, no MSVC cl, no CUDA Toolkit and no Visual Studio directory; CUDA=1/HIP=1 are Linux-only in the Makefile anyway",
+    "xdna2_is_not_this_npu": "the lane is AMD XDNA2 (Ryzen AI) and this box has an Intel AI Boost NPU; it also needs an MSVC-built coli_xdna.dll and SHA256-qualified artifacts that are not present"
+  },
+  "burn_cubecl_verdict": {
+    "request": "include Colibri and Fennec on Burn + CubeCL in the benchmark",
+    "date": "2026-11-12",
+    "decision": "not runnable for this checkpoint; recorded as unavailable with evidence, not as a number",
+    "versions_checked": {
+      "burn": {
+        "latest": "0.23.0-pre.2",
+        "latest_stable": "0.22.1",
+        "versions": 51,
+        "live": 51
+      },
+      "cubecl": {
+        "latest": "0.11.4",
+        "versions": 33,
+        "live": 33
+      },
+      "burn_core_stable": "0.22.1",
+      "source": "crates.io sparse index: logs/crates-burn.json, logs/crates-cubecl.json, logs/crates-burn-core.json"
+    },
+    "cubecl_backends_are_real": {
+      "features": [
+        "cpu",
+        "cuda",
+        "hip",
+        "metal",
+        "metal-native",
+        "rocm",
+        "vulkan",
+        "webgpu",
+        "wgpu",
+        "wgpu-msl",
+        "wgpu-spirv",
+        "stdlib",
+        "tokio",
+        "autotune-checks",
+        "template",
+        "test-runtime"
+      ],
+      "note": "CubeCL genuinely covers CPU, CUDA, HIP/ROCm, Vulkan, WebGPU and Apple Metal, so the requested lanes are not the obstacle",
+      "no_npu_lane": "there is no NPU, DirectML, OpenVINO or XDNA feature in CubeCL's list"
+    },
+    "blockers": [
+      "Neither burn nor cubecl is in the offline registry cache (1166 crates; the only ML crates present are candle-core 0.11.1 and candle-nn 0.11.1). Adding them breaks `cargo build --release --offline`, a build property this project keeps.",
+      "Burn is a framework, not an inference engine: the Qwen3.6-35B-A3B architecture (256-expert MoE, top-8, gated delta net linear attention on 30 of 40 layers, attn_output_gate, partial rotary 0.25) would have to be written by hand.",
+      "There is no import path for this container. The checkpoint is 43 int4-packed safetensors shards with a custom nibble/group layout, not a Burn record (.bpk/.mpk), and there is no ONNX export (zero .onnx files under the model root).",
+      "No tiered residency: Burn/CubeCL have no hot-VRAM / warm-RAM / cold-NVMe expert placement with in-inference disk streaming, which is the whole engine here."
+    ],
+    "the_only_burn_qwen3_implementation_found": {
+      "repo": "holg/qwen3-burn",
+      "description": "Qwen3 language model implementation using the Burn deep learning framework in Rust",
+      "language": "Rust",
+      "stars": 3,
+      "pushed_at": "2026-02-22T16:41:43Z",
+      "archived": false,
+      "architecture": "decoder-only DENSE transformer (GQA, RoPE, RMSNorm, SwiGLU, QK-norm)",
+      "supported_sizes": [
+        "0.6B",
+        "1.7B",
+        "4B",
+        "8B",
+        "14B",
+        "32B"
+      ],
+      "why_it_does_not_apply": "dense only, no MoE routing, no gated delta net, no Qwen3.6; its Metal example runs through the `candle` feature, not CubeCL",
+      "weight_path": "HuggingFace safetensors -> Burn .bpk conversion, which does not describe this int4-packed container"
+    },
+    "what_would_change_it": "a hand-written Qwen3.6 MoE + gated-delta-net module in Burn, a loader for the int4-packed container, an expert-residency tier, and vendoring burn/cubecl into the offline cache",
+    "evidence": [
+      "engine-bench/logs/crates-burn.json",
+      "engine-bench/logs/crates-cubecl.json",
+      "engine-bench/logs/crates-burn-core.json",
+      "offline registry cache listing"
+    ]
+  },
+  "apple_metal_policy": {
+    "request": "on Apple always use Metal",
+    "date": "2026-11-12",
+    "status": "implemented and unit-tested, NOT measured: no Apple hardware on this box",
+    "host": "MSI Prestige 16 AI Studio B1VFG, Windows 11 Home, x64-based PC",
+    "fennec": {
+      "vendor_policy": "src/backend.rs:35-40 for_vendor: 0x10DE => Cuda, 0x106B => Metal, _ if portability => Metal, _ => Vulkan",
+      "portability_fallback": "a device advertising VK_KHR_portability_subset is treated as Metal even under an unnamed vendor id",
+      "mechanism": "Metal is reached through MoltenVK, which translates Vulkan calls and SPIR-V to Metal, so Metal and Vulkan share one code path and differ only in loader and portability hooks",
+      "loader_names_macos": [
+        "libMoltenVK.dylib",
+        "libvulkan.1.dylib",
+        "libvulkan.dylib"
+      ],
+      "explicit_aliases": "--backend metal|moltenvk|apple|mps, and COLI_METAL=1",
+      "unit_tests": [
+        "backend.rs:137 for_vendor(0x106B,false)==Metal",
+        "backend.rs:140 for_vendor(0x1002,true)==Metal",
+        "backend.rs:141 for_vendor(0,true)==Metal",
+        "backend.rs:191 Metal.is_vulkan()"
+      ],
+      "cross_compile_targets_installed": [
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin"
+      ],
+      "why_still_unmeasured": "installed Rust targets allow cross-compilation, not execution; there is no Mac to run on and no Metal runtime on Windows"
+    },
+    "colibri": {
+      "has_a_native_metal_backend": true,
+      "source": "c/backend_metal.mm, objective-c++, -framework Metal -framework Foundation -lc++",
+      "gated_macos_only": "c/Makefile:693 $(error METAL=1 is supported only on macOS)",
+      "this_build": "METAL=0",
+      "qwen36_apple_gate": "qwen36-metal-test runs qwen36 routed experts through the MLX affine path against a CPU reference"
+    },
+    "consequence_for_the_table": "the Apple/Metal row stays labelled unmeasured for both engines. It is not a missing feature and not a zero."
+  },
+  "serve_thinking_default_fix": {
+    "found_while": "re-running both engines through one serve protocol for the backend matrix",
+    "date": "2026-11-12",
+    "symptom": "a plain streaming chat completion with max_tokens=64 returned usage.completion_tokens=64 but ZERO delta.content chunks; every token went to delta.reasoning_content, so a client reading the answer field saw an empty reply",
+    "root_cause": "src/serve.rs:295 read v[\"enable_thinking\"].as_bool().unwrap_or(true), defaulting thinking ON",
+    "colibri_contract": "c/openai_server.py:9610 enable_thinking = body.get(\"enable_thinking\", reasoning_effort not in (None, \"none\")) -> defaults OFF for the qwen family; render_chat_qwen also defaults enable_thinking=False",
+    "fix": "mirror Colibri exactly: honour enable_thinking when present, otherwise default to true only when reasoning_effort is present and not \"none\"",
+    "why_it_matters_beyond_the_benchmark": "Fennec is a drop-in replacement for Colibri's OpenAI-compatible surface; the suite's clients and harnesses were written against the Colibri default",
+    "build": "cargo build --release --offline -j 6, exit 0, zero warnings (logs/build-thinking-default.log)",
+    "known_remaining_template_difference": {
+      "what": "Colibri's render_chat_qwen emits a think-block opener when thinking is on; Fennec's chat_prompt emits none and relies on the model to produce the marker",
+      "why_not_changed": "src/serve.rs:199 hardcodes `let mut think = false`, so the prompt's think state is not threaded into generate. Adding the opener without that would route reasoning text into `content` -- a worse bug. Left as a disclosed difference, not half-fixed.",
+      "detected_by": "the matrix harness now counts content and reasoning deltas separately and takes the token count from usage.completion_tokens"
+    },
+    "harness_hardening": "engine-bench/bench-backend-matrix.py no longer counts SSE chunks as tokens; it raises if usage reports no completion tokens, so a template difference can never again appear as a throughput number"
+  },
+  "backend_matrix": {
+    "request": "rerun Colibri and Fennec on CPU / Vulkan / ONNX-or-ORT / Burn+CubeCL, Metal on Apple",
+    "date": "2026-11-12T20:49:33Z",
+    "why_a_new_protocol": "The published table compared Fennec's instrumented decode loop against Colibri's HTTP server, so the two columns were not the same measurement. This matrix runs both engines through `serve` and one streaming /v1/chat/completions request, at the same context, the same token budget and the same greedy sampler, median of 3.",
+    "protocol": "every live cell: serve + one streaming chat completion, same prompt and budget, median of pairs",
+    "model": "qwen36-35b (43 int4-packed shards, 22.76 GiB)",
+    "ctx": 32768,
+    "tokens": 64,
+    "pairs": 3,
+    "host": {
+      "system": "Windows",
+      "release": "11",
+      "machine": "AMD64"
+    },
+    "token_count_source": "usage.completion_tokens from the final SSE chunk, not a count of SSE frames. A frame can carry a partial character or several tokens, and a reasoning model can spend the whole budget in reasoning_content while content stays empty. The harness raises if usage reports zero.",
+    "cells": [
+      {
+        "cell": "colibri-cpu",
+        "engine": "colibri",
+        "status": "ok",
+        "args": [
+          "--policy",
+          "quality"
+        ],
+        "env": {},
+        "startup_s": 9.0,
+        "median_tokens_per_s": 8.162,
+        "median_ttft_s": 1.109,
+        "median_tpot_ms": 122.524,
+        "median_total_s": 8.906,
+        "runs_tokens_per_s": [
+          4.5,
+          8.162,
+          8.178
+        ],
+        "runs_ttft_s": [
+          0.797,
+          1.187,
+          1.109
+        ],
+        "range_tokens_per_s": [
+          4.5,
+          8.178
+        ],
+        "tokens_per_run": [
+          64,
+          64,
+          64
+        ],
+        "content_chunks": [
+          64,
+          64,
+          64
+        ],
+        "reasoning_chunks": [
+          0,
+          0,
+          0
+        ],
+        "finish_reason": [
+          "length",
+          "length",
+          "length"
+        ],
+        "log": "engine-bench/logs/matrix-colibri-cpu.log"
+      },
+      {
+        "cell": "colibri-vulkan",
+        "engine": "colibri",
+        "status": "ok",
+        "args": [
+          "--auto-tier",
+          "--policy",
+          "quality"
+        ],
+        "env": {
+          "COLI_VULKAN": "1",
+          "COLI_VK_TIER_HOST_GB": "4"
+        },
+        "startup_s": 25.1,
+        "median_tokens_per_s": 15.273,
+        "median_ttft_s": 0.64,
+        "median_tpot_ms": 65.476,
+        "median_total_s": 4.765,
+        "runs_tokens_per_s": [
+          7.55,
+          15.273,
+          16.125
+        ],
+        "runs_ttft_s": [
+          0.625,
+          0.64,
+          0.703
+        ],
+        "range_tokens_per_s": [
+          7.55,
+          16.125
+        ],
+        "tokens_per_run": [
+          64,
+          64,
+          64
+        ],
+        "content_chunks": [
+          64,
+          64,
+          64
+        ],
+        "reasoning_chunks": [
+          0,
+          0,
+          0
+        ],
+        "finish_reason": [
+          "length",
+          "length",
+          "length"
+        ],
+        "log": "engine-bench/logs/matrix-colibri-vulkan.log"
+      },
+      {
+        "cell": "fennec-cpu",
+        "engine": "fennec",
+        "status": "ok",
+        "args": [
+          "--cpu",
+          "--threads",
+          "8"
+        ],
+        "env": {},
+        "startup_s": 26.9,
+        "median_tokens_per_s": 2.684,
+        "median_ttft_s": 5.796,
+        "median_tpot_ms": 372.524,
+        "median_total_s": 28.672,
+        "runs_tokens_per_s": [
+          2.148,
+          2.798,
+          2.684
+        ],
+        "runs_ttft_s": [
+          5.796,
+          5.812,
+          5.203
+        ],
+        "range_tokens_per_s": [
+          2.148,
+          2.798
+        ],
+        "tokens_per_run": [
+          64,
+          64,
+          64
+        ],
+        "content_chunks": [
+          64,
+          64,
+          64
+        ],
+        "reasoning_chunks": [
+          0,
+          0,
+          0
+        ],
+        "finish_reason": [
+          "length",
+          "length",
+          "length"
+        ],
+        "log": "engine-bench/logs/matrix-fennec-cpu.log"
+      },
+      {
+        "cell": "fennec-vulkan",
+        "engine": "fennec",
+        "status": "ok",
+        "args": [
+          "--gpu",
+          "0",
+          "--backend",
+          "vulkan",
+          "--threads",
+          "8",
+          "--host-gb",
+          "18"
+        ],
+        "env": {},
+        "startup_s": 21.8,
+        "median_tokens_per_s": 10.209,
+        "median_ttft_s": 2.313,
+        "median_tpot_ms": 97.952,
+        "median_total_s": 8.484,
+        "runs_tokens_per_s": [
+          9.669,
+          10.209,
+          10.926
+        ],
+        "runs_ttft_s": [
+          2.546,
+          2.313,
+          2.188
+        ],
+        "range_tokens_per_s": [
+          9.669,
+          10.926
+        ],
+        "tokens_per_run": [
+          64,
+          64,
+          64
+        ],
+        "content_chunks": [
+          64,
+          64,
+          64
+        ],
+        "reasoning_chunks": [
+          0,
+          0,
+          0
+        ],
+        "finish_reason": [
+          "length",
+          "length",
+          "length"
+        ],
+        "log": "engine-bench/logs/matrix-fennec-vulkan.log"
+      },
+      {
+        "cell": "fennec-cuda",
+        "engine": "fennec",
+        "status": "ok",
+        "args": [
+          "--gpu",
+          "0",
+          "--backend",
+          "cuda",
+          "--threads",
+          "8",
+          "--host-gb",
+          "18"
+        ],
+        "env": {},
+        "startup_s": 13.1,
+        "median_tokens_per_s": 12.562,
+        "median_ttft_s": 2.063,
+        "median_tpot_ms": 79.603,
+        "median_total_s": 7.078,
+        "runs_tokens_per_s": [
+          11.2,
+          12.562,
+          12.638
+        ],
+        "runs_ttft_s": [
+          2.593,
+          2.063,
+          2.047
+        ],
+        "range_tokens_per_s": [
+          11.2,
+          12.638
+        ],
+        "tokens_per_run": [
+          64,
+          64,
+          64
+        ],
+        "content_chunks": [
+          64,
+          64,
+          64
+        ],
+        "reasoning_chunks": [
+          0,
+          0,
+          0
+        ],
+        "finish_reason": [
+          "length",
+          "length",
+          "length"
+        ],
+        "log": "engine-bench/logs/matrix-fennec-cuda.log"
+      }
+    ],
+    "winner": "colibri-vulkan at 15.273 tok/s; Fennec's best is CUDA at 12.562 (1.22x behind)",
+    "ratios": {
+      "colibri_vulkan_over_fennec_cuda": 1.216,
+      "colibri_vulkan_over_fennec_vulkan": 1.496,
+      "colibri_cpu_over_fennec_cpu": 3.041,
+      "fennec_cuda_over_fennec_vulkan": 1.23,
+      "fennec_cuda_over_fennec_cpu": 4.68
+    },
+    "first_run_is_cold": "Run 1 of each cell is a cold start and is slower in every cell (colibri-cpu 4.5, colibri-vulkan 7.55, fennec-cpu 2.148, fennec-vulkan 9.669, fennec-cuda 11.2). The median of 3 is reported, not the best run.",
+    "colibri_deltas_against_the_published_rows": {
+      "published_source": "benchmarks/results-engine-devices.json (2026-11-12T00:18:44Z)",
+      "cpu": {
+        "published_tok_s": 3.93,
+        "remeasured_tok_s": 8.162,
+        "cause": "the expert cache grew. Published log: 'RAM plan: 0 expert cache slots/layer, below one token's route; starting at 8' then 'cache=8/layer'. New log: 'cache=118/layer' - 14.75x more slots, because the .coli_usage selection history grew from 45,901,800 to 45,973,480. Same binary, same flags, different warm-start state.",
+        "published_runs": [
+          3.58,
+          3.93
+        ]
+      },
+      "vulkan": {
+        "published_tok_s": 20.06,
+        "remeasured_tok_s": 15.273,
+        "cause": "run-to-run spread, not configuration. The published 20.06 was run 2 of 2; run 1 was 8.45. The expert cache is comparable across the two sessions (published cache=133/layer, new cache=112/layer, both 'warm start, 4668 experts'), so the drop is not a plan change.",
+        "published_runs": [
+          8.45,
+          20.06
+        ],
+        "remeasured_runs": [
+          7.55,
+          15.273,
+          16.125
+        ]
+      },
+      "threads": "Colibri's own default changed: it now prints '[OMP] qwen36: 6 performance-core threads instead of 22 logical CPUs'. The published 20.06 row ran 16 threads. Fennec is pinned to 8 in every cell here."
+    },
+    "device_evidence": {
+      "colibri-cpu": [
+        "== qwen36 Phase-2 engine | cache=118/layer bits=4 ctx=32768 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==",
+        "resident weights loaded in 8.0s | RSS after load: 3.65 GB"
+      ],
+      "colibri-vulkan": [
+        "== qwen36 Phase-2 engine | cache=112/layer bits=4 ctx=32768 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==",
+        "resident weights loaded in 9.8s | RSS after load: 5.54 GB",
+        "[VK] ready: NVIDIA GeForce RTX 4060 Laptop GPU, compute qfam 0, memtype 4, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096 (cooperative matrix)"
+      ],
+      "fennec-cpu": [
+        "[fennec] load phases: host pool 16.7 s | dense+embed 0.0 s | lm_head 0.0 s | device upload 0.0 s",
+        "[fennec] 40 layers, 0 experts in VRAM, 5689 in RAM, loaded in 16.7 s"
+      ],
+      "fennec-vulkan": [
+        "[fennec] compute device: NVIDIA GeForce RTX 4060 Laptop GPU on Vulkan (SPIR-V)",
+        "[fennec] load phases: host pool 6.5 s | dense+embed 0.0 s | lm_head 0.7 s | device upload 13.3 s",
+        "[fennec] 40 layers, 2304 experts in VRAM, 7936 in RAM, loaded in 20.6 s"
+      ],
+      "fennec-cuda": [
+        "[fennec] compute device: NVIDIA GeForce RTX 4060 Laptop GPU on CUDA (NVIDIA driver API, PTX)",
+        "[fennec] load phases: host pool 5.9 s | dense+embed 0.0 s | lm_head 0.4 s | device upload 5.7 s",
+        "[fennec] 40 layers, 2304 experts in VRAM, 7936 in RAM, loaded in 12.1 s"
+      ]
+    },
+    "unavailable_cells": {
+      "colibri_onnx_ort": "no such code path exists in Colibri - see colibri_backend_surface",
+      "colibri_burn_cubecl": "NO SUCH CODE PATH - unchanged. A grep for onnxruntime|onnx|\\bort\\b|cubecl|\\bburn\\b over Colibri's C, headers, Makefiles, docs and Python returns six hits, every one the English word \"burn\" in a comment. There is nothing to run, so no number is reported.",
+      "fennec_onnx_ort": "not buildable on this toolchain - see ort_openvino_verdict and ort_nvrtx_verdict",
+      "fennec_burn_cubecl": "PARTLY UNBLOCKED - CPU measured at KERNEL LEVEL, Vulkan blocked upstream, see burn_cubecl_lane. Burn's Flex (pure-Rust CPU) backend runs the dominant decode kernels at the checkpoint's exact shapes. All 6 CubeCL/Vulkan cells panic inside cubecl-ir 0.11.4 before a kernel executes; removing burn-fusion and rebuilding reproduced the identical panic, so fusion is not the cause. A full-model lane remains impossible: dequantized to the precisions Burn can compute, the routed experts alone need 120 GiB at f32 or 60 GiB at f16 against 31.5 GiB RAM and 8 GiB VRAM, and Burn owns its allocator so tiered residency is not expressible. CubeCL-on-CPU specifically is blocked by a static LLVM link failure.",
+      "apple_metal_both_engines": "implemented and unit-tested on both, never executed - see apple_metal_policy",
+      "fennec_npu_openvino": "UNBLOCKED and measured in Rust - see npu_rust_lane. This was never an NPU limitation: ort's dist has no windows-gnu row and ships no DLL, while the openvino crate's runtime-linking dlopens the installed openvino_c.dll."
+    },
+    "artifacts": {
+      "results": "benchmarks/results-backend-matrix.json",
+      "table": "benchmarks/results-backend-matrix.md",
+      "driver": "engine-bench/bench-backend-matrix.py",
+      "charts": [
+        "docs/engine-matrix-tok.svg",
+        "docs/engine-matrix-ttft.svg",
+        "docs/engine-matrix-tpot.svg",
+        "docs/engine-matrix-total.svg",
+        "docs/engine-matrix-load.svg"
+      ],
+      "chart_tool": "tools/matrix_graph.py",
+      "npu_rust_results": "benchmarks/results-npu-rust.json",
+      "npu_rust_driver": "engine-bench/rust-lanes/src/main.rs",
+      "burn_cubecl_results": "benchmarks/results-burn-cubecl.json",
+      "burn_cubecl_driver": "engine-bench/burn-lanes/src/main.rs",
+      "burn_cubecl_log": "engine-bench/burn-lanes/lanes-burn.log",
+      "burn_cubecl_nofusion_diagnostic": "benchmarks/results-burn-cubecl-nofusion.json"
+    },
+    "published_rows_are_untouched": "results-engine-devices.json was not rewritten. The decode-loop numbers in the engines array stay labelled with their own protocol; this matrix is a separate, symmetric measurement and the README presents both."
+  },
+  "npu_rust_lane": {
+    "request": "unblock what is possible: wire the openvino crate (runtime-linking) for the NPU lane, in Rust, no C or C++",
+    "date": "2026-11-12T21:29:14Z",
+    "status": "MEASURED - this lane is no longer blocked",
+    "what_changed": "The blocker was never the NPU. ort's OpenVINO EP dist ships a 309 MB static MSVC onnxruntime.lib and no onnxruntime.dll, so load-dynamic has nothing to load, and dist.tsv has no x86_64-pc-windows-gnu row. The openvino crate's runtime-linking feature resolves to openvino-sys/runtime-linking = [libloading], whose build script skips linking entirely and dlopens openvino_c.dll at runtime. No import library, no target-triple match, no MSVC, no C or C++ authored, and no ONNX export: it reads the int8 IR already on disk.",
+    "crate": {
+      "features": [
+        "runtime-linking"
+      ],
+      "openvino": "0.11.1",
+      "openvino-sys": "0.11.1"
+    },
+    "openvino_version": "2026.4.1-22982-e213a147257-releases/2026/4",
+    "language": "Rust only; openvino-sys runtime-linking dlopens openvino_c.dll. No C or C++ authored, no MSVC, no ONNX export.",
+    "model": "embed/bge-base-en-v1.5-int8-ov (int8 OpenVINO IR, the suite's real embedder)",
+    "shape": [
+      1,
+      128
+    ],
+    "shapes_are_static": true,
+    "static_shapes_required_by": "the NPU plugin refuses dynamic shapes",
+    "protocol": "each device: compile, then 3 repeats of (10 warm-ups + 50 timed infer() calls); the cell median is the median of the three per-repeat medians. Fidelity pass runs all 5 real tokenized sentences on every device and compares against CPU.",
+    "warmups": 10,
+    "iterations": 50,
+    "repeats": 3,
+    "tokenizer": "inputs.json, produced by make_inputs.py with transformers AutoTokenizer, padding=max_length",
+    "sentences": [
+      "The fennec fox has unusually large ears for its body size.",
+      "Tiered residency keeps hot experts in video memory and streams cold ones.",
+      "A gated delta net replaces quadratic attention with a linear recurrence.",
+      "The router selects eight experts out of two hundred and fifty six.",
+      "Cold start improved when the host pool borrowed the mapping instead of copying."
+    ],
+    "available_devices": [
+      "CPU",
+      "GPU.0",
+      "GPU.1",
+      "NPU"
+    ],
+    "cells": [
+      {
+        "device": "CPU",
+        "status": "ok",
+        "compile_s": 0.4367912,
+        "median_infer_ms": 45.6546,
+        "runs_median_ms": [
+          43.663700000000006,
+          45.6546,
+          48.61685
+        ],
+        "min_infer_ms": 40.9026,
+        "max_infer_ms": 52.092800000000004,
+        "execution_devices": "CPU",
+        "device_architecture": "intel64",
+        "full_device_name": "Intel(R) Core(TM) Ultra 7 155H",
+        "output_shape": [
+          1,
+          128,
+          768
+        ]
+      },
+      {
+        "device": "NPU",
+        "status": "ok",
+        "compile_s": 0.2490837,
+        "median_infer_ms": 12.206150000000001,
+        "runs_median_ms": [
+          12.236650000000001,
+          12.206150000000001,
+          12.196000000000002
+        ],
+        "min_infer_ms": 12.0933,
+        "max_infer_ms": 12.3015,
+        "execution_devices": "NPU",
+        "device_architecture": "3720",
+        "full_device_name": "Intel(R) AI Boost",
+        "output_shape": [
+          1,
+          128,
+          768
+        ]
+      },
+      {
+        "device": "GPU.0",
+        "status": "ok",
+        "compile_s": 1.2018238,
+        "median_infer_ms": 10.2049,
+        "runs_median_ms": [
+          9.968499999999999,
+          10.328800000000001,
+          10.2049
+        ],
+        "min_infer_ms": 9.7436,
+        "max_infer_ms": 10.682799999999999,
+        "execution_devices": "GPU.0",
+        "device_architecture": "GPU: vendor=0x8086 arch=v12.71.4",
+        "full_device_name": "Intel(R) Arc(TM) Graphics (iGPU)",
+        "output_shape": [
+          1,
+          128,
+          768
+        ]
+      },
+      {
+        "device": "GPU.1",
+        "status": "ok",
+        "compile_s": 0.89482,
+        "median_infer_ms": 236.24829999999997,
+        "runs_median_ms": [
+          236.377,
+          236.24829999999997,
+          236.2068
+        ],
+        "min_infer_ms": 235.8916,
+        "max_infer_ms": 237.65720000000002,
+        "execution_devices": "GPU.1",
+        "device_architecture": "GPU: vendor=0x10de arch=v8.9.0",
+        "full_device_name": "NVIDIA GeForce RTX 4060 Laptop GPU (dGPU)",
+        "output_shape": [
+          1,
+          128,
+          768
+        ]
+      },
+      {
+        "device": "MULTI:NPU,CPU",
+        "status": "ok",
+        "compile_s": 0.906431,
+        "median_infer_ms": 12.32405,
+        "runs_median_ms": [
+          12.827099999999998,
+          12.32405,
+          12.310849999999999
+        ],
+        "min_infer_ms": 12.7526,
+        "max_infer_ms": 12.9392,
+        "execution_devices": "NPU.3720 CPU",
+        "device_architecture": "3720",
+        "full_device_name": "Intel(R) AI Boost",
+        "output_shape": [
+          1,
+          128,
+          768
+        ]
+      },
+      {
+        "device": "HETERO:NPU,CPU",
+        "status": "ok",
+        "compile_s": 0.5855575,
+        "median_infer_ms": 12.20205,
+        "runs_median_ms": [
+          12.2064,
+          12.19165,
+          12.20205
+        ],
+        "min_infer_ms": 12.061,
+        "max_infer_ms": 12.7615,
+        "execution_devices": "NPU",
+        "device_architecture": "3720",
+        "full_device_name": "Intel(R) AI Boost",
+        "output_shape": [
+          1,
+          128,
+          768
+        ]
+      }
+    ],
+    "winner": {
+      "device": "GPU.0",
+      "median_infer_ms": 10.2049,
+      "full_device_name": "Intel(R) Arc(TM) Graphics (iGPU)"
+    },
+    "ratios": {
+      "npu_vs_cpu_at_8_threads": 3.74,
+      "arc_vs_cpu_at_8_threads": 4.474,
+      "rtx4060_vs_cpu_at_8_threads": 0.193,
+      "npu_vs_arc": 0.836,
+      "rtx4060_vs_npu": 0.052
+    },
+    "fidelity": [
+      {
+        "against": "CPU",
+        "cosine_flat_mean": 0.9998141807109064,
+        "cosine_flat_min": 0.9998005639116098,
+        "cosine_flat_per_sentence": [
+          0.9998005639116098,
+          0.9998041548897667,
+          0.9998433499357551,
+          0.9998042863849574,
+          0.9998185484324426
+        ],
+        "cosine_pooled_mean": 0.9999075893495297,
+        "cosine_pooled_min": 0.9998910275514188,
+        "cosine_pooled_per_sentence": [
+          0.9999291946281109,
+          0.9998994244801384,
+          0.9999168809731821,
+          0.9998910275514188,
+          0.999901419114798
+        ],
+        "device": "NPU",
+        "sentences": 5
+      },
+      {
+        "against": "CPU",
+        "cosine_flat_mean": 0.9998075636550245,
+        "cosine_flat_min": 0.9997903277757533,
+        "cosine_flat_per_sentence": [
+          0.9998103707155789,
+          0.9997903277757533,
+          0.9998432169365261,
+          0.9998011064558255,
+          0.9997927963914389
+        ],
+        "cosine_pooled_mean": 0.99990749398958,
+        "cosine_pooled_min": 0.9998882799351954,
+        "cosine_pooled_per_sentence": [
+          0.9999316438933697,
+          0.9999009139777333,
+          0.9999210081492438,
+          0.9998882799351954,
+          0.9998956239923579
+        ],
+        "device": "GPU.0",
+        "sentences": 5
+      },
+      {
+        "against": "CPU",
+        "cosine_flat_mean": 0.9998269752255113,
+        "cosine_flat_min": 0.9998165705587275,
+        "cosine_flat_per_sentence": [
+          0.9998239645582522,
+          0.9998187355553775,
+          0.9998563031243796,
+          0.9998165705587275,
+          0.9998193023308205
+        ],
+        "cosine_pooled_mean": 0.9999107642700242,
+        "cosine_pooled_min": 0.9998931568098353,
+        "cosine_pooled_per_sentence": [
+          0.9999316641763893,
+          0.9999040699646451,
+          0.9999214402718158,
+          0.9998931568098353,
+          0.9999034901274355
+        ],
+        "device": "GPU.1",
+        "sentences": 5
+      },
+      {
+        "against": "CPU",
+        "cosine_flat_mean": 0.9998141807109064,
+        "cosine_flat_min": 0.9998005639116098,
+        "cosine_flat_per_sentence": [
+          0.9998005639116098,
+          0.9998041548897667,
+          0.9998433499357551,
+          0.9998042863849574,
+          0.9998185484324426
+        ],
+        "cosine_pooled_mean": 0.9999075893495297,
+        "cosine_pooled_min": 0.9998910275514188,
+        "cosine_pooled_per_sentence": [
+          0.9999291946281109,
+          0.9998994244801384,
+          0.9999168809731821,
+          0.9998910275514188,
+          0.999901419114798
+        ],
+        "device": "MULTI:NPU,CPU",
+        "sentences": 5
+      },
+      {
+        "against": "CPU",
+        "cosine_flat_mean": 0.9998141807109064,
+        "cosine_flat_min": 0.9998005639116098,
+        "cosine_flat_per_sentence": [
+          0.9998005639116098,
+          0.9998041548897667,
+          0.9998433499357551,
+          0.9998042863849574,
+          0.9998185484324426
+        ],
+        "cosine_pooled_mean": 0.9999075893495297,
+        "cosine_pooled_min": 0.9998910275514188,
+        "cosine_pooled_per_sentence": [
+          0.9999291946281109,
+          0.9998994244801384,
+          0.9999168809731821,
+          0.9998910275514188,
+          0.999901419114798
+        ],
+        "device": "HETERO:NPU,CPU",
+        "sentences": 5
+      }
+    ],
+    "fidelity_note": "Cosine against the CPU lane on real tokenized text, both flattened over the whole [1,128,768] output and mask-weighted mean-pooled to a 768-vector. An earlier 0.83 cosine came from feeding random token ids to an int8-calibrated model and is withdrawn.",
+    "cpu_threads": 8,
+    "cpu_threads_note": "The CPU lane is capped at 8 threads so this benchmark does not saturate the machine. The Python reference used OpenVINO's default thread count, so the two CPU figures are not directly comparable; NPU and GPU are unaffected by this setting.",
+    "cpu_variance_disclosure": "The CPU lane is the only unstable cell: per-run medians of 38.72 ms and 45.65 ms were observed in separate invocations. The Windows Defender process (MsMpEng) was measured at 63-69% CPU during one of them. NPU, Arc and RTX 4060 were unaffected: their per-repeat medians agree to within 0.3%, 3.5% and 0.05% respectively.",
+    "hetero_disclosure": "MULTI:NPU,CPU reports EXECUTION_DEVICES 'NPU.3720 CPU', so both devices genuinely participate. HETERO:NPU,CPU reports 'NPU' alone: the whole graph fit on the NPU, so the CPU half was not used in this run. Neither is a throughput win over the NPU by itself at this batch size.",
+    "rtx4060_anomaly_reproduced_from_rust": "GPU.1 is 236 ms against the Arc's 10.2 ms and the NPU's 12.2 ms. DEVICE_ARCHITECTURE reads 'GPU: vendor=0x10de arch=v8.9.0' for the NVIDIA card - the CUDA compute capability misread as an Intel uArch - against 'arch=v12.71.4' for the Arc. The kernel selector therefore matches nothing and falls back to the scalar reference OpenCL kernels. This reproduces the Python finding from Rust; it is not noise.",
+    "python_reference": {
+      "CPU_ms": 32.16,
+      "GPU.0_ms": 11.48,
+      "GPU.1_ms": 239.09,
+      "NPU_cosine_mean": 0.999838,
+      "NPU_cosine_min": 0.999732,
+      "NPU_ms": 12.75,
+      "note": "Recorded for comparison only. This file's numbers are the Rust measurements.",
+      "source": "the earlier Python OpenVINO pass, 10 warm-ups + 50 timed iterations, median"
+    },
+    "two_loader_bugs_found_and_fixed": [
+      "openvino-sys forwards the path straight to libloading::Library::new, which on Windows is LoadLibraryExW(path, 0, 0). Handing it the libs directory fails; it needs the openvino_c.dll file itself.",
+      "With flags 0 the dependency search starts at the executable's directory, so openvino.dll sitting beside openvino_c.dll is not found. Prepending the runtime directory to the process PATH puts it in the standard search order."
+    ],
+    "harness_bug_found_and_fixed": "The first version split the device list on ',', which cut MULTI:NPU,CPU into MULTI:NPU and ran the NPU alone while labelling it heterogeneous. The separator is now ';'. The truncated cells were discarded and re-measured, not published.",
+    "artifacts": {
+      "results": "benchmarks/results-npu-rust.json",
+      "driver": "engine-bench/rust-lanes/src/main.rs",
+      "inputs": "engine-bench/rust-lanes/make_inputs.py -> inputs.json",
+      "log": "engine-bench/rust-lanes/lanes-npu-rust.log"
+    },
+    "not_yet_wired_into_fennec": "This is a standalone lane crate, deliberately outside D:/Fennec so the engine's offline build does not acquire the dependency. Wiring it behind an optional feature is a separate decision; nothing in the engine changed."
+  },
+  "burn_cubecl_lane": {
+    "request": "unblock what is possible: vendor Burn + CubeCL and measure the MoE kernels in Rust",
+    "date": "2026-11-13T02:28:46Z",
+    "status": "CPU MEASURED, VULKAN BLOCKED UPSTREAM - a full-model lane is still impossible on this box",
+    "scope": "KERNEL-LEVEL, not full model. The dominant decode kernels at the checkpoint's exact shapes, on Burn's Flex and CubeCL backends.",
+    "what_changed": "Two earlier claims are withdrawn. (1) 'Neither burn nor cubecl is in the offline registry cache, so adding them breaks cargo build --offline' was wrong: cargo fetch pulled 357 crates into the shared cache and 689 packages locked, and the offline build resolves them with no vendoring. The lane is a standalone crate outside the engine, so Fennec's own dependency list is untouched. (2) 'Burn has no int4' was too coarse: 4-bit block storage exists, fused 4-bit compute does not. What did NOT get unblocked: every CubeCL/Vulkan cell panics inside cubecl-ir before a kernel runs, so the only measured cells are Burn's pure-Rust Flex CPU backend.",
+    "crate": {
+      "burn": "0.22.1",
+      "default_features": false,
+      "features": [
+        "std",
+        "flex",
+        "simd",
+        "rayon",
+        "vulkan",
+        "fusion"
+      ]
+    },
+    "api_note": "Burn 0.22 erased the backend type parameter: Tensor<D, K> carries no B, and the device a tensor was created on selects the runtime. One code path runs on CPU and on both Vulkan adapters unchanged. Backend types still exist (burn_flex::Flex, burn_wgpu::Wgpu = Fusion<CubeBackend>) but are not needed to write a kernel.",
+    "model_shapes": {
+      "experts_per_layer": 256,
+      "hidden": 2048,
+      "layers": 40,
+      "moe_intermediate": 512,
+      "top_k": 8
+    },
+    "protocol": "10 warm-ups then 30 timed iterations per repeat, median of 3 repeats, weights regenerated per repeat. Each iteration ends in a one-scalar readback because CubeCL queues asynchronously and burn-fusion defers execution; the readback is the sync point. Flex's rayon pool is capped via RAYON_NUM_THREADS before the first tensor.",
+    "cpu_threads": 8,
+    "cpu_threads_note": "RAYON_NUM_THREADS is set before the first tensor, so Flex's rayon pool is capped at this count. 8 matches every Fennec figure in this suite.",
+    "timing_method": "each iteration ends in a one-scalar readback, because CubeCL queues asynchronously and burn-fusion defers execution; the readback is the sync point. Weights are regenerated per repeat, so a repeat is not just re-reading a warm cache.",
+    "cells": [
+      {
+        "backend": "Flex (pure Rust)",
+        "device": "cpu",
+        "device_debug": "Device<Flex(Cpu)>",
+        "dtype": "f32",
+        "error": null,
+        "iterations": 30,
+        "kernel": "expert-ffn",
+        "max_ms": 2.8845,
+        "median_ms_per_layer": 2.30165,
+        "min_ms": 2.1401,
+        "projected_ms_per_token_x40_layers": 92.066,
+        "resident_weight_bytes_f32": 100663296,
+        "runs_ms": [
+          2.30165,
+          2.2878,
+          2.40425
+        ],
+        "status": "ok",
+        "warmups": 10
+      },
+      {
+        "backend": "Flex (pure Rust)",
+        "device": "cpu",
+        "device_debug": "Device<Flex(Cpu)>",
+        "dtype": "f32",
+        "error": null,
+        "iterations": 30,
+        "kernel": "router",
+        "max_ms": 0.0314,
+        "median_ms_per_layer": 0.027100000000000003,
+        "min_ms": 0.0269,
+        "projected_ms_per_token_x40_layers": 1.084,
+        "resident_weight_bytes_f32": 2097152,
+        "runs_ms": [
+          0.027100000000000003,
+          0.027100000000000003,
+          0.02695
+        ],
+        "status": "ok",
+        "warmups": 10
+      },
+      {
+        "backend": "Flex (pure Rust)",
+        "device": "cpu",
+        "device_debug": "Device<Flex(Cpu)>",
+        "dtype": "f32",
+        "error": null,
+        "iterations": 30,
+        "kernel": "shared-expert",
+        "max_ms": 0.4621,
+        "median_ms_per_layer": 0.39825,
+        "min_ms": 0.3581,
+        "projected_ms_per_token_x40_layers": 15.93,
+        "resident_weight_bytes_f32": 12582912,
+        "runs_ms": [
+          0.40315,
+          0.39825,
+          0.36955
+        ],
+        "status": "ok",
+        "warmups": 10
+      },
+      {
+        "backend": "Wgpu (CubeCL)",
+        "device": "vulkan-discrete",
+        "device_debug": "Device<Cube(Wgpu(WgpuDevice { kind: DiscreteGpu(0), backend: Vulkan }))>",
+        "dtype": "f32",
+        "error": "Error while reading data: use `try_into_scalar` instead to catch the error at runtime: Execution(An error happened during execution\nCaused by:\n  the work writing it was skipped 4 operation(s) below a failure: called `Result::unwrap()` on an `Err` value: \"Expected type vector.vector <4 x cube.f32 > to implement dyn MaybeVectorizedType\")",
+        "iterations": 30,
+        "kernel": "expert-ffn",
+        "max_ms": null,
+        "median_ms_per_layer": null,
+        "min_ms": null,
+        "projected_ms_per_token_x40_layers": null,
+        "resident_weight_bytes_f32": 0,
+        "runs_ms": [],
+        "status": "panicked",
+        "warmups": 10
+      },
+      {
+        "backend": "Wgpu (CubeCL)",
+        "device": "vulkan-discrete",
+        "device_debug": "Device<Cube(Wgpu(WgpuDevice { kind: DiscreteGpu(0), backend: Vulkan }))>",
+        "dtype": "f32",
+        "error": "Error while reading data: use `try_into_scalar` instead to catch the error at runtime: Execution(An error happened during execution\nCaused by:\n  the work writing it was skipped 3 operation(s) below a failure: called `Result::unwrap()` on an `Err` value: \"Expected type vector.vector <4 x cube.f32 > to implement dyn MaybeVectorizedType\")",
+        "iterations": 30,
+        "kernel": "router",
+        "max_ms": null,
+        "median_ms_per_layer": null,
+        "min_ms": null,
+        "projected_ms_per_token_x40_layers": null,
+        "resident_weight_bytes_f32": 0,
+        "runs_ms": [],
+        "status": "panicked",
+        "warmups": 10
+      },
+      {
+        "backend": "Wgpu (CubeCL)",
+        "device": "vulkan-discrete",
+        "device_debug": "Device<Cube(Wgpu(WgpuDevice { kind: DiscreteGpu(0), backend: Vulkan }))>",
+        "dtype": "f32",
+        "error": "Error while reading data: use `try_into_scalar` instead to catch the error at runtime: Execution(An error happened during execution\nCaused by:\n  the work writing it was skipped 4 operation(s) below a failure: called `Result::unwrap()` on an `Err` value: \"Expected type vector.vector <4 x cube.f32 > to implement dyn MaybeVectorizedType\")",
+        "iterations": 30,
+        "kernel": "shared-expert",
+        "max_ms": null,
+        "median_ms_per_layer": null,
+        "min_ms": null,
+        "projected_ms_per_token_x40_layers": null,
+        "resident_weight_bytes_f32": 0,
+        "runs_ms": [],
+        "status": "panicked",
+        "warmups": 10
+      },
+      {
+        "backend": "Wgpu (CubeCL)",
+        "device": "vulkan-integrated",
+        "device_debug": "Device<Cube(Wgpu(WgpuDevice { kind: IntegratedGpu(0), backend: Vulkan }))>",
+        "dtype": "f32",
+        "error": "Error while reading data: use `try_into_scalar` instead to catch the error at runtime: Execution(An error happened during execution\nCaused by:\n  the work writing it was skipped 4 operation(s) below a failure: called `Result::unwrap()` on an `Err` value: \"Expected type vector.vector <4 x cube.f32 > to implement dyn MaybeVectorizedType\")",
+        "iterations": 30,
+        "kernel": "expert-ffn",
+        "max_ms": null,
+        "median_ms_per_layer": null,
+        "min_ms": null,
+        "projected_ms_per_token_x40_layers": null,
+        "resident_weight_bytes_f32": 0,
+        "runs_ms": [],
+        "status": "panicked",
+        "warmups": 10
+      },
+      {
+        "backend": "Wgpu (CubeCL)",
+        "device": "vulkan-integrated",
+        "device_debug": "Device<Cube(Wgpu(WgpuDevice { kind: IntegratedGpu(0), backend: Vulkan }))>",
+        "dtype": "f32",
+        "error": "Error while reading data: use `try_into_scalar` instead to catch the error at runtime: Execution(An error happened during execution\nCaused by:\n  the work writing it was skipped 3 operation(s) below a failure: called `Result::unwrap()` on an `Err` value: \"Expected type vector.vector <4 x cube.f32 > to implement dyn MaybeVectorizedType\")",
+        "iterations": 30,
+        "kernel": "router",
+        "max_ms": null,
+        "median_ms_per_layer": null,
+        "min_ms": null,
+        "projected_ms_per_token_x40_layers": null,
+        "resident_weight_bytes_f32": 0,
+        "runs_ms": [],
+        "status": "panicked",
+        "warmups": 10
+      },
+      {
+        "backend": "Wgpu (CubeCL)",
+        "device": "vulkan-integrated",
+        "device_debug": "Device<Cube(Wgpu(WgpuDevice { kind: IntegratedGpu(0), backend: Vulkan }))>",
+        "dtype": "f32",
+        "error": "Error while reading data: use `try_into_scalar` instead to catch the error at runtime: Execution(An error happened during execution\nCaused by:\n  the work writing it was skipped 4 operation(s) below a failure: called `Result::unwrap()` on an `Err` value: \"Expected type vector.vector <4 x cube.f32 > to implement dyn MaybeVectorizedType\")",
+        "iterations": 30,
+        "kernel": "shared-expert",
+        "max_ms": null,
+        "median_ms_per_layer": null,
+        "min_ms": null,
+        "projected_ms_per_token_x40_layers": null,
+        "resident_weight_bytes_f32": 0,
+        "runs_ms": [],
+        "status": "panicked",
+        "warmups": 10
+      }
+    ],
+    "winner_expert_ffn": {
+      "backend": "Flex (pure Rust)",
+      "device": "cpu",
+      "median_ms_per_layer": 2.30165,
+      "projected_ms_per_token": 92.066
+    },
+    "projected_ms_per_token": {
+      "burn_flex_cpu_expert_ffn": 92.066,
+      "burn_vulkan_discrete_expert_ffn": null,
+      "burn_vulkan_integrated_expert_ffn": null,
+      "burn_flex_cpu_router": 1.084,
+      "burn_flex_cpu_shared_expert": 15.93,
+      "fennec_moe_host_experts": 36.63,
+      "fennec_route": 4.31,
+      "note": "Burn's projection is per-kernel x 40 layers, the same workload Fennec's stage profile reports. It is NOT a token rate: no attention, no sampling, no KV, no residency traffic. Comparing it to a full decode tok/s would be meaningless."
+    },
+    "ratios": {
+      "burn_flex_cpu_vs_fennec_host_experts": 2.513
+    },
+    "precision_caveat": "Burn 0.22.1 has quantize/quantize_dynamic/dequantize and a 4-bit block dtype (mxfp4 per_block[32] UE8M0, nvfp4 per_block[16] UE4M3), but NO fused quantized matmul anywhere in burn-tensor, burn-backend, burn-cubecl or cubecl. These GEMMs therefore run on dequantized f32 weights, reading 8x the bytes Fennec's int4 group-64 kernel reads with the dequant fused into the dot. Not a like-for-like kernel comparison.",
+    "cubecl_cpu_not_measured": {
+      "chain": "burn/cpu -> burn-cpu -> cubecl/cpu -> cubecl-cpu -> cubecl-llvm -> tracel-llvm-bundler",
+      "consequence": "the CPU cell here is Burn's Flex backend, not CubeCL-on-CPU. Flex is the backend Burn 0.22 itself recommends (NdArray and LibTorch are deprecated in favour of it), and it is pure Rust, so it also satisfies the no-C/C++ constraint. The GPU cells are genuinely CubeCL.",
+      "detail": "cubecl's CPU runtime JIT-compiles kernels through LLVM and links it statically. The bundler downloaded tracel-llvm-23.1.0-4-windows-x64.tar.xz (59,586,340 bytes) into the user cache but no extracted lib directory was produced, so the link line names archives that are not on disk. Clearing it needs a working LLVM install, which is a system-wide change this suite does not make.",
+      "error": "could not find native static library `LLVMWindowsManifest`, perhaps an -L flag is missing?",
+      "status": "BLOCKED - build failure, not a runtime refusal"
+    },
+    "cubecl_vulkan_blocked": {
+      "status": "BLOCKED - upstream panic, every one of the 6 Vulkan cells",
+      "cells": [
+        "vulkan-discrete/expert-ffn",
+        "vulkan-discrete/router",
+        "vulkan-discrete/shared-expert",
+        "vulkan-integrated/expert-ffn",
+        "vulkan-integrated/router",
+        "vulkan-integrated/shared-expert"
+      ],
+      "panic_site": "cubecl-ir-0.11.4/src/interfaces/mod.rs:443:25",
+      "panic_message": "called `Result::unwrap()` on an `Err` value: \"Expected type vector.vector <4 x cube.f32 > to implement dyn MaybeVectorizedType\"",
+      "downstream_error": "src/main.rs readback: \"use `try_into_scalar` instead to catch the error at runtime: Execution(An error happened during execution Caused by: the work writing it was skipped 4 operation(s) below a failure)\" - 3 operations for the router. The readback is reporting a kernel that never executed.",
+      "root_cause": "Not a harness bug. cubecl-ir's vector_size() (interfaces/mod.rs:441-445) calls try_cast_ty!(ty, ctx, dyn MaybeVectorizedType) and unwraps it, while the sibling try_get_vector_size() (:447) uses the non-panicking type_cast::<dyn MaybeVectorizedType>(&*ty)?. The failing type is vector.vector, defined at types/mod.rs:29-46, and that definition DOES carry #[type_interface_impl] impl MaybeVectorizedType for VectorType returning self.vectorization. A second, unrelated VectorType (count/element_type) lives at types/spirv.rs:113-118 with its own impl. So the trait is implemented on the type that is being rejected: this is a pliron interface-registration failure inside cubecl-ir 0.11.4, upstream of anything this lane controls.",
+      "fusion_diagnostic": {
+        "hypothesis": "burn-fusion's deferred IR construction is what trips the cast",
+        "test": "removed \"fusion\" from the lane's Cargo.toml features, rebuilt and reran all 9 cells",
+        "result": "REFUTED - all 6 Vulkan cells panicked at the identical site with the identical message",
+        "artifacts": {
+          "results": "benchmarks/results-burn-cubecl-nofusion.json",
+          "log": "engine-bench/burn-lanes/lanes-burn-nofusion.log",
+          "build_log": "engine-bench/burn-lanes/lanes-build-burn4.log"
+        },
+        "consequence": "fusion is not the cause. The canonical published run is the fusion-on one (results-burn-cubecl.json); the fusion-off run is kept only as the diagnostic that rules fusion out."
+      },
+      "containment": "Each cell runs inside catch_unwind(AssertUnwindSafe(..)), so a panicking GPU cell is recorded with status/error and the CPU cells still publish. That is why this lane reports 3 measured cells and 6 blocked ones rather than nothing.",
+      "what_would_clear_it": "A cubecl-ir release where the vector.vector type's MaybeVectorizedType interface is registered before vector_size() is called, or a Burn/CubeCL version pair that does not hit that path on Windows Vulkan. Neither is something this suite can patch without editing a vendored upstream crate."
+    },
+    "cpu_run_spread": {
+      "note": "The fusion-on and fusion-off builds are two independent measurements of the same Flex kernels, not one run. expert-ffn median 2.302 ms/layer with fusion against 2.774 without; router 0.027 against 0.031; shared-expert 0.398 against 0.494. Both are reported, neither is averaged away. The published winner is the fusion-on build.",
+      "fusion_on": "benchmarks/results-burn-cubecl.json",
+      "fusion_off": "benchmarks/results-burn-cubecl-nofusion.json"
+    },
+    "fennec_reference": {
+      "mixer_device_ms": 23.79,
+      "moe_device_wait_ms": 3.32,
+      "moe_host_experts_ms": 36.63,
+      "moe_submit_ms": 4.99,
+      "note": "Fennec's host-expert figure is int4 weights read from RAM with dequant inside the AVX2 dot, 8 routed experts x 40 layers. Burn's projected figure is the same workload at f32.",
+      "route_ms": 4.31,
+      "source": "FENNEC_PROFILE=1 decode, rep-cuda3 median run, ms per token"
+    },
+    "why_not_full_model": {
+      "dequantized_f16_bytes": 64424509440,
+      "dequantized_f16_gib": 60.0,
+      "dequantized_f32_bytes": 128849018880,
+      "dequantized_f32_gib": 120.0,
+      "experts_total": 10240,
+      "host_ram_gib": 31.5,
+      "int4_packed_bytes_with_scales": 18119393280,
+      "verdict": "Burn owns its allocator, so hot-in-VRAM / warm-in-RAM / cold-on-NVMe tiering is not expressible. Dequantized to the only precisions it can compute, the routed experts alone need 120 GiB at f32 or 60 GiB at f16 against 31.5 GiB of RAM and 8 GiB of VRAM. A full-model Burn lane cannot run on this box.",
+      "vram_gib": 8.0,
+      "weights_per_expert": 3145728
+    },
+    "colibri": "Colibri has no Burn, CubeCL, ONNX or ORT code path at all: a grep for onnxruntime|onnx|\\bort\\b|cubecl|\\bburn\\b over its C, headers, Makefiles, docs and Python returns six hits, every one the English word \"burn\" in a comment. There is nothing to run for this lane.",
+    "artifacts": {
+      "results": "benchmarks/results-burn-cubecl.json",
+      "driver": "engine-bench/burn-lanes/src/main.rs",
+      "log": "engine-bench/burn-lanes/lanes-burn.log"
+    },
+    "not_wired_into_fennec": "Deliberately not a dependency of the engine. Burn owns its allocator, so adopting it would mean giving up the three-tier residency that makes a 22.76 GiB int4 checkpoint run on a 31.5 GiB box at all. This lane is evidence about the framework, not a proposed backend swap."
+  }
+}

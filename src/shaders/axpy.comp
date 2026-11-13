@@ -1,0 +1,24 @@
+#version 450
+// y += w * x, the routed-expert and shared-expert accumulation. `set` makes the
+// first accumulation of a token a plain store, so the accumulator needs no
+// zero-fill: 40 layers x 8 KiB of blocking host-to-device copy per token.
+layout(local_size_x = 256) in;
+layout(push_constant) uniform P {
+    uint n;
+    uint x_off;
+    uint y_off;
+    float w;
+    uint set;
+} p;
+layout(set = 0, binding = 0) readonly buffer X { float x[]; };
+layout(set = 0, binding = 1) buffer Y { float y[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.n) return;
+    if (p.set != 0u) {
+        y[p.y_off + i] = p.w * x[p.x_off + i];
+    } else {
+        y[p.y_off + i] += p.w * x[p.x_off + i];
+    }
+}

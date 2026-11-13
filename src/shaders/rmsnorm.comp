@@ -1,0 +1,36 @@
+#version 450
+// Qwen3_5MoeRMSNorm is zero-centred: the stored weight is a delta, use (1 + w).
+// One workgroup, tree reduction in f32 - the CPU sums in f64, so this agrees to
+// float tolerance, not bit for bit.
+layout(local_size_x = 256) in;
+layout(push_constant) uniform P {
+    uint n;
+    uint x_off;
+    uint w_off;
+    uint y_off;
+    float eps;
+} p;
+layout(set = 0, binding = 0) readonly buffer X { float x[]; };
+layout(set = 0, binding = 1) readonly buffer W { float w[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+
+shared float red[256];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    float acc = 0.0;
+    for (uint i = t; i < p.n; i += 256u) {
+        float v = x[p.x_off + i];
+        acc += v * v;
+    }
+    red[t] = acc;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (t < s) red[t] += red[t + s];
+        barrier();
+    }
+    float inv = inversesqrt(red[0] / float(p.n) + p.eps);
+    for (uint i = t; i < p.n; i += 256u) {
+        y[p.y_off + i] = x[p.x_off + i] * inv * (1.0 + w[p.w_off + i]);
+    }
+}

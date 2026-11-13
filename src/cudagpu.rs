@@ -1,0 +1,401 @@
+//! The CUDA device tier: same arena, same offsets, same six kernels as Vulkan.
+//!
+//! The driver API is loaded at runtime from `nvcuda.dll` / `libcuda.so.1`, which
+//! ships with the display driver, and the PTX in `kernels/fennec.ptx` is JIT'd by
+//! `cuModuleLoadData`. There is no nvcc, no ptxas and no CUDA toolkit in the
+//! build.
+//!
+//! The activation arena is **device-local** (`cuMemAlloc`), and `write`/`read_into`
+//! are explicit HtoD/DtoH copies. This is deliberately not Vulkan's host-visible
+//! coherent arena: CUDA zero-copy memory makes every kernel read its activations
+//! over PCIe, and the gemv re-reads the same x once per row. Measured on this
+//! card, pinned host memory cost lm_head 6.7 ms against 4.7 device-local and the
+//! mixer 25.5 ms against 14.6, so the copies are the cheaper side of that trade.
+//! Every offset the model computes still means the same thing on either backend.
+//!
+//! A batch is a list of launches rather than a recorded command buffer: the
+//! default stream is in-order, so consecutive kernels see each other's writes
+//! without the explicit barriers Vulkan needs.
+
+use crate::config::Result;
+use crate::cuda::{version_string, Cuda, DevPtr, Handle};
+use crate::gpu::Op;
+use crate::quant::Q4;
+use crate::vk::Device;
+use std::ffi::c_void;
+
+const PTX: &str = include_str!("kernels/fennec.ptx");
+
+/// One kernel per `Op`, in the same order the Vulkan pipelines are built.
+const NAMES: [&str; 8] = ["gemv_bf16", "gemv_q4", "rmsnorm", "silu_mul", "axpy", "gemv_f16", "gdn_conv", "gdn_rec"];
+
+struct CBuf {
+    ptr: DevPtr,
+    size: u64,
+    f16: bool,
+}
+
+/// A recorded launch. Arguments are held by value so the parameter block can
+/// point at them when the batch is submitted.
+#[derive(Clone, Copy)]
+enum Launch {
+    Axpy { n: u32, x_off: u32, y_off: u32, w: f32, set: bool },
+    SiluMul { n: u32, a_off: u32, b_off: u32, y_off: u32 },
+    RmsNorm { n: u32, x_off: u32, w_off: u32, y_off: u32, eps: f32 },
+    GemvQ4 { w: DevPtr, s: DevPtr, rows: u32, cols: u32, group: u32, x_off: u32, y_off: u32 },
+    GemvHalf { w: DevPtr, f16: bool, rows: u32, cols: u32, x_off: u32, y_off: u32 },
+    GdnConv { w: DevPtr, state: DevPtr, base: u32, cd: u32, kernel: u32, hist: u32 },
+    GdnRec { w: DevPtr, state: DevPtr, base: u32, out_off: u32, kd: u32, nv: u32, dk: u32, dv: u32, rep: u32, eps: f32 },
+}
+
+pub struct CudaGpu {
+    cu: Cuda,
+    pub info: Device,
+    bufs: Vec<CBuf>,
+    funcs: [Handle; 8],
+    arena_dev: DevPtr,
+    arena_floats: usize,
+    pub submitted: u64,
+    pub dispatches: u64,
+    pub sync_ms: f64,
+    pub syncs: u64,
+}
+
+// The context is current on the owning thread only; the CPU workers that run
+// alongside a submitted batch never touch it.
+unsafe impl Send for CudaGpu {}
+
+fn arg<T>(v: &mut T) -> *mut c_void {
+    v as *mut T as *mut c_void
+}
+
+fn div_up(n: u32, d: u32) -> u32 {
+    n.div_ceil(d)
+}
+
+impl CudaGpu {
+    pub fn open(index: usize) -> Result<CudaGpu> {
+        let mut cu = Cuda::load().map_err(|e| format!("no CUDA driver: {e}"))?;
+        cu.open(index, &[PTX]).map_err(|e| format!("CUDA device {index}: {e}"))?;
+        let mut funcs: [Handle; 8] = [std::ptr::null_mut(); 8];
+        for (i, n) in NAMES.iter().enumerate() {
+            funcs[i] = cu.function(n).map_err(|e| format!("CUDA kernel {n}: {e}"))?;
+        }
+        let d = cu.devices[index].clone();
+        let bytes = (d.total_gib * 2f64.powi(30)) as u64;
+        let info = Device {
+            index,
+            name: d.name.clone(),
+            vendor_id: 0x10DE,
+            device_id: 0,
+            class: 2,
+            api: format!("CUDA {}.{}", d.compute.0, d.compute.1),
+            driver: version_string(cu.driver_version),
+            device_local_gib: d.total_gib,
+            dedicated_gib: d.total_gib,
+            host_visible_gib: 0.0,
+            heaps: vec![(bytes, 0x1, false)],
+            extensions: Vec::new(),
+            vendor: "NVIDIA",
+            rank: 0,
+        };
+        let mut g = CudaGpu {
+            cu,
+            info,
+            bufs: Vec::new(),
+            funcs,
+            arena_dev: 0,
+            arena_floats: 0,
+            submitted: 0,
+            dispatches: 0,
+            sync_ms: 0.0,
+            syncs: 0,
+        };
+        // The same starting arena the Vulkan tier opens with, so a caller that
+        // writes activations without naming a size behaves identically on both.
+        g.reserve(crate::gpu::SCRATCH_FLOATS)?;
+        Ok(g)
+    }
+
+    pub fn name(&self) -> &str {
+        &self.info.name
+    }
+
+    /// Grow the device-local activation arena. Like the Vulkan tier's `reserve`,
+    /// this discards the contents: callers write their inputs after reserving.
+    pub fn reserve(&mut self, floats: usize) -> Result<()> {
+        if floats <= self.arena_floats {
+            return Ok(());
+        }
+        let dev = self
+            .cu
+            .alloc(floats * 4)
+            .map_err(|e| format!("CUDA arena of {} floats: {e}", floats))?;
+        self.cu.free(self.arena_dev);
+        self.arena_dev = dev;
+        self.arena_floats = floats;
+        Ok(())
+    }
+
+    pub fn arena(&self) -> usize {
+        self.arena_floats
+    }
+
+    pub fn upload(&mut self, bytes: &[u8]) -> Result<usize> {
+        self.upload_half(bytes, false)
+    }
+
+    pub fn upload_half(&mut self, bytes: &[u8], f16: bool) -> Result<usize> {
+        let ptr = self.cu.alloc(bytes.len()).map_err(|e| format!("CUDA alloc {} bytes: {e}", bytes.len()))?;
+        if let Err(e) = self.cu.write(ptr, bytes) {
+            self.cu.free(ptr);
+            return Err(format!("CUDA upload: {e}"));
+        }
+        self.bufs.push(CBuf { ptr, size: bytes.len() as u64, f16 });
+        Ok(self.bufs.len() - 1)
+    }
+
+    pub fn upload_q4(&mut self, q: &Q4) -> Result<(usize, usize)> {
+        if q.cols % 8 != 0 || q.group % 8 != 0 {
+            return Err(format!("the q4 kernel needs cols and group divisible by 8, got {} / {}", q.cols, q.group));
+        }
+        if q.signed {
+            return Err("the q4 kernel reads offset-binary nibbles; a borrowed pack must be flipped first".into());
+        }
+        if q.cols % q.group != 0 {
+            return Err(format!("the q4 kernel needs cols divisible by group, got {} / {}", q.cols, q.group));
+        }
+        let w = self.upload(&q.data)?;
+        let mut sb = Vec::with_capacity(q.scale.len() * 4);
+        for s in &q.scale {
+            sb.extend_from_slice(&s.to_le_bytes());
+        }
+        let s = self.upload(&sb)?;
+        Ok((w, s))
+    }
+
+    pub fn alloc_half(&mut self, bytes: usize, f16: bool) -> Result<usize> {
+        let ptr = self.cu.alloc(bytes).map_err(|e| format!("CUDA alloc {bytes} bytes: {e}"))?;
+        self.bufs.push(CBuf { ptr, size: bytes as u64, f16 });
+        Ok(self.bufs.len() - 1)
+    }
+
+    pub fn write_buf(&mut self, id: usize, at: usize, bytes: &[u8]) -> Result<()> {
+        if at + bytes.len() > self.bufs[id].size as usize {
+            return Err(format!("write_buf: {} bytes at {at} into a {}-byte buffer", bytes.len(), self.bufs[id].size));
+        }
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.cu.write(self.bufs[id].ptr + at as u64, bytes).map_err(|e| format!("CUDA write_buf {id}: {e}"))
+    }
+
+    pub fn read_buf(&mut self, id: usize, out: &mut [u8]) -> Result<()> {
+        if out.len() > self.bufs[id].size as usize {
+            return Err(format!("read_buf: {} bytes out of a {}-byte buffer", out.len(), self.bufs[id].size));
+        }
+        if out.is_empty() {
+            return Ok(());
+        }
+        self.cu.read(out, self.bufs[id].ptr).map_err(|e| format!("CUDA read_buf {id}: {e}"))
+    }
+
+    pub fn write(&mut self, off: usize, v: &[f32]) {
+        assert!(off + v.len() <= self.arena_floats, "activation arena too small");
+        let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
+        self.cu
+            .write(self.arena_dev + (off * 4) as u64, bytes)
+            .unwrap_or_else(|e| panic!("CUDA arena write at {off}: {e}"));
+    }
+
+    pub fn read(&self, off: usize, n: usize) -> Vec<f32> {
+        let mut out = vec![0f32; n];
+        self.read_into(off, &mut out);
+        out
+    }
+
+    pub fn read_into(&self, off: usize, out: &mut [f32]) {
+        assert!(off + out.len() <= self.arena_floats, "activation arena too small");
+        let bytes = unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, out.len() * 4) };
+        self.cu
+            .read(bytes, self.arena_dev + (off * 4) as u64)
+            .unwrap_or_else(|e| panic!("CUDA arena read at {off}: {e}"));
+    }
+
+    pub fn batch(&mut self) -> Result<CudaBatch<'_>> {
+        Ok(CudaBatch { gpu: self, queue: Vec::new(), ops: 0, live: true })
+    }
+
+    fn exec(&mut self, l: Launch) -> Result<()> {
+        let arena = self.arena_dev;
+        match l {
+            Launch::Axpy { n, x_off, y_off, w, set } => {
+                let (mut a, mut n, mut x, mut y, mut w, mut s) =
+                    (arena, n, x_off, y_off, w, set as u32);
+                let mut p = [arg(&mut a), arg(&mut n), arg(&mut x), arg(&mut y), arg(&mut w), arg(&mut s)];
+                self.cu.launch(self.funcs[Op::Axpy as usize], div_up(n, 256), 256, 0, &mut p)
+            }
+            Launch::SiluMul { n, a_off, b_off, y_off } => {
+                let (mut a, mut n, mut x, mut b, mut y) = (arena, n, a_off, b_off, y_off);
+                let mut p = [arg(&mut a), arg(&mut n), arg(&mut x), arg(&mut b), arg(&mut y)];
+                self.cu.launch(self.funcs[Op::SiluMul as usize], div_up(n, 256), 256, 0, &mut p)
+            }
+            Launch::RmsNorm { n, x_off, w_off, y_off, eps } => {
+                let (mut a, mut n, mut x, mut w, mut y, mut e) = (arena, n, x_off, w_off, y_off, eps);
+                let mut p = [arg(&mut a), arg(&mut n), arg(&mut x), arg(&mut w), arg(&mut y), arg(&mut e)];
+                self.cu.launch(self.funcs[Op::RmsNorm as usize], 1, 256, 0, &mut p)
+            }
+            Launch::GemvQ4 { w, s, rows, cols, group, x_off, y_off } => {
+                // grid.x is a signed 32-bit count, so the 65535-workgroup split
+                // the Vulkan path needs for a tall matrix does not apply here.
+                let (mut w, mut s, mut a, mut r, mut c, mut g, mut x, mut y, mut base) =
+                    (w, s, arena, rows, cols, group, x_off, y_off, 0u32);
+                let mut p = [
+                    arg(&mut w), arg(&mut s), arg(&mut a), arg(&mut r), arg(&mut c),
+                    arg(&mut g), arg(&mut x), arg(&mut y), arg(&mut base),
+                ];
+                self.cu.launch(self.funcs[Op::GemvQ4 as usize], rows, 64, 0, &mut p)
+            }
+            Launch::GemvHalf { w, f16, rows, cols, x_off, y_off } => {
+                let (mut w, mut a, mut r, mut c, mut x, mut y, mut base) =
+                    (w, arena, rows, cols, x_off, y_off, 0u32);
+                let mut p = [
+                    arg(&mut w), arg(&mut a), arg(&mut r), arg(&mut c),
+                    arg(&mut x), arg(&mut y), arg(&mut base),
+                ];
+                let op = if f16 { Op::GemvF16 } else { Op::GemvBf16 };
+                self.cu.launch(self.funcs[op as usize], div_up(rows, 4), 256, 0, &mut p)
+            }
+            Launch::GdnConv { w, state, base, cd, kernel, hist } => {
+                let (mut a, mut wp, mut sp, mut b, mut c, mut k, mut h) = (arena, w, state, base, cd, kernel, hist);
+                let mut p = [arg(&mut a), arg(&mut wp), arg(&mut sp), arg(&mut b), arg(&mut c), arg(&mut k), arg(&mut h)];
+                self.cu.launch(self.funcs[Op::GdnConv as usize], div_up(cd, 256), 256, 0, &mut p)
+            }
+            Launch::GdnRec { w, state, base, out_off, kd, nv, dk, dv, rep, eps } => {
+                let (mut a, mut wp, mut sp, mut b, mut o, mut k, mut n, mut dkk, mut dvv, mut r, mut e) =
+                    (arena, w, state, base, out_off, kd, nv, dk, dv, rep, eps);
+                let mut p = [
+                    arg(&mut a), arg(&mut wp), arg(&mut sp), arg(&mut b), arg(&mut o), arg(&mut k),
+                    arg(&mut n), arg(&mut dkk), arg(&mut dvv), arg(&mut r), arg(&mut e),
+                ];
+                self.cu.launch(self.funcs[Op::GdnRec as usize], nv, 512, 0, &mut p)
+            }
+        }
+    }
+
+    pub fn wait(&mut self) -> Result<()> {
+        let t0 = std::time::Instant::now();
+        let r = self.cu.sync();
+        self.sync_ms += t0.elapsed().as_secs_f64() * 1e3;
+        self.syncs += 1;
+        r
+    }
+
+    pub fn wait_idle(&mut self) -> Result<()> {
+        self.cu.sync()
+    }
+
+    pub fn bytes_held(&self) -> u64 {
+        self.bufs.iter().map(|b| b.size).sum::<u64>() + (self.arena_floats * 4) as u64
+    }
+
+    pub fn reset_counters(&mut self) {
+        self.submitted = 0;
+        self.dispatches = 0;
+        self.sync_ms = 0.0;
+        self.syncs = 0;
+    }
+}
+
+impl Drop for CudaGpu {
+    fn drop(&mut self) {
+        let _ = self.cu.sync();
+        for b in &self.bufs {
+            self.cu.free(b.ptr);
+        }
+        self.cu.free(self.arena_dev);
+    }
+}
+
+pub struct CudaBatch<'a> {
+    gpu: &'a mut CudaGpu,
+    queue: Vec<Launch>,
+    pub ops: usize,
+    live: bool,
+}
+
+impl<'a> CudaBatch<'a> {
+    fn push(&mut self, l: Launch) -> Result<&mut CudaBatch<'a>> {
+        self.queue.push(l);
+        self.ops += 1;
+        Ok(self)
+    }
+
+    pub fn gemv_half(&mut self, w: usize, rows: usize, cols: usize, x_off: usize, y_off: usize) -> Result<&mut CudaBatch<'a>> {
+        assert!(cols % 2 == 0, "half pairs need an even column count");
+        let f16 = self.gpu.bufs[w].f16;
+        self.push(Launch::GemvHalf { w: self.gpu.bufs[w].ptr, f16, rows: rows as u32, cols: cols as u32, x_off: x_off as u32, y_off: y_off as u32 })
+    }
+
+    pub fn gemv_q4(&mut self, w: usize, sc: usize, rows: usize, cols: usize, group: usize, x_off: usize, y_off: usize) -> Result<&mut CudaBatch<'a>> {
+        let (wp, sp) = (self.gpu.bufs[w].ptr, self.gpu.bufs[sc].ptr);
+        self.push(Launch::GemvQ4 { w: wp, s: sp, rows: rows as u32, cols: cols as u32, group: group as u32, x_off: x_off as u32, y_off: y_off as u32 })
+    }
+
+    pub fn rmsnorm(&mut self, n: usize, x_off: usize, w_off: usize, y_off: usize, eps: f32) -> Result<&mut CudaBatch<'a>> {
+        self.push(Launch::RmsNorm { n: n as u32, x_off: x_off as u32, w_off: w_off as u32, y_off: y_off as u32, eps })
+    }
+
+    pub fn silu_mul(&mut self, n: usize, a_off: usize, b_off: usize, y_off: usize) -> Result<&mut CudaBatch<'a>> {
+        self.push(Launch::SiluMul { n: n as u32, a_off: a_off as u32, b_off: b_off as u32, y_off: y_off as u32 })
+    }
+
+    pub fn axpy(&mut self, n: usize, x_off: usize, y_off: usize, w: f32, set: bool) -> Result<&mut CudaBatch<'a>> {
+        self.push(Launch::Axpy { n: n as u32, x_off: x_off as u32, y_off: y_off as u32, w, set })
+    }
+
+    pub fn gdn_conv(&mut self, w: usize, state: usize, base: usize, cd: usize, kernel: usize, hist: usize) -> Result<&mut CudaBatch<'a>> {
+        let (wp, sp) = (self.gpu.bufs[w].ptr, self.gpu.bufs[state].ptr);
+        self.push(Launch::GdnConv { w: wp, state: sp, base: base as u32, cd: cd as u32, kernel: kernel as u32, hist: hist as u32 })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_rec(&mut self, w: usize, state: usize, base: usize, out_off: usize, kd: usize, nv: usize, dk: usize, dv: usize, rep: usize, eps: f32) -> Result<&mut CudaBatch<'a>> {
+        let (wp, sp) = (self.gpu.bufs[w].ptr, self.gpu.bufs[state].ptr);
+        self.push(Launch::GdnRec {
+            w: wp, state: sp, base: base as u32, out_off: out_off as u32, kd: kd as u32,
+            nv: nv as u32, dk: dk as u32, dv: dv as u32, rep: rep as u32, eps,
+        })
+    }
+
+    pub fn submit(&mut self) -> Result<()> {
+        if !self.live {
+            return Err("batch already submitted".into());
+        }
+        self.live = false;
+        let q = std::mem::take(&mut self.queue);
+        for l in q {
+            self.gpu.exec(l)?;
+            self.gpu.dispatches += 1;
+        }
+        self.gpu.submitted += 1;
+        Ok(())
+    }
+
+    pub fn wait(&mut self) -> Result<()> {
+        self.gpu.wait()
+    }
+
+    pub fn run(&mut self) -> Result<()> {
+        self.submit()?;
+        self.gpu.wait()
+    }
+}
+
+impl Drop for CudaBatch<'_> {
+    fn drop(&mut self) {
+        // Match the Vulkan batch: recorded work that was never submitted is
+        // discarded, not run. The queue drops with it.
+        self.queue.clear();
+    }
+}

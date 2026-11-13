@@ -1,0 +1,6 @@
+target/
+*.fq4
+__pycache__/
+*.pyc
+.qoder/
+skills-lock.json

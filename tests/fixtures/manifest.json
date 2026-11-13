@@ -1,0 +1,404 @@
+{
+ "seed": 20261112,
+ "model": "D:\\MEGAsync-sync\\colibri-models\\Qwen3.6-35B-A3B-bf16",
+ "seconds": 66.46,
+ "hidden_size": 2048,
+ "fixtures": {
+  "fwd.ids": {
+   "shape": [
+    8
+   ],
+   "bytes": 64
+  },
+  "fwd.n_layers": {
+   "shape": [
+    1
+   ],
+   "bytes": 8
+  },
+  "fwd.embed": {
+   "shape": [
+    1,
+    8,
+    2048
+   ],
+   "bytes": 131072
+  },
+  "fwd.h0": {
+   "shape": [
+    1,
+    8,
+    2048
+   ],
+   "bytes": 131072
+  },
+  "fwd.h1": {
+   "shape": [
+    1,
+    8,
+    2048
+   ],
+   "bytes": 131072
+  },
+  "fwd.h2": {
+   "shape": [
+    1,
+    8,
+    2048
+   ],
+   "bytes": 131072
+  },
+  "fwd.h3": {
+   "shape": [
+    1,
+    8,
+    2048
+   ],
+   "bytes": 131072
+  },
+  "fwd.qh0": {
+   "shape": [
+    1,
+    8,
+    2048
+   ],
+   "bytes": 131072
+  },
+  "fwd.qh1": {
+   "shape": [
+    1,
+    8,
+    2048
+   ],
+   "bytes": 131072
+  },
+  "fwd.qh2": {
+   "shape": [
+    1,
+    8,
+    2048
+   ],
+   "bytes": 131072
+  },
+  "fwd.qh3": {
+   "shape": [
+    1,
+    8,
+    2048
+   ],
+   "bytes": 131072
+  },
+  "fwd.qs0": {
+   "shape": [
+    1,
+    8,
+    2048
+   ],
+   "bytes": 131072
+  },
+  "fwd.qs0.attn": {
+   "shape": [
+    1,
+    8,
+    2048
+   ],
+   "bytes": 131072
+  },
+  "fwd.qs0.moe": {
+   "shape": [
+    1,
+    8,
+    2048
+   ],
+   "bytes": 131072
+  },
+  "fwd.qs0.shared": {
+   "shape": [
+    1,
+    8,
+    2048
+   ],
+   "bytes": 131072
+  },
+  "fwd.qs0.experts": {
+   "shape": [
+    1,
+    8,
+    2048
+   ],
+   "bytes": 131072
+  },
+  "fwd.qs0.route_id": {
+   "shape": [
+    1,
+    8,
+    8
+   ],
+   "bytes": 512
+  },
+  "fwd.qs0.route_w": {
+   "shape": [
+    1,
+    8,
+    8
+   ],
+   "bytes": 512
+  },
+  "fwd.qs0.exp_hh": {
+   "shape": [
+    1,
+    4096
+   ],
+   "bytes": 32768
+  },
+  "fwd.qs0.exp_y": {
+   "shape": [
+    1,
+    16384
+   ],
+   "bytes": 131072
+  },
+  "fwd.qs0.gu_probe": {
+   "shape": [
+    13,
+    2048
+   ],
+   "bytes": 212992
+  },
+  "fwd.qs0.dn_probe": {
+   "shape": [
+    13,
+    512
+   ],
+   "bytes": 53248
+  },
+  "fwd.qs0.probe_rows": {
+   "shape": [
+    13
+   ],
+   "bytes": 104
+  },
+  "fwd.qs0.probe_id": {
+   "shape": [
+    1
+   ],
+   "bytes": 8
+  },
+  "fwd.qs1": {
+   "shape": [
+    1,
+    8,
+    2048
+   ],
+   "bytes": 131072
+  },
+  "fwd.qs1.attn": {
+   "shape": [
+    1,
+    8,
+    2048
+   ],
+   "bytes": 131072
+  },
+  "fwd.qs1.moe": {
+   "shape": [
+    1,
+    8,
+    2048
+   ],
+   "bytes": 131072
+  },
+  "fwd.qs1.shared": {
+   "shape": [
+    1,
+    8,
+    2048
+   ],
+   "bytes": 131072
+  },
+  "fwd.qs1.experts": {
+   "shape": [
+    1,
+    8,
+    2048
+   ],
+   "bytes": 131072
+  },
+  "fwd.qs1.route_id": {
+   "shape": [
+    1,
+    8,
+    8
+   ],
+   "bytes": 512
+  },
+  "fwd.qs1.route_w": {
+   "shape": [
+    1,
+    8,
+    8
+   ],
+   "bytes": 512
+  },
+  "fwd.qs2": {
+   "shape": [
+    1,
+    8,
+    2048
+   ],
+   "bytes": 131072
+  },
+  "fwd.qs2.attn": {
+   "shape": [
+    1,
+    8,
+    2048
+   ],
+   "bytes": 131072
+  },
+  "fwd.qs2.moe": {
+   "shape": [
+    1,
+    8,
+    2048
+   ],
+   "bytes": 131072
+  },
+  "fwd.qs2.shared": {
+   "shape": [
+    1,
+    8,
+    2048
+   ],
+   "bytes": 131072
+  },
+  "fwd.qs2.experts": {
+   "shape": [
+    1,
+    8,
+    2048
+   ],
+   "bytes": 131072
+  },
+  "fwd.qs2.route_id": {
+   "shape": [
+    1,
+    8,
+    8
+   ],
+   "bytes": 512
+  },
+  "fwd.qs2.route_w": {
+   "shape": [
+    1,
+    8,
+    8
+   ],
+   "bytes": 512
+  },
+  "fwd.qs3": {
+   "shape": [
+    1,
+    8,
+    2048
+   ],
+   "bytes": 131072
+  },
+  "fwd.qs3.attn": {
+   "shape": [
+    1,
+    8,
+    2048
+   ],
+   "bytes": 131072
+  },
+  "fwd.qs3.moe": {
+   "shape": [
+    1,
+    8,
+    2048
+   ],
+   "bytes": 131072
+  },
+  "fwd.qs3.shared": {
+   "shape": [
+    1,
+    8,
+    2048
+   ],
+   "bytes": 131072
+  },
+  "fwd.qs3.experts": {
+   "shape": [
+    1,
+    8,
+    2048
+   ],
+   "bytes": 131072
+  },
+  "fwd.qs3.route_id": {
+   "shape": [
+    1,
+    8,
+    8
+   ],
+   "bytes": 512
+  },
+  "fwd.qs3.route_w": {
+   "shape": [
+    1,
+    8,
+    8
+   ],
+   "bytes": 512
+  },
+  "fwd.norm": {
+   "shape": [
+    1,
+    8,
+    2048
+   ],
+   "bytes": 131072
+  },
+  "fwd.logits_idx": {
+   "shape": [
+    8
+   ],
+   "bytes": 64
+  },
+  "fwd.logits_top": {
+   "shape": [
+    8
+   ],
+   "bytes": 32
+  },
+  "fwd.norm32": {
+   "shape": [
+    1,
+    8,
+    2048
+   ],
+   "bytes": 131072
+  },
+  "fwd.logits_top32": {
+   "shape": [
+    8
+   ],
+   "bytes": 32
+  }
+ },
+ "notes": {
+  "fwd": {
+   "h{l}": "residual stream, 8-token prefill, fp32 experts",
+   "qh{l}": "same prefill with the experts pushed through FQ4",
+   "qs{l}": "token-at-a-time with a cache, FQ4 experts: Fennec's own algorithm",
+   "qs{l}.attn": "that stream's mixer output, before the residual add",
+   "qs{l}.moe": "and its MoE block output (routed + gated shared expert)",
+   "qs{l}.shared": "the shared expert before its sigmoid gate",
+   "qs{l}.experts": "the top-k routed experts after their weights, before the add",
+   "qs{l}.route_id": "[seq, top_k] expert ids, qs{l}.route_w the renormalised weights",
+   "logits_idx": "top-8 ids of the stepped stream's last position",
+   "logits_top32": "those same 8 ids read off the fp32 prefill"
+  }
+ }
+}

@@ -1,0 +1,45 @@
+#version 450
+// y = W x for FQ4: one uint holds eight nibbles, low nibble = even column,
+// value stored +8, one f32 scale per `group` columns of one row. Requires
+// group % 8 == 0 so a uint never straddles two scales.
+layout(local_size_x = 64) in;
+layout(push_constant) uniform P {
+    uint rows;
+    uint cols;
+    uint group;
+    uint x_off;
+    uint y_off;
+    uint row_base;
+} p;
+layout(set = 0, binding = 0) readonly buffer W { uint w[]; };
+layout(set = 0, binding = 1) readonly buffer S { float s[]; };
+layout(set = 0, binding = 2) readonly buffer X { float x[]; };
+layout(set = 0, binding = 3) writeonly buffer Y { float y[]; };
+
+shared float red[64];
+
+void main() {
+    uint r = p.row_base + gl_WorkGroupID.x;
+    if (r >= p.rows) return;
+    uint words = p.cols >> 3;
+    uint ng = p.cols / p.group;
+    uint base = r * words;
+    float acc = 0.0;
+    for (uint i = gl_LocalInvocationID.x; i < words; i += 64u) {
+        uint u = w[base + i];
+        float sc = s[r * ng + (i << 3) / p.group];
+        float part = 0.0;
+        uint c = p.x_off + (i << 3);
+        for (uint k = 0u; k < 8u; k++) {
+            part += (float((u >> (4u * k)) & 0xFu) - 8.0) * x[c + k];
+        }
+        acc += part * sc;
+    }
+    red[gl_LocalInvocationID.x] = acc;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) {
+        if (gl_LocalInvocationID.x < s) red[gl_LocalInvocationID.x] += red[gl_LocalInvocationID.x + s];
+        barrier();
+    }
+    if (gl_LocalInvocationID.x == 0u) y[p.y_off + r] = red[0];
+}

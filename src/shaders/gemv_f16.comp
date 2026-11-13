@@ -1,0 +1,83 @@
+#version 450
+// y = W x, W left as f16 pairs inside uints. The same four-rows-per-workgroup
+// shape as gemv_bf16: 64 lanes per row, six reduction barriers paid once for
+// four rows, 16 bytes per load. Only the unpack differs — f16 carries 10
+// mantissa bits and a 5-bit exponent, so it needs a real conversion rather
+// than bf16's shift into the top half of an f32.
+layout(local_size_x = 256) in;
+layout(push_constant) uniform P {
+    uint rows;
+    uint cols;
+    uint x_off;
+    uint y_off;
+    uint row_base;
+} p;
+layout(set = 0, binding = 0) readonly buffer W { uint w[]; };
+layout(set = 0, binding = 1) readonly buffer X { float x[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+// The same weight buffer, viewed as 16-byte words. Binding it twice is what
+// buys the wide load without a second copy of the weights in VRAM.
+layout(set = 0, binding = 3) readonly buffer W4 { uvec4 w4[]; };
+
+shared float red[256];
+
+// Rebase an f16 into an f32 with integer ops only. The tempting one-multiply
+// version (shift the field up 13, scale by 2^112) needs a subnormal f32
+// intermediate for subnormal halves, and this driver flushes those to zero:
+// it silently zeroed 61% of the weights in a small-magnitude test. Normalising
+// the mantissa with findMSB keeps every intermediate normal.
+float hf(uint h) {
+    uint s = (h & 0x8000u) << 16;
+    uint e = (h >> 10) & 0x1Fu;
+    uint m = h & 0x3FFu;
+    uint sh = 10u - uint(findMSB(m | 1u));
+    uint nrm = s | ((e == 31u ? 255u : e + 112u) << 23) | (m << 13);
+    uint sub = s | ((113u - sh) << 23) | (((m << sh) & 0x3FFu) << 13);
+    return uintBitsToFloat(e != 0u ? nrm : (m != 0u ? sub : s));
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint lane = tid & 63u;
+    uint slot = tid >> 6;
+    // row_base counts workgroups, not rows: the host splits a tall matrix into
+    // dispatches of at most 65535 workgroups.
+    uint r = (p.row_base + gl_WorkGroupID.x) * 4u + slot;
+    uint half_cols = p.cols >> 1;
+    float acc = 0.0;
+    // No early return: every lane must reach the barriers below, including the
+    // ones whose row is past the end of a partial last workgroup.
+    if (r < p.rows) {
+        uint base = r * half_cols;
+        if ((half_cols & 3u) == 0u) {
+            uint quads = half_cols >> 2;
+            for (uint i = lane; i < quads; i += 64u) {
+                uvec4 u = w4[(base >> 2) + i];
+                uint c = p.x_off + (i << 3);
+                vec4 x0 = vec4(x[c], x[c + 1u], x[c + 2u], x[c + 3u]);
+                vec4 x1 = vec4(x[c + 4u], x[c + 5u], x[c + 6u], x[c + 7u]);
+                // Explicit terms, not dot(): dot is free to reduce in any order,
+                // and matching gemv_bf16's order keeps the two shaders' error
+                // against the CPU kernel the same size.
+                acc += hf(u.x) * x0.x + hf(u.x >> 16) * x0.y
+                     + hf(u.y) * x0.z + hf(u.y >> 16) * x0.w
+                     + hf(u.z) * x1.x + hf(u.z >> 16) * x1.y
+                     + hf(u.w) * x1.z + hf(u.w >> 16) * x1.w;
+            }
+        } else {
+            // cols % 8 != 0: a row base is not 16-byte aligned, so read scalars.
+            for (uint i = lane; i < half_cols; i += 64u) {
+                uint u = w[base + i];
+                uint c = p.x_off + (i << 1);
+                acc += hf(u) * x[c] + hf(u >> 16) * x[c + 1u];
+            }
+        }
+    }
+    red[tid] = acc;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) {
+        if (lane < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    if (lane == 0u && r < p.rows) y[p.y_off + r] = red[tid];
+}

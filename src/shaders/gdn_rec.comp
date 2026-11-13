@@ -1,0 +1,154 @@
+#version 450
+// Gated delta net, one workgroup per value head. The head's [dk, dv] recurrence
+// is elementwise in (i, j); the only cross-row work is the two reductions over
+// i. So 512 threads cover it as G = 512/dv row groups of dv columns each, and
+// the groups reduce through shared memory. One thread per column with dk rows
+// each left 24 SMs holding 32 workgroups and ran at memory latency, not
+// bandwidth.
+//
+// q and k are shared by `rep` value heads. The reductions are f32 trees where
+// the CPU sums serially, so this agrees to float tolerance, not bit for bit.
+layout(local_size_x = 512) in;
+layout(push_constant) uniform P {
+    uint base;
+    uint out_off;
+    uint kd;
+    uint nv;
+    uint dk;
+    uint dv;
+    uint rep;
+    float eps;
+} p;
+layout(set = 0, binding = 0) buffer A { float a[]; };
+// a_log[nv] | dt_bias[nv] | norm_w[dv]
+layout(set = 0, binding = 1) readonly buffer W { float w[]; };
+layout(set = 0, binding = 2) buffer S { float s[]; };
+
+shared float sq[256];
+shared float sk[256];
+shared float so[256];
+shared float tmp[512];
+
+void main() {
+    uint hv = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    uint vd = p.nv * p.dv;
+    uint cd = 2u * p.kd + vd;
+    uint hk = hv / p.rep;
+    uint groups = 512u / p.dv;
+    uint g = t / p.dv;
+    uint j = t - g * p.dv;
+    uint rows = p.dk / groups;
+    uint i0 = g * rows;
+
+    float lq = 0.0;
+    float lk = 0.0;
+    for (uint i = t; i < p.dk; i += 512u) {
+        float qv = a[p.base + hk * p.dk + i];
+        float kv = a[p.base + p.kd + hk * p.dk + i];
+        sq[i] = qv;
+        sk[i] = kv;
+        lq += qv * qv;
+        lk += kv * kv;
+    }
+    tmp[t] = lq;
+    barrier();
+    for (uint s = 256u; s > 0u; s >>= 1) {
+        if (t < s) tmp[t] += tmp[t + s];
+        barrier();
+    }
+    float invq = 1.0 / sqrt(tmp[0] + 1e-6);
+    barrier();
+    tmp[t] = lk;
+    barrier();
+    for (uint s = 256u; s > 0u; s >>= 1) {
+        if (t < s) tmp[t] += tmp[t + s];
+        barrier();
+    }
+    float invk = 1.0 / sqrt(tmp[0] + 1e-6);
+    barrier();
+
+    float scale = 1.0 / sqrt(float(p.dk));
+    for (uint i = t; i < p.dk; i += 512u) {
+        sq[i] = sq[i] * invq * scale;
+        sk[i] = sk[i] * invk;
+    }
+    barrier();
+
+    float bv = a[p.base + cd + vd + hv];
+    float beta = 1.0 / (1.0 + exp(-bv));
+    float av = a[p.base + cd + vd + p.nv + hv] + w[p.nv + hv];
+    float sp = av > 20.0 ? av : log(1.0 + exp(av));
+    float decay = exp(-exp(w[hv]) * sp);
+    uint sb = hv * p.dk * p.dv;
+    float v = a[p.base + 2u * p.kd + hv * p.dv + j];
+
+    // Four rows per iteration: one at a time, the next load cannot issue until
+    // the previous store retires, and the pass runs at memory latency.
+    float kvm = 0.0;
+    uint c = sb + i0 * p.dv + j;
+    for (uint i = i0; i < i0 + rows; i += 4u) {
+        float s0 = s[c] * decay;
+        float s1 = s[c + p.dv] * decay;
+        float s2 = s[c + 2u * p.dv] * decay;
+        float s3 = s[c + 3u * p.dv] * decay;
+        s[c] = s0;
+        s[c + p.dv] = s1;
+        s[c + 2u * p.dv] = s2;
+        s[c + 3u * p.dv] = s3;
+        kvm += s0 * sk[i];
+        kvm += s1 * sk[i + 1u];
+        kvm += s2 * sk[i + 2u];
+        kvm += s3 * sk[i + 3u];
+        c += 4u * p.dv;
+    }
+    tmp[t] = kvm;
+    barrier();
+    if (g == 0u) {
+        float acc = 0.0;
+        for (uint q = 0u; q < groups; q++) acc += tmp[q * p.dv + j];
+        so[j] = acc;
+    }
+    barrier();
+    float delta = (v - so[j]) * beta;
+
+    float o = 0.0;
+    c = sb + i0 * p.dv + j;
+    for (uint i = i0; i < i0 + rows; i += 4u) {
+        float r0 = s[c] + sk[i] * delta;
+        float r1 = s[c + p.dv] + sk[i + 1u] * delta;
+        float r2 = s[c + 2u * p.dv] + sk[i + 2u] * delta;
+        float r3 = s[c + 3u * p.dv] + sk[i + 3u] * delta;
+        s[c] = r0;
+        s[c + p.dv] = r1;
+        s[c + 2u * p.dv] = r2;
+        s[c + 3u * p.dv] = r3;
+        o += r0 * sq[i];
+        o += r1 * sq[i + 1u];
+        o += r2 * sq[i + 2u];
+        o += r3 * sq[i + 3u];
+        c += 4u * p.dv;
+    }
+    tmp[t] = o;
+    barrier();
+    if (g == 0u) {
+        float acc = 0.0;
+        for (uint q = 0u; q < groups; q++) acc += tmp[q * p.dv + j];
+        so[j] = acc;
+    }
+    barrier();
+
+    float ss = g == 0u ? so[j] * so[j] : 0.0;
+    tmp[t] = ss;
+    barrier();
+    for (uint s = 256u; s > 0u; s >>= 1) {
+        if (t < s) tmp[t] += tmp[t + s];
+        barrier();
+    }
+    float inv = 1.0 / sqrt(tmp[0] / float(p.dv) + p.eps);
+    if (g == 0u) {
+        float gate = a[p.base + cd + hv * p.dv + j];
+        float silu = gate / (1.0 + exp(-gate));
+        a[p.out_off + hv * p.dv + j] = w[2u * p.nv + j] * (so[j] * inv) * silu;
+    }
+}

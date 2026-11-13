@@ -1,0 +1,23 @@
+name: Engine (Rust)
+
+# SAC-free compile + test verification. The decode/perf bench needs the 22.8 GiB
+# checkpoint and a GPU, neither present on hosted runners, so it runs on the
+# local box instead; this job proves the code builds and the synthetic/unit
+# tests (incl. the int4-dense lever behind --dense-int4) stay green.
+on:
+  push:
+    paths: ["src/**", "tests/**", "Cargo.toml", ".github/workflows/engine.yml"]
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release
+      - name: Unit + synthetic tests (goldens skip without the checkpoint)
+        run: cargo test --release
+      - name: CPU plan with int4-dense lever
+        run: ./target/release/fennec.exe plan --cpu --dense-int4

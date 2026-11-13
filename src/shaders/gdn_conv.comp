@@ -1,0 +1,31 @@
+#version 450
+// Depthwise causal conv + SiLU, in place over the qkv projection, with the
+// rolling window kept in a persistent device buffer. One thread owns one
+// channel for every time slice, so the window rotation needs no barrier: the
+// only reads and writes to column c are this thread's.
+layout(local_size_x = 256) in;
+layout(push_constant) uniform P {
+    uint base;
+    uint cd;
+    uint kernel;
+    uint hist;
+} p;
+layout(set = 0, binding = 0) buffer A { float a[]; };
+layout(set = 0, binding = 1) readonly buffer W { float w[]; };
+layout(set = 0, binding = 2) buffer S { float s[]; };
+
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= p.cd) return;
+    float cur = a[p.base + c];
+    float acc = 0.0;
+    for (uint k = 0u; k < p.hist; k++) {
+        acc += s[k * p.cd + c] * w[c * p.kernel + k];
+    }
+    acc += cur * w[c * p.kernel + p.hist];
+    for (uint i = 0u; i + 1u < p.hist; i++) {
+        s[i * p.cd + c] = s[(i + 1u) * p.cd + c];
+    }
+    if (p.hist > 0u) s[(p.hist - 1u) * p.cd + c] = cur;
+    a[p.base + c] = acc / (1.0 + exp(-acc));
+}

@@ -1,0 +1,1139 @@
+// Fennec CUDA kernels, PTX ISA 7.0. The driver JITs this at cuModuleLoadData,
+// so there is no nvcc, no ptxas and no CUDA toolkit in the build - the same
+// arrangement as the checked-in SPIR-V beside src/shaders.
+//
+// These are ports of the GLSL in src/shaders, one entry per Op in gpu.rs, with
+// the same push-constant arguments and the same accumulation order so the two
+// backends agree to float tolerance. Activations live in one arena addressed by
+// float offset, exactly as the Vulkan descriptor set does; weights and scales
+// are separate device pointers.
+//
+// sm_60 is the floor: every instruction here is Pascal-era, and the driver
+// JITs forward to whatever the device actually is.
+
+.version 7.0
+.target sm_60
+.address_size 64
+
+// ---------------------------------------------------------------------------
+// y += w * x  (routed-expert and shared-expert accumulation)
+// set != 0 stores instead, so the first pick of a token needs no zero-fill
+// grid = ceil(n/256), block = 256
+// ---------------------------------------------------------------------------
+.visible .entry axpy(
+    .param .u64 arena,
+    .param .u32 n,
+    .param .u32 x_off,
+    .param .u32 y_off,
+    .param .f32 w,
+    .param .u32 set
+)
+{
+    .reg .pred %p<3>;
+    .reg .b32 %r<11>;
+    .reg .b64 %rd<8>;
+    .reg .f32 %f<5>;
+
+    ld.param.u64 %rd1, [arena];
+    ld.param.u32 %r1, [n];
+    ld.param.u32 %r2, [x_off];
+    ld.param.u32 %r3, [y_off];
+    ld.param.f32 %f1, [w];
+    ld.param.u32 %r10, [set];
+
+    mov.u32 %r4, %ctaid.x;
+    mov.u32 %r5, %ntid.x;
+    mov.u32 %r6, %tid.x;
+    mad.lo.s32 %r7, %r4, %r5, %r6;
+    setp.ge.u32 %p1, %r7, %r1;
+    @%p1 bra AXPY_DONE;
+
+    add.s32 %r8, %r2, %r7;
+    mul.wide.u32 %rd2, %r8, 4;
+    add.s64 %rd3, %rd1, %rd2;
+    ld.global.f32 %f2, [%rd3];
+
+    add.s32 %r9, %r3, %r7;
+    mul.wide.u32 %rd4, %r9, 4;
+    add.s64 %rd5, %rd1, %rd4;
+    setp.ne.u32 %p2, %r10, 0;
+    @%p2 bra AXPY_SET;
+    ld.global.f32 %f3, [%rd5];
+    fma.rn.f32 %f3, %f1, %f2, %f3;
+    st.global.f32 [%rd5], %f3;
+    bra AXPY_DONE;
+AXPY_SET:
+    mul.f32 %f3, %f1, %f2;
+    st.global.f32 [%rd5], %f3;
+AXPY_DONE:
+    ret;
+}
+
+// ---------------------------------------------------------------------------
+// y = silu(a) * b  (the SwiGLU half of an expert)
+// grid = ceil(n/256), block = 256
+// ---------------------------------------------------------------------------
+.visible .entry silu_mul(
+    .param .u64 arena,
+    .param .u32 n,
+    .param .u32 a_off,
+    .param .u32 b_off,
+    .param .u32 y_off
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<10>;
+    .reg .b64 %rd<10>;
+    .reg .f32 %f<8>;
+
+    ld.param.u64 %rd1, [arena];
+    ld.param.u32 %r1, [n];
+    ld.param.u32 %r2, [a_off];
+    ld.param.u32 %r3, [b_off];
+    ld.param.u32 %r4, [y_off];
+
+    mov.u32 %r5, %ctaid.x;
+    mov.u32 %r6, %ntid.x;
+    mov.u32 %r7, %tid.x;
+    mad.lo.s32 %r8, %r5, %r6, %r7;
+    setp.ge.u32 %p1, %r8, %r1;
+    @%p1 bra SILU_DONE;
+
+    add.s32 %r9, %r2, %r8;
+    mul.wide.u32 %rd2, %r9, 4;
+    add.s64 %rd3, %rd1, %rd2;
+    ld.global.f32 %f1, [%rd3];          // g
+
+    add.s32 %r9, %r3, %r8;
+    mul.wide.u32 %rd4, %r9, 4;
+    add.s64 %rd5, %rd1, %rd4;
+    ld.global.f32 %f2, [%rd5];          // up
+
+    // exp(-g) = 2^(-g * log2(e)); ex2.approx is what GLSL exp lowers to as well.
+    neg.f32 %f3, %f1;
+    mul.f32 %f3, %f3, 0f3FB8AA3B;
+    ex2.approx.f32 %f3, %f3;
+    add.f32 %f3, %f3, 0f3F800000;
+    div.rn.f32 %f3, %f1, %f3;
+    mul.f32 %f3, %f3, %f2;
+
+    add.s32 %r9, %r4, %r8;
+    mul.wide.u32 %rd6, %r9, 4;
+    add.s64 %rd7, %rd1, %rd6;
+    st.global.f32 [%rd7], %f3;
+SILU_DONE:
+    ret;
+}
+
+// ---------------------------------------------------------------------------
+// RMSNorm, zero-centred: out = x * rsqrt(mean(x^2) + eps) * (1 + w)
+// grid = 1, block = 256, tree reduction in f32
+// ---------------------------------------------------------------------------
+.visible .entry rmsnorm(
+    .param .u64 arena,
+    .param .u32 n,
+    .param .u32 x_off,
+    .param .u32 w_off,
+    .param .u32 y_off,
+    .param .f32 eps
+)
+{
+    .shared .align 4 .b8 red[1024];
+    .reg .pred %p<4>;
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<12>;
+    .reg .f32 %f<10>;
+
+    ld.param.u64 %rd1, [arena];
+    ld.param.u32 %r1, [n];
+    ld.param.u32 %r2, [x_off];
+    ld.param.u32 %r3, [w_off];
+    ld.param.u32 %r4, [y_off];
+    ld.param.f32 %f1, [eps];
+    mov.u32 %r5, %tid.x;
+
+    mov.f32 %f2, 0f00000000;
+    mov.u32 %r6, %r5;
+RN_ACC:
+    setp.ge.u32 %p1, %r6, %r1;
+    @%p1 bra RN_ACC_END;
+    add.s32 %r7, %r2, %r6;
+    mul.wide.u32 %rd2, %r7, 4;
+    add.s64 %rd3, %rd1, %rd2;
+    ld.global.f32 %f3, [%rd3];
+    fma.rn.f32 %f2, %f3, %f3, %f2;
+    add.s32 %r6, %r6, 256;
+    bra RN_ACC;
+RN_ACC_END:
+    mul.wide.u32 %rd4, %r5, 4;
+    mov.u64 %rd5, red;
+    add.s64 %rd6, %rd5, %rd4;
+    st.shared.f32 [%rd6], %f2;
+    bar.sync 0;
+
+    mov.u32 %r8, 128;
+RN_TREE:
+    setp.ge.u32 %p1, %r5, %r8;
+    @%p1 bra RN_TREE_SKIP;
+    add.s32 %r9, %r5, %r8;
+    mul.wide.u32 %rd7, %r9, 4;
+    add.s64 %rd8, %rd5, %rd7;
+    ld.shared.f32 %f3, [%rd8];
+    ld.shared.f32 %f4, [%rd6];
+    add.f32 %f4, %f4, %f3;
+    st.shared.f32 [%rd6], %f4;
+RN_TREE_SKIP:
+    bar.sync 0;
+    shr.u32 %r8, %r8, 1;
+    setp.gt.u32 %p2, %r8, 0;
+    @%p2 bra RN_TREE;
+
+    ld.shared.f32 %f5, [%rd5];
+    cvt.rn.f32.u32 %f6, %r1;
+    div.rn.f32 %f5, %f5, %f6;
+    add.f32 %f5, %f5, %f1;
+    rsqrt.approx.f32 %f5, %f5;
+
+    mov.u32 %r6, %r5;
+RN_OUT:
+    setp.ge.u32 %p1, %r6, %r1;
+    @%p1 bra RN_OUT_END;
+    add.s32 %r7, %r2, %r6;
+    mul.wide.u32 %rd2, %r7, 4;
+    add.s64 %rd3, %rd1, %rd2;
+    ld.global.f32 %f3, [%rd3];
+    add.s32 %r10, %r3, %r6;
+    mul.wide.u32 %rd9, %r10, 4;
+    add.s64 %rd10, %rd1, %rd9;
+    ld.global.f32 %f4, [%rd10];
+    add.f32 %f4, %f4, 0f3F800000;
+    mul.f32 %f3, %f3, %f5;
+    mul.f32 %f3, %f3, %f4;
+    add.s32 %r11, %r4, %r6;
+    mul.wide.u32 %rd11, %r11, 4;
+    add.s64 %rd11, %rd1, %rd11;
+    st.global.f32 [%rd11], %f3;
+    add.s32 %r6, %r6, 256;
+    bra RN_OUT;
+RN_OUT_END:
+    ret;
+}
+
+// ---------------------------------------------------------------------------
+// y = W x for FQ4: one uint holds eight nibbles, low nibble = even column,
+// value stored +8, one f32 scale per `group` columns of one row.
+// grid = rows, block = 64
+// ---------------------------------------------------------------------------
+.visible .entry gemv_q4(
+    .param .u64 w,
+    .param .u64 s,
+    .param .u64 arena,
+    .param .u32 rows,
+    .param .u32 cols,
+    .param .u32 group,
+    .param .u32 x_off,
+    .param .u32 y_off,
+    .param .u32 row_base
+)
+{
+    .shared .align 4 .b8 red[256];
+    .reg .pred %p<4>;
+    .reg .b32 %r<28>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<10>;
+
+    ld.param.u64 %rd1, [w];
+    ld.param.u64 %rd2, [s];
+    ld.param.u64 %rd3, [arena];
+    ld.param.u32 %r1, [rows];
+    ld.param.u32 %r2, [cols];
+    ld.param.u32 %r3, [group];
+    ld.param.u32 %r4, [x_off];
+    ld.param.u32 %r5, [y_off];
+    ld.param.u32 %r6, [row_base];
+    mov.u32 %r7, %tid.x;
+    mov.u32 %r8, %ctaid.x;
+
+    add.s32 %r9, %r6, %r8;              // r
+    setp.ge.u32 %p1, %r9, %r1;
+    @%p1 bra Q4_DONE;
+
+    shr.u32 %r10, %r2, 3;               // words = cols >> 3
+    div.u32 %r11, %r2, %r3;             // ng = cols / group
+    mul.lo.u32 %r12, %r9, %r10;         // base = r * words
+    mul.lo.u32 %r13, %r9, %r11;         // r * ng
+
+    mov.f32 %f1, 0f00000000;            // acc
+    mov.u32 %r14, %r7;                  // i = lane
+Q4_LOOP:
+    setp.ge.u32 %p2, %r14, %r10;
+    @%p2 bra Q4_LOOP_END;
+    add.s32 %r15, %r12, %r14;
+    mul.wide.u32 %rd4, %r15, 4;
+    add.s64 %rd5, %rd1, %rd4;
+    ld.global.nc.u32 %r16, [%rd5];         // u
+
+    shl.b32 %r17, %r14, 3;              // i << 3
+    div.u32 %r18, %r17, %r3;
+    add.s32 %r19, %r13, %r18;
+    mul.wide.u32 %rd6, %r19, 4;
+    add.s64 %rd7, %rd2, %rd6;
+    ld.global.nc.f32 %f2, [%rd7];          // sc
+
+    add.s32 %r20, %r4, %r17;            // c = x_off + (i<<3)
+    mov.f32 %f3, 0f00000000;            // part
+    mov.u32 %r21, 0;                    // k
+Q4_K:
+    shl.b32 %r22, %r21, 2;              // 4*k
+    shr.u32 %r23, %r16, %r22;
+    and.b32 %r23, %r23, 15;
+    cvt.rn.f32.u32 %f4, %r23;
+    sub.f32 %f4, %f4, 0f41000000;       // - 8.0
+    add.s32 %r24, %r20, %r21;
+    mul.wide.u32 %rd8, %r24, 4;
+    add.s64 %rd9, %rd3, %rd8;
+    ld.global.f32 %f5, [%rd9];
+    fma.rn.f32 %f3, %f4, %f5, %f3;
+    add.s32 %r21, %r21, 1;
+    setp.lt.u32 %p3, %r21, 8;
+    @%p3 bra Q4_K;
+
+    fma.rn.f32 %f1, %f3, %f2, %f1;      // acc += part * sc
+    add.s32 %r14, %r14, 64;
+    bra Q4_LOOP;
+Q4_LOOP_END:
+    mul.wide.u32 %rd10, %r7, 4;
+    mov.u64 %rd11, red;
+    add.s64 %rd12, %rd11, %rd10;
+    st.shared.f32 [%rd12], %f1;
+    bar.sync 0;
+
+    mov.u32 %r25, 32;
+Q4_TREE:
+    setp.ge.u32 %p2, %r7, %r25;
+    @%p2 bra Q4_TREE_SKIP;
+    add.s32 %r26, %r7, %r25;
+    mul.wide.u32 %rd13, %r26, 4;
+    add.s64 %rd14, %rd11, %rd13;
+    ld.shared.f32 %f6, [%rd14];
+    ld.shared.f32 %f7, [%rd12];
+    add.f32 %f7, %f7, %f6;
+    st.shared.f32 [%rd12], %f7;
+Q4_TREE_SKIP:
+    bar.sync 0;
+    shr.u32 %r25, %r25, 1;
+    setp.gt.u32 %p3, %r25, 0;
+    @%p3 bra Q4_TREE;
+
+    setp.ne.u32 %p2, %r7, 0;
+    @%p2 bra Q4_DONE;
+    ld.shared.f32 %f8, [%rd11];
+    add.s32 %r27, %r5, %r9;
+    mul.wide.u32 %rd15, %r27, 4;
+    add.s64 %rd15, %rd3, %rd15;
+    st.global.f32 [%rd15], %f8;
+Q4_DONE:
+    ret;
+}
+
+// ---------------------------------------------------------------------------
+// y = W x, W left as bf16 pairs inside uints. Four rows per block, 64 lanes per
+// row, 16-byte loads. bf16 -> f32 is exact as a shift into the top half.
+// grid = ceil(rows/4), block = 256
+// ---------------------------------------------------------------------------
+.visible .entry gemv_bf16(
+    .param .u64 w,
+    .param .u64 arena,
+    .param .u32 rows,
+    .param .u32 cols,
+    .param .u32 x_off,
+    .param .u32 y_off,
+    .param .u32 row_base
+)
+{
+    .shared .align 4 .b8 red[1024];
+    .reg .pred %p<4>;
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<20>;
+
+    ld.param.u64 %rd1, [w];
+    ld.param.u64 %rd2, [arena];
+    ld.param.u32 %r1, [rows];
+    ld.param.u32 %r2, [cols];
+    ld.param.u32 %r3, [x_off];
+    ld.param.u32 %r4, [y_off];
+    ld.param.u32 %r5, [row_base];
+    mov.u32 %r6, %tid.x;
+    and.b32 %r7, %r6, 63;               // lane
+    shr.u32 %r8, %r6, 6;                // slot
+    mov.u32 %r9, %ctaid.x;
+    add.s32 %r10, %r5, %r9;
+    shl.b32 %r10, %r10, 2;
+    add.s32 %r11, %r10, %r8;            // r
+    shr.u32 %r12, %r2, 1;               // half_cols
+
+    mov.f32 %f1, 0f00000000;
+    setp.ge.u32 %p1, %r11, %r1;
+    @%p1 bra BF_RED;
+    mul.lo.u32 %r13, %r11, %r12;        // base
+    and.b32 %r14, %r12, 3;
+    setp.ne.u32 %p2, %r14, 0;
+    @%p2 bra BF_SCALAR;
+
+    shr.u32 %r15, %r12, 2;              // quads
+    shr.u32 %r16, %r13, 2;              // base >> 2
+    mov.u32 %r17, %r7;
+BF_QUAD:
+    setp.ge.u32 %p2, %r17, %r15;
+    @%p2 bra BF_RED;
+    add.s32 %r18, %r16, %r17;
+    mul.wide.u32 %rd3, %r18, 16;
+    add.s64 %rd4, %rd1, %rd3;
+    ld.global.nc.v4.u32 {%r19,%r20,%r21,%r22}, [%rd4];
+    shl.b32 %r23, %r17, 3;
+    add.s32 %r24, %r3, %r23;            // c
+    mul.wide.u32 %rd5, %r24, 4;
+    add.s64 %rd6, %rd2, %rd5;
+    ld.global.v4.f32 {%f2,%f3,%f4,%f5}, [%rd6];
+    ld.global.v4.f32 {%f6,%f7,%f8,%f9}, [%rd6+16];
+
+    shl.b32 %r25, %r19, 16; mov.b32 %f10, %r25;
+    and.b32 %r26, %r19, 0xFFFF0000; mov.b32 %f11, %r26;
+    shl.b32 %r25, %r20, 16; mov.b32 %f12, %r25;
+    and.b32 %r26, %r20, 0xFFFF0000; mov.b32 %f13, %r26;
+    shl.b32 %r25, %r21, 16; mov.b32 %f14, %r25;
+    and.b32 %r26, %r21, 0xFFFF0000; mov.b32 %f15, %r26;
+    shl.b32 %r25, %r22, 16; mov.b32 %f16, %r25;
+    and.b32 %r26, %r22, 0xFFFF0000; mov.b32 %f17, %r26;
+
+    // Eight live halves, eight registers: reusing %f10/%f11 for the fourth word
+    // would multiply u.w twice and drop u.x entirely.
+    mul.f32 %f18, %f10, %f2;
+    fma.rn.f32 %f18, %f11, %f3, %f18;
+    fma.rn.f32 %f18, %f12, %f4, %f18;
+    fma.rn.f32 %f18, %f13, %f5, %f18;
+    fma.rn.f32 %f18, %f14, %f6, %f18;
+    fma.rn.f32 %f18, %f15, %f7, %f18;
+    fma.rn.f32 %f18, %f16, %f8, %f18;
+    fma.rn.f32 %f18, %f17, %f9, %f18;
+    add.f32 %f1, %f1, %f18;
+    add.s32 %r17, %r17, 64;
+    bra BF_QUAD;
+
+BF_SCALAR:
+    mov.u32 %r17, %r7;
+BF_SLOOP:
+    setp.ge.u32 %p2, %r17, %r12;
+    @%p2 bra BF_RED;
+    add.s32 %r18, %r13, %r17;
+    mul.wide.u32 %rd3, %r18, 4;
+    add.s64 %rd4, %rd1, %rd3;
+    ld.global.nc.u32 %r19, [%rd4];
+    shl.b32 %r23, %r17, 1;
+    add.s32 %r24, %r3, %r23;
+    mul.wide.u32 %rd5, %r24, 4;
+    add.s64 %rd6, %rd2, %rd5;
+    ld.global.f32 %f2, [%rd6];
+    ld.global.f32 %f3, [%rd6+4];
+    shl.b32 %r25, %r19, 16; mov.b32 %f10, %r25;
+    and.b32 %r26, %r19, 0xFFFF0000; mov.b32 %f11, %r26;
+    mul.f32 %f12, %f10, %f2;
+    fma.rn.f32 %f12, %f11, %f3, %f12;
+    add.f32 %f1, %f1, %f12;
+    add.s32 %r17, %r17, 64;
+    bra BF_SLOOP;
+
+BF_RED:
+    mul.wide.u32 %rd7, %r6, 4;
+    mov.u64 %rd8, red;
+    add.s64 %rd9, %rd8, %rd7;
+    st.shared.f32 [%rd9], %f1;
+    bar.sync 0;
+    mov.u32 %r27, 32;
+BF_TREE:
+    setp.ge.u32 %p2, %r7, %r27;
+    @%p2 bra BF_TREE_SKIP;
+    add.s32 %r28, %r6, %r27;
+    mul.wide.u32 %rd10, %r28, 4;
+    add.s64 %rd11, %rd8, %rd10;
+    ld.shared.f32 %f2, [%rd11];
+    ld.shared.f32 %f3, [%rd9];
+    add.f32 %f3, %f3, %f2;
+    st.shared.f32 [%rd9], %f3;
+BF_TREE_SKIP:
+    bar.sync 0;
+    shr.u32 %r27, %r27, 1;
+    setp.gt.u32 %p3, %r27, 0;
+    @%p3 bra BF_TREE;
+
+    setp.ne.u32 %p2, %r7, 0;
+    @%p2 bra BF_DONE;
+    setp.ge.u32 %p2, %r11, %r1;
+    @%p2 bra BF_DONE;
+    ld.shared.f32 %f4, [%rd9];
+    add.s32 %r29, %r4, %r11;
+    mul.wide.u32 %rd12, %r29, 4;
+    add.s64 %rd13, %rd2, %rd12;
+    st.global.f32 [%rd13], %f4;
+BF_DONE:
+    ret;
+}
+
+// ---------------------------------------------------------------------------
+// y = W x, W left as f16 pairs inside uints. Same shape as gemv_bf16; the
+// unpack is a hardware cvt, which is correct for subnormal halves (the
+// shift-and-scale trick needs a subnormal f32 intermediate that drivers flush).
+// grid = ceil(rows/4), block = 256
+// ---------------------------------------------------------------------------
+.visible .entry gemv_f16(
+    .param .u64 w,
+    .param .u64 arena,
+    .param .u32 rows,
+    .param .u32 cols,
+    .param .u32 x_off,
+    .param .u32 y_off,
+    .param .u32 row_base
+)
+{
+    .shared .align 4 .b8 red[1024];
+    .reg .pred %p<4>;
+    .reg .b16 %h<3>;
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<20>;
+
+    ld.param.u64 %rd1, [w];
+    ld.param.u64 %rd2, [arena];
+    ld.param.u32 %r1, [rows];
+    ld.param.u32 %r2, [cols];
+    ld.param.u32 %r3, [x_off];
+    ld.param.u32 %r4, [y_off];
+    ld.param.u32 %r5, [row_base];
+    mov.u32 %r6, %tid.x;
+    and.b32 %r7, %r6, 63;
+    shr.u32 %r8, %r6, 6;
+    mov.u32 %r9, %ctaid.x;
+    add.s32 %r10, %r5, %r9;
+    shl.b32 %r10, %r10, 2;
+    add.s32 %r11, %r10, %r8;
+    shr.u32 %r12, %r2, 1;
+
+    mov.f32 %f1, 0f00000000;
+    setp.ge.u32 %p1, %r11, %r1;
+    @%p1 bra HF_RED;
+    mul.lo.u32 %r13, %r11, %r12;
+    and.b32 %r14, %r12, 3;
+    setp.ne.u32 %p2, %r14, 0;
+    @%p2 bra HF_SCALAR;
+
+    shr.u32 %r15, %r12, 2;
+    shr.u32 %r16, %r13, 2;
+    mov.u32 %r17, %r7;
+HF_QUAD:
+    setp.ge.u32 %p2, %r17, %r15;
+    @%p2 bra HF_RED;
+    add.s32 %r18, %r16, %r17;
+    mul.wide.u32 %rd3, %r18, 16;
+    add.s64 %rd4, %rd1, %rd3;
+    ld.global.nc.v4.u32 {%r19,%r20,%r21,%r22}, [%rd4];
+    shl.b32 %r23, %r17, 3;
+    add.s32 %r24, %r3, %r23;
+    mul.wide.u32 %rd5, %r24, 4;
+    add.s64 %rd6, %rd2, %rd5;
+    ld.global.v4.f32 {%f2,%f3,%f4,%f5}, [%rd6];
+    ld.global.v4.f32 {%f6,%f7,%f8,%f9}, [%rd6+16];
+
+    cvt.u16.u32 %h1, %r19; cvt.f32.f16 %f10, %h1;
+    shr.u32 %r25, %r19, 16; cvt.u16.u32 %h2, %r25; cvt.f32.f16 %f11, %h2;
+    cvt.u16.u32 %h1, %r20; cvt.f32.f16 %f12, %h1;
+    shr.u32 %r25, %r20, 16; cvt.u16.u32 %h2, %r25; cvt.f32.f16 %f13, %h2;
+    cvt.u16.u32 %h1, %r21; cvt.f32.f16 %f14, %h1;
+    shr.u32 %r25, %r21, 16; cvt.u16.u32 %h2, %r25; cvt.f32.f16 %f15, %h2;
+    cvt.u16.u32 %h1, %r22; cvt.f32.f16 %f16, %h1;
+    shr.u32 %r25, %r22, 16; cvt.u16.u32 %h2, %r25; cvt.f32.f16 %f17, %h2;
+
+    mul.f32 %f18, %f10, %f2;
+    fma.rn.f32 %f18, %f11, %f3, %f18;
+    fma.rn.f32 %f18, %f12, %f4, %f18;
+    fma.rn.f32 %f18, %f13, %f5, %f18;
+    fma.rn.f32 %f18, %f14, %f6, %f18;
+    fma.rn.f32 %f18, %f15, %f7, %f18;
+    fma.rn.f32 %f18, %f16, %f8, %f18;
+    fma.rn.f32 %f18, %f17, %f9, %f18;
+    add.f32 %f1, %f1, %f18;
+    add.s32 %r17, %r17, 64;
+    bra HF_QUAD;
+
+HF_SCALAR:
+    mov.u32 %r17, %r7;
+HF_SLOOP:
+    setp.ge.u32 %p2, %r17, %r12;
+    @%p2 bra HF_RED;
+    add.s32 %r18, %r13, %r17;
+    mul.wide.u32 %rd3, %r18, 4;
+    add.s64 %rd4, %rd1, %rd3;
+    ld.global.nc.u32 %r19, [%rd4];
+    shl.b32 %r23, %r17, 1;
+    add.s32 %r24, %r3, %r23;
+    mul.wide.u32 %rd5, %r24, 4;
+    add.s64 %rd6, %rd2, %rd5;
+    ld.global.f32 %f2, [%rd6];
+    ld.global.f32 %f3, [%rd6+4];
+    cvt.u16.u32 %h1, %r19; cvt.f32.f16 %f10, %h1;
+    shr.u32 %r25, %r19, 16; cvt.u16.u32 %h2, %r25; cvt.f32.f16 %f11, %h2;
+    mul.f32 %f12, %f10, %f2;
+    fma.rn.f32 %f12, %f11, %f3, %f12;
+    add.f32 %f1, %f1, %f12;
+    add.s32 %r17, %r17, 64;
+    bra HF_SLOOP;
+
+HF_RED:
+    mul.wide.u32 %rd7, %r6, 4;
+    mov.u64 %rd8, red;
+    add.s64 %rd9, %rd8, %rd7;
+    st.shared.f32 [%rd9], %f1;
+    bar.sync 0;
+    mov.u32 %r27, 32;
+HF_TREE:
+    setp.ge.u32 %p2, %r7, %r27;
+    @%p2 bra HF_TREE_SKIP;
+    add.s32 %r28, %r6, %r27;
+    mul.wide.u32 %rd10, %r28, 4;
+    add.s64 %rd11, %rd8, %rd10;
+    ld.shared.f32 %f2, [%rd11];
+    ld.shared.f32 %f3, [%rd9];
+    add.f32 %f3, %f3, %f2;
+    st.shared.f32 [%rd9], %f3;
+HF_TREE_SKIP:
+    bar.sync 0;
+    shr.u32 %r27, %r27, 1;
+    setp.gt.u32 %p3, %r27, 0;
+    @%p3 bra HF_TREE;
+
+    setp.ne.u32 %p2, %r7, 0;
+    @%p2 bra HF_DONE;
+    setp.ge.u32 %p2, %r11, %r1;
+    @%p2 bra HF_DONE;
+    ld.shared.f32 %f4, [%rd9];
+    add.s32 %r29, %r4, %r11;
+    mul.wide.u32 %rd12, %r29, 4;
+    add.s64 %rd13, %rd2, %rd12;
+    st.global.f32 [%rd13], %f4;
+HF_DONE:
+    ret;
+}
+
+// ---------------------------------------------------------------------------
+// Depthwise causal conv + SiLU in place over the qkv projection, with the
+// rolling window in a persistent device buffer. One thread owns one channel
+// across every time slice, so the rotation needs no barrier.
+// grid = ceil(cd/256), block = 256
+// ---------------------------------------------------------------------------
+.visible .entry gdn_conv(
+    .param .u64 arena,
+    .param .u64 w,
+    .param .u64 state,
+    .param .u32 base,
+    .param .u32 cd,
+    .param .u32 kernel,
+    .param .u32 hist
+)
+{
+    .reg .pred %p<6>;
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<24>;
+    .reg .f32 %f<10>;
+
+    ld.param.u64 %rd1, [arena];
+    ld.param.u64 %rd2, [w];
+    ld.param.u64 %rd3, [state];
+    ld.param.u32 %r1, [base];
+    ld.param.u32 %r2, [cd];
+    ld.param.u32 %r3, [kernel];
+    ld.param.u32 %r4, [hist];
+    mov.u32 %r5, %ctaid.x;
+    mov.u32 %r6, %tid.x;
+    mad.lo.s32 %r7, %r5, 256, %r6;
+    setp.ge.u32 %p1, %r7, %r2;
+    @%p1 bra GC_DONE;
+
+    add.s32 %r8, %r1, %r7;
+    mul.wide.u32 %rd4, %r8, 4;
+    add.s64 %rd5, %rd1, %rd4;
+    ld.global.f32 %f1, [%rd5];
+
+    mov.f32 %f2, 0f00000000;
+    mov.u32 %r9, 0;
+GC_HIST:
+    setp.ge.u32 %p2, %r9, %r4;
+    @%p2 bra GC_HIST_END;
+    mad.lo.s32 %r10, %r9, %r2, %r7;
+    mul.wide.u32 %rd6, %r10, 4;
+    add.s64 %rd7, %rd3, %rd6;
+    ld.global.f32 %f3, [%rd7];
+    mad.lo.s32 %r11, %r7, %r3, %r9;
+    mul.wide.u32 %rd8, %r11, 4;
+    add.s64 %rd9, %rd2, %rd8;
+    ld.global.f32 %f4, [%rd9];
+    fma.rn.f32 %f2, %f3, %f4, %f2;
+    add.s32 %r9, %r9, 1;
+    bra GC_HIST;
+GC_HIST_END:
+    mad.lo.s32 %r12, %r7, %r3, %r4;
+    mul.wide.u32 %rd10, %r12, 4;
+    add.s64 %rd11, %rd2, %rd10;
+    ld.global.f32 %f5, [%rd11];
+    fma.rn.f32 %f2, %f1, %f5, %f2;
+
+    mov.u32 %r13, 0;
+GC_ROT:
+    add.s32 %r14, %r13, 1;
+    setp.ge.u32 %p3, %r14, %r4;
+    @%p3 bra GC_ROT_END;
+    mad.lo.s32 %r15, %r14, %r2, %r7;
+    mul.wide.u32 %rd12, %r15, 4;
+    add.s64 %rd13, %rd3, %rd12;
+    ld.global.f32 %f6, [%rd13];
+    mad.lo.s32 %r16, %r13, %r2, %r7;
+    mul.wide.u32 %rd14, %r16, 4;
+    add.s64 %rd15, %rd3, %rd14;
+    st.global.f32 [%rd15], %f6;
+    mov.u32 %r13, %r14;
+    bra GC_ROT;
+GC_ROT_END:
+    setp.eq.u32 %p4, %r4, 0;
+    @%p4 bra GC_SILU;
+    sub.s32 %r17, %r4, 1;
+    mad.lo.s32 %r18, %r17, %r2, %r7;
+    mul.wide.u32 %rd16, %r18, 4;
+    add.s64 %rd17, %rd3, %rd16;
+    st.global.f32 [%rd17], %f1;
+GC_SILU:
+    neg.f32 %f7, %f2;
+    mul.f32 %f7, %f7, 0f3FB8AA3B;
+    ex2.approx.f32 %f7, %f7;
+    add.f32 %f7, %f7, 0f3F800000;
+    div.rn.f32 %f7, %f2, %f7;
+    st.global.f32 [%rd5], %f7;
+GC_DONE:
+    ret;
+}
+
+// ---------------------------------------------------------------------------
+// Gated delta net. One block per value head, 512 threads covering the head's
+// [dk, dv] recurrence as G = 512/dv row groups of dv columns. The update is
+// elementwise in (i, j); only the two reductions over i cross rows, and those
+// go through shared memory. One thread per column left 24 SMs holding 32
+// blocks and ran at memory latency instead of bandwidth.
+// Shared: sq[256] sk[256] so[256] tmp[512].
+// grid = nv, block = 512
+// ---------------------------------------------------------------------------
+.visible .entry gdn_rec(
+    .param .u64 arena,
+    .param .u64 w,
+    .param .u64 state,
+    .param .u32 base,
+    .param .u32 out_off,
+    .param .u32 kd,
+    .param .u32 nv,
+    .param .u32 dk,
+    .param .u32 dv,
+    .param .u32 rep,
+    .param .f32 eps
+)
+{
+    .shared .align 4 .b8 sh[5120];
+    .reg .pred %p<8>;
+    .reg .b32 %r<48>;
+    .reg .b64 %rd<48>;
+    .reg .f32 %f<32>;
+
+    ld.param.u64 %rd1, [arena];
+    ld.param.u64 %rd2, [w];
+    ld.param.u64 %rd3, [state];
+    ld.param.u32 %r1, [base];
+    ld.param.u32 %r2, [out_off];
+    ld.param.u32 %r3, [kd];
+    ld.param.u32 %r4, [nv];
+    ld.param.u32 %r5, [dk];
+    ld.param.u32 %r6, [dv];
+    ld.param.u32 %r7, [rep];
+    ld.param.f32 %f1, [eps];
+
+    mov.u32 %r8, %ctaid.x;
+    mov.u32 %r9, %tid.x;
+    mov.u64 %rd4, sh;
+    add.s64 %rd13, %rd4, 3072;
+
+    mul.lo.s32 %r10, %r4, %r6;
+    shl.b32 %r11, %r3, 1;
+    add.s32 %r12, %r11, %r10;
+    div.u32 %r13, %r8, %r7;
+    mad.lo.s32 %r14, %r13, %r5, %r1;
+    add.s32 %r15, %r14, %r3;
+
+    mov.u32 %r16, 512;
+    div.u32 %r16, %r16, %r6;
+    div.u32 %r17, %r9, %r6;
+    mul.lo.s32 %r18, %r17, %r6;
+    sub.s32 %r18, %r9, %r18;
+    div.u32 %r19, %r5, %r16;
+    mul.lo.s32 %r20, %r17, %r19;
+    add.s32 %r21, %r20, %r19;
+
+    mov.f32 %f2, 0f00000000;
+    mov.f32 %f3, 0f00000000;
+    mov.u32 %r22, %r9;
+GR_LOAD:
+    setp.ge.u32 %p1, %r22, %r5;
+    @%p1 bra GR_LOAD_END;
+    add.s32 %r23, %r14, %r22;
+    mul.wide.u32 %rd5, %r23, 4;
+    add.s64 %rd6, %rd1, %rd5;
+    ld.global.f32 %f4, [%rd6];
+    add.s32 %r23, %r15, %r22;
+    mul.wide.u32 %rd7, %r23, 4;
+    add.s64 %rd8, %rd1, %rd7;
+    ld.global.f32 %f5, [%rd8];
+    mul.wide.u32 %rd9, %r22, 4;
+    add.s64 %rd10, %rd4, %rd9;
+    st.shared.f32 [%rd10], %f4;
+    add.s64 %rd11, %rd10, 1024;
+    st.shared.f32 [%rd11], %f5;
+    fma.rn.f32 %f2, %f4, %f4, %f2;
+    fma.rn.f32 %f3, %f5, %f5, %f3;
+    add.s32 %r22, %r22, 512;
+    bra GR_LOAD;
+GR_LOAD_END:
+    mul.wide.u32 %rd12, %r9, 4;
+    add.s64 %rd14, %rd13, %rd12;
+    st.shared.f32 [%rd14], %f2;
+    bar.sync 0;
+    mov.u32 %r22, 256;
+GR_TREE1:
+    setp.ge.u32 %p2, %r9, %r22;
+    @%p2 bra GR_SKIP1;
+    add.s32 %r23, %r9, %r22;
+    mul.wide.u32 %rd15, %r23, 4;
+    add.s64 %rd16, %rd13, %rd15;
+    ld.shared.f32 %f4, [%rd16];
+    ld.shared.f32 %f5, [%rd14];
+    add.f32 %f5, %f5, %f4;
+    st.shared.f32 [%rd14], %f5;
+GR_SKIP1:
+    bar.sync 0;
+    shr.u32 %r22, %r22, 1;
+    setp.gt.u32 %p3, %r22, 0;
+    @%p3 bra GR_TREE1;
+    ld.shared.f32 %f6, [%rd13];
+    add.f32 %f6, %f6, 0f358637BD;
+    sqrt.rn.f32 %f6, %f6;
+    div.rn.f32 %f7, 0f3F800000, %f6;
+    bar.sync 0;
+
+    st.shared.f32 [%rd14], %f3;
+    bar.sync 0;
+    mov.u32 %r22, 256;
+GR_TREE2:
+    setp.ge.u32 %p2, %r9, %r22;
+    @%p2 bra GR_SKIP2;
+    add.s32 %r23, %r9, %r22;
+    mul.wide.u32 %rd15, %r23, 4;
+    add.s64 %rd16, %rd13, %rd15;
+    ld.shared.f32 %f4, [%rd16];
+    ld.shared.f32 %f5, [%rd14];
+    add.f32 %f5, %f5, %f4;
+    st.shared.f32 [%rd14], %f5;
+GR_SKIP2:
+    bar.sync 0;
+    shr.u32 %r22, %r22, 1;
+    setp.gt.u32 %p3, %r22, 0;
+    @%p3 bra GR_TREE2;
+    ld.shared.f32 %f6, [%rd13];
+    add.f32 %f6, %f6, 0f358637BD;
+    sqrt.rn.f32 %f6, %f6;
+    div.rn.f32 %f8, 0f3F800000, %f6;
+    bar.sync 0;
+
+    cvt.rn.f32.u32 %f6, %r5;
+    sqrt.rn.f32 %f6, %f6;
+    div.rn.f32 %f6, 0f3F800000, %f6;
+    mov.u32 %r22, %r9;
+GR_SCALE:
+    setp.ge.u32 %p1, %r22, %r5;
+    @%p1 bra GR_SCALE_END;
+    mul.wide.u32 %rd9, %r22, 4;
+    add.s64 %rd10, %rd4, %rd9;
+    ld.shared.f32 %f4, [%rd10];
+    mul.f32 %f4, %f4, %f7;
+    mul.f32 %f4, %f4, %f6;
+    st.shared.f32 [%rd10], %f4;
+    add.s64 %rd11, %rd10, 1024;
+    ld.shared.f32 %f5, [%rd11];
+    mul.f32 %f5, %f5, %f8;
+    st.shared.f32 [%rd11], %f5;
+    add.s32 %r22, %r22, 512;
+    bra GR_SCALE;
+GR_SCALE_END:
+    bar.sync 0;
+
+    add.s32 %r24, %r12, %r10;
+    add.s32 %r23, %r24, %r8;
+    add.s32 %r23, %r23, %r1;
+    mul.wide.u32 %rd17, %r23, 4;
+    add.s64 %rd18, %rd1, %rd17;
+    ld.global.f32 %f9, [%rd18];
+    neg.f32 %f10, %f9;
+    mul.f32 %f10, %f10, 0f3FB8AA3B;
+    ex2.approx.f32 %f10, %f10;
+    add.f32 %f10, %f10, 0f3F800000;
+    div.rn.f32 %f9, 0f3F800000, %f10;
+
+    add.s32 %r23, %r24, %r4;
+    add.s32 %r23, %r23, %r8;
+    add.s32 %r23, %r23, %r1;
+    mul.wide.u32 %rd19, %r23, 4;
+    add.s64 %rd20, %rd1, %rd19;
+    ld.global.f32 %f10, [%rd20];
+    add.s32 %r23, %r4, %r8;
+    mul.wide.u32 %rd21, %r23, 4;
+    add.s64 %rd22, %rd2, %rd21;
+    ld.global.f32 %f11, [%rd22];
+    add.f32 %f10, %f10, %f11;
+    setp.gt.f32 %p4, %f10, 0f41A00000;
+    @%p4 bra GR_SP_DONE;
+    mul.f32 %f12, %f10, 0f3FB8AA3B;
+    ex2.approx.f32 %f12, %f12;
+    add.f32 %f12, %f12, 0f3F800000;
+    lg2.approx.f32 %f12, %f12;
+    mul.f32 %f12, %f12, 0f3F317218;
+    mov.f32 %f10, %f12;
+GR_SP_DONE:
+    mul.wide.u32 %rd23, %r8, 4;
+    add.s64 %rd24, %rd2, %rd23;
+    ld.global.f32 %f12, [%rd24];
+    mul.f32 %f13, %f12, 0f3FB8AA3B;
+    ex2.approx.f32 %f13, %f13;
+    mul.f32 %f13, %f13, %f10;
+    neg.f32 %f13, %f13;
+    mul.f32 %f14, %f13, 0f3FB8AA3B;
+    ex2.approx.f32 %f14, %f14;
+
+    mul.lo.s32 %r25, %r8, %r5;
+    mul.lo.s32 %r25, %r25, %r6;
+    mul.wide.u32 %rd29, %r6, 4;
+
+    mad.lo.s32 %r23, %r8, %r6, %r18;
+    add.s32 %r23, %r23, %r11;
+    add.s32 %r23, %r23, %r1;
+    mul.wide.u32 %rd25, %r23, 4;
+    add.s64 %rd26, %rd1, %rd25;
+    ld.global.f32 %f15, [%rd26];
+
+    mad.lo.s32 %r23, %r20, %r6, %r18;
+    add.s32 %r23, %r23, %r25;
+    mul.wide.u32 %rd27, %r23, 4;
+    add.s64 %rd28, %rd3, %rd27;
+
+    mov.f32 %f16, 0f00000000;
+    mov.u32 %r26, %r20;
+    mov.u64 %rd30, %rd28;
+// Four rows per iteration. One row at a time, the next load cannot issue until
+// the previous store retires - ptxas cannot prove they do not alias - so the
+// pass would run at memory latency instead of memory bandwidth.
+GR_I1:
+    setp.ge.u32 %p2, %r26, %r21;
+    @%p2 bra GR_I1_END;
+    ld.global.f32 %f21, [%rd30];
+    add.s64 %rd31, %rd30, %rd29;
+    ld.global.f32 %f22, [%rd31];
+    add.s64 %rd32, %rd31, %rd29;
+    ld.global.f32 %f23, [%rd32];
+    add.s64 %rd33, %rd32, %rd29;
+    ld.global.f32 %f24, [%rd33];
+    mul.f32 %f21, %f21, %f14;
+    mul.f32 %f22, %f22, %f14;
+    mul.f32 %f23, %f23, %f14;
+    mul.f32 %f24, %f24, %f14;
+    st.global.f32 [%rd30], %f21;
+    st.global.f32 [%rd31], %f22;
+    st.global.f32 [%rd32], %f23;
+    st.global.f32 [%rd33], %f24;
+    mul.wide.u32 %rd34, %r26, 4;
+    add.s64 %rd35, %rd4, 1024;
+    add.s64 %rd35, %rd35, %rd34;
+    ld.shared.f32 %f25, [%rd35];
+    ld.shared.f32 %f26, [%rd35+4];
+    ld.shared.f32 %f27, [%rd35+8];
+    ld.shared.f32 %f28, [%rd35+12];
+    fma.rn.f32 %f16, %f21, %f25, %f16;
+    fma.rn.f32 %f16, %f22, %f26, %f16;
+    fma.rn.f32 %f16, %f23, %f27, %f16;
+    fma.rn.f32 %f16, %f24, %f28, %f16;
+    add.s64 %rd30, %rd33, %rd29;
+    add.s32 %r26, %r26, 4;
+    bra GR_I1;
+GR_I1_END:
+    st.shared.f32 [%rd14], %f16;
+    bar.sync 0;
+    setp.ne.u32 %p5, %r17, 0;
+    @%p5 bra GR_KVM_DONE;
+    mov.f32 %f16, 0f00000000;
+    mov.u32 %r27, 0;
+GR_KVM:
+    setp.ge.u32 %p6, %r27, %r16;
+    @%p6 bra GR_KVM_END;
+    mad.lo.s32 %r23, %r27, %r6, %r18;
+    mul.wide.u32 %rd31, %r23, 4;
+    add.s64 %rd32, %rd13, %rd31;
+    ld.shared.f32 %f4, [%rd32];
+    add.f32 %f16, %f16, %f4;
+    add.s32 %r27, %r27, 1;
+    bra GR_KVM;
+GR_KVM_END:
+    mul.wide.u32 %rd31, %r18, 4;
+    add.s64 %rd32, %rd4, 2048;
+    add.s64 %rd32, %rd32, %rd31;
+    st.shared.f32 [%rd32], %f16;
+GR_KVM_DONE:
+    bar.sync 0;
+    mul.wide.u32 %rd31, %r18, 4;
+    add.s64 %rd32, %rd4, 2048;
+    add.s64 %rd32, %rd32, %rd31;
+    ld.shared.f32 %f17, [%rd32];
+    sub.f32 %f17, %f15, %f17;
+    mul.f32 %f17, %f17, %f9;
+
+    mov.f32 %f16, 0f00000000;
+    mov.u32 %r26, %r20;
+    mov.u64 %rd30, %rd28;
+GR_I2:
+    setp.ge.u32 %p2, %r26, %r21;
+    @%p2 bra GR_I2_END;
+    ld.global.f32 %f21, [%rd30];
+    add.s64 %rd31, %rd30, %rd29;
+    ld.global.f32 %f22, [%rd31];
+    add.s64 %rd32, %rd31, %rd29;
+    ld.global.f32 %f23, [%rd32];
+    add.s64 %rd33, %rd32, %rd29;
+    ld.global.f32 %f24, [%rd33];
+    mul.wide.u32 %rd34, %r26, 4;
+    add.s64 %rd35, %rd4, 1024;
+    add.s64 %rd35, %rd35, %rd34;
+    add.s64 %rd36, %rd4, %rd34;
+    ld.shared.f32 %f25, [%rd35];
+    ld.shared.f32 %f26, [%rd35+4];
+    ld.shared.f32 %f27, [%rd35+8];
+    ld.shared.f32 %f28, [%rd35+12];
+    fma.rn.f32 %f21, %f25, %f17, %f21;
+    fma.rn.f32 %f22, %f26, %f17, %f22;
+    fma.rn.f32 %f23, %f27, %f17, %f23;
+    fma.rn.f32 %f24, %f28, %f17, %f24;
+    st.global.f32 [%rd30], %f21;
+    st.global.f32 [%rd31], %f22;
+    st.global.f32 [%rd32], %f23;
+    st.global.f32 [%rd33], %f24;
+    ld.shared.f32 %f25, [%rd36];
+    ld.shared.f32 %f26, [%rd36+4];
+    ld.shared.f32 %f27, [%rd36+8];
+    ld.shared.f32 %f28, [%rd36+12];
+    fma.rn.f32 %f16, %f21, %f25, %f16;
+    fma.rn.f32 %f16, %f22, %f26, %f16;
+    fma.rn.f32 %f16, %f23, %f27, %f16;
+    fma.rn.f32 %f16, %f24, %f28, %f16;
+    add.s64 %rd30, %rd33, %rd29;
+    add.s32 %r26, %r26, 4;
+    bra GR_I2;
+GR_I2_END:
+    st.shared.f32 [%rd14], %f16;
+    bar.sync 0;
+    setp.ne.u32 %p5, %r17, 0;
+    @%p5 bra GR_OSUM_DONE;
+    mov.f32 %f16, 0f00000000;
+    mov.u32 %r27, 0;
+GR_OSUM:
+    setp.ge.u32 %p6, %r27, %r16;
+    @%p6 bra GR_OSUM_END;
+    mad.lo.s32 %r23, %r27, %r6, %r18;
+    mul.wide.u32 %rd31, %r23, 4;
+    add.s64 %rd32, %rd13, %rd31;
+    ld.shared.f32 %f4, [%rd32];
+    add.f32 %f16, %f16, %f4;
+    add.s32 %r27, %r27, 1;
+    bra GR_OSUM;
+GR_OSUM_END:
+    mul.wide.u32 %rd31, %r18, 4;
+    add.s64 %rd32, %rd4, 2048;
+    add.s64 %rd32, %rd32, %rd31;
+    st.shared.f32 [%rd32], %f16;
+GR_OSUM_DONE:
+    bar.sync 0;
+
+    mov.f32 %f2, 0f00000000;
+    setp.ne.u32 %p5, %r17, 0;
+    @%p5 bra GR_SS_SKIP;
+    mul.wide.u32 %rd31, %r18, 4;
+    add.s64 %rd32, %rd4, 2048;
+    add.s64 %rd32, %rd32, %rd31;
+    ld.shared.f32 %f4, [%rd32];
+    mul.f32 %f2, %f4, %f4;
+GR_SS_SKIP:
+    st.shared.f32 [%rd14], %f2;
+    bar.sync 0;
+    mov.u32 %r22, 256;
+GR_TREE3:
+    setp.ge.u32 %p2, %r9, %r22;
+    @%p2 bra GR_SKIP3;
+    add.s32 %r23, %r9, %r22;
+    mul.wide.u32 %rd15, %r23, 4;
+    add.s64 %rd16, %rd13, %rd15;
+    ld.shared.f32 %f4, [%rd16];
+    ld.shared.f32 %f5, [%rd14];
+    add.f32 %f5, %f5, %f4;
+    st.shared.f32 [%rd14], %f5;
+GR_SKIP3:
+    bar.sync 0;
+    shr.u32 %r22, %r22, 1;
+    setp.gt.u32 %p3, %r22, 0;
+    @%p3 bra GR_TREE3;
+    ld.shared.f32 %f5, [%rd13];
+    cvt.rn.f32.u32 %f6, %r6;
+    div.rn.f32 %f5, %f5, %f6;
+    add.f32 %f5, %f5, %f1;
+    sqrt.rn.f32 %f5, %f5;
+    div.rn.f32 %f5, 0f3F800000, %f5;
+
+    setp.ne.u32 %p5, %r17, 0;
+    @%p5 bra GR_DONE;
+    shl.b32 %r30, %r4, 1;
+    mad.lo.s32 %r31, %r8, %r6, %r18;
+    add.s32 %r31, %r31, %r12;
+    add.s32 %r31, %r31, %r1;
+    mul.wide.u32 %rd36, %r31, 4;
+    add.s64 %rd37, %rd1, %rd36;
+    ld.global.f32 %f7, [%rd37];
+    neg.f32 %f8, %f7;
+    mul.f32 %f8, %f8, 0f3FB8AA3B;
+    ex2.approx.f32 %f8, %f8;
+    add.f32 %f8, %f8, 0f3F800000;
+    div.rn.f32 %f8, %f7, %f8;
+    mul.wide.u32 %rd31, %r18, 4;
+    add.s64 %rd32, %rd4, 2048;
+    add.s64 %rd32, %rd32, %rd31;
+    ld.shared.f32 %f9, [%rd32];
+    mul.f32 %f9, %f9, %f5;
+    add.s32 %r32, %r30, %r18;
+    mul.wide.u32 %rd38, %r32, 4;
+    add.s64 %rd39, %rd2, %rd38;
+    ld.global.f32 %f10, [%rd39];
+    mul.f32 %f9, %f10, %f9;
+    mul.f32 %f9, %f9, %f8;
+    mad.lo.s32 %r33, %r8, %r6, %r18;
+    add.s32 %r33, %r33, %r2;
+    mul.wide.u32 %rd36, %r33, 4;
+    add.s64 %rd37, %rd1, %rd36;
+    st.global.f32 [%rd37], %f9;
+GR_DONE:
+    ret;
+}
