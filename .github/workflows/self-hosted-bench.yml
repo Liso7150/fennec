@@ -38,8 +38,8 @@ jobs:
       - name: Backend matrix vs Colibri (3 pairs, <=8 threads)
         shell: powershell
         env:
-          FENNEC_DENSE_INT4: "1"
-        run: python D:/Fennec-Suite/engine-bench/bench-backend-matrix.py --pairs 3 --only fennec-cuda --merge
+          FENNEC_PLANAR_DOT: "1"
+        run: python D:/Fennec-Suite/engine-bench/bench-backend-matrix.py --pairs 3 --only fennec-cpu --merge
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:

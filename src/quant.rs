@@ -76,6 +76,13 @@ impl PartialEq<[u8]> for Store {
 }
 
 #[derive(Debug, Clone)]
+/// Opt-in: prefer the planar-activation f32 dot over the int8 `maddubs` dot for
+/// host experts. The f32 path showed ~1.3x in a microbenchmark; default off keeps
+/// the int8 kernel that measured 92->38 ms/token. A/B with --planar-dot.
+static PLANAR_DOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn set_planar_dot(v: bool) { PLANAR_DOT.store(v, std::sync::atomic::Ordering::Relaxed); }
+pub fn planar_dot() -> bool { PLANAR_DOT.load(std::sync::atomic::Ordering::Relaxed) }
+
 pub struct Q4 {
     pub rows: usize,
     pub cols: usize,
@@ -425,7 +432,8 @@ impl Q4 {
         debug_assert_eq!(p.x.len(), self.cols);
         #[cfg(target_arch = "x86_64")]
         if let Some(ip) = &p.q {
-            if self.wants_int()
+            if !planar_dot()
+                && self.wants_int()
                 && std::is_x86_feature_detected!("avx2")
                 && std::is_x86_feature_detected!("fma")
             {

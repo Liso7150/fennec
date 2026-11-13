@@ -104,6 +104,7 @@ fn main() {
     let threads = opts.usize_at("threads", cores);
     kernel::set_threads(threads);
     fennec::model::set_dense_int4(opts.has("dense-int4"));
+    fennec::quant::set_planar_dot(opts.has("planar-dot"));
     let r = match cmd.as_str() {
         "info" => info(&opts),
         "doctor" => doctor(&opts),
