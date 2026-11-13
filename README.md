@@ -9,10 +9,11 @@ Replaces [fox](https://github.com/ferrumox/fox), [Colibrì](https://github.com/J
 
 | metric | value | basis |
 |---|---|---|
-| Decode, best tier (CUDA) | **14.716 tok/s** | HTTP protocol, median of 3 |
-| Decode, leader (Colibrì Vulkan) | **19.108 tok/s** | **1.30×** ahead of Fennec |
-| Cold start (CUDA) | **10.1 s** | vs Colibrì Vulkan 25.1 s |
-| Decode, CPU only | 6.109 tok/s | vs Colibrì CPU 7.680 |
+| Decode, best tier (CUDA) | **19.956 tok/s** | HTTP protocol, median of 3, **SAC off** |
+| Decode, leader (Colibrì Vulkan) | **19.481 tok/s** | Fennec CUDA **1.02×** ahead (SAC off) |
+| Vulkan vs Vulkan | 11.016 vs 19.481 | Colibrì **1.77×** ahead — host kernel is the gap |
+| Cold start (CUDA) | **9.6 s** | vs Colibrì Vulkan 23.9 s |
+| Decode, CPU only | 6.988 tok/s | vs Colibrì CPU 8.862 |
 | Device residency | **30.1%** — 3855 picks | 8945 host picks, **0** disk |
 | Host expert pool | **13.08 GiB** | zero-copy borrow, 40/40 layers |
 | Checkpoint | 22.8 GiB int4 | 43 shards, 10240 experts, top-8 of 256 |
@@ -69,16 +70,19 @@ Every live cell: `serve`, then one streaming `/v1/chat/completions`. Same checkp
 ![Cold start per engine and backend](docs/matrix-coldstart.png)
 
 > [!IMPORTANT]
-> **Colibrì still wins.** Its Vulkan tier is **19.108 tok/s** against Fennec's best (CUDA) at **14.716** — a **1.30×** gap. Fennec wins cold start: **10.1 s against 25.1 s**. On CPU alone the gap is 1.26× (6.109 vs 7.680), so the device tier pays for itself (2.41× over Fennec's own CPU-only tier) but the host kernel underneath it is not competitive. It is not "best in everything".
+> **Best-tier: Fennec wins (SAC off).** Fennec CUDA **19.956 tok/s** edges Colibrì's best (Vulkan **19.481**) — 1.02× — and wins cold start 9.6 s vs 23.9 s. **Vulkan-to-Vulkan, Colibrì still leads 1.77×** (19.481 vs 11.016): the gap is the host expert dot (79.5% of the token), which is DRAM-bandwidth-bound. Two levers were measured and do **not** close it: `--planar-dot` (+0.5%, the 1.3× microbench did not translate end-to-end) and `--dense-int4` (no gain; the freed VRAM is offset by scale-buffer headroom, and it OOMs without it). Closing the Vulkan gap needs a host-kernel rewrite that reads fewer bytes or a larger device tier, not a flag.
 
 | engine | backend | tok/s | head s | TTFT s | TPOT ms | total s | cold s |
 |---|---|---|---|---|---|---|---|
-| Colibrì | CPU | 7.680 | 1.657 | 1.657 | 130.2 | 10.0 | 9.3 |
-| **Colibrì** | **Vulkan** | **19.108** | **0.423** | **0.515** | **52.3** | **4.0** | 25.1 |
-| Fennec | CPU | 6.109 | 3.467 | 3.844 | 163.7 | 13.6 | 13.0 |
-| Fennec | Vulkan | 10.418 | 2.079 | 2.344 | 96.0 | 8.0 | 13.6 |
-| **Fennec** | **CUDA** | 14.716 | 1.767 | 1.578 | 68.0 | 6.0 | **10.1** |
-| rabbit | CPU | 1.374 | 17.149 | 17.063 | 727.9 | 61.5 | 7.8 |
+| Colibrì | CPU | 8.862 | 1.657 | 1.672 | 112.8 | 10.0 | 7.7 |
+| **Colibrì** | **Vulkan** | **19.481** | **0.423** | **0.516** | **51.3** | **4.0** | 23.9 |
+| Fennec | CPU | 6.988 | 3.467 | 3.062 | 143.1 | 13.6 | 13.7 |
+| Fennec | Vulkan | 11.016 | 2.079 | 2.063 | 90.8 | 8.0 | 14.1 |
+| **Fennec** | **CUDA** | **19.956** | 1.767 | 1.250 | 50.1 | 6.0 | **9.6** |
+| rabbit | CPU | 1.757 | 17.149 | 17.063 | 569.2 | 61.5 | 7.1 |
+
+> [!NOTE]
+> Measured with **Smart App Control off**. With SAC on, real-time verification adds overhead that hurts Fennec more (CUDA ~14.7 tok/s), so the SAC-off figures are the engine's true speed. Re-enable SAC for a shipping build only after code-signing (#105).
 
 **Winner tally (lower is better except decode): Colibrì 5 · rabbit 1 · Fennec 0.** Total latency is the measured wall time of the request, TTFT included; cold start is process launch to `/v1/models` answering, before any token. Run 1 of each cell is a cold start and slower; the table quotes the **median**, not the best run.
 

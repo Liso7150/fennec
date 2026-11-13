@@ -246,7 +246,11 @@ impl Plan {
         // sized. Without this the lm_head upload at the end is the allocation
         // that hits the wall, 240 MiB after the plan said everything fit.
         let shared_dev = if gpu { n_layers * shared_bytes_of(cfg, DEV_BPP) } else { 0 };
-        let budget = device_budget.saturating_sub(reserve).saturating_sub(shared_dev);
+        // int4 dense adds per-group f32 scale buffers and alignment padding the
+        // bytes-per-weight estimate misses; keep headroom so the last upload
+        // does not hit the wall (vkAllocateMemory out of device memory).
+        let int4_headroom = if gpu && dbpp == 1 { 1 << 30 } else { 0 };
+        let budget = device_budget.saturating_sub(reserve).saturating_sub(shared_dev).saturating_sub(int4_headroom);
 
         // pass 1: bf16 dense into VRAM, smallest block first. Every dense byte
         // is read once per token, so value and weight are the same number and

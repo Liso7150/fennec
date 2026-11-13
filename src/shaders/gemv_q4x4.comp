@@ -1,0 +1,49 @@
+#version 450
+// y = W x for FQ4, four rows per workgroup (same shape as gemv_f16): 64 lanes
+// per row, six reduction barriers paid once for four rows. Same 4-binding layout
+// as gemv_q4 so it reuses the existing descriptor set. One uint = eight nibbles
+// (low = even col, value +8); one f32 scale per `group` cols (group % 8 == 0).
+layout(local_size_x = 256) in;
+layout(push_constant) uniform P {
+    uint rows;
+    uint cols;
+    uint group;
+    uint x_off;
+    uint y_off;
+    uint row_base;
+} p;
+layout(set = 0, binding = 0) readonly buffer W { uint w[]; };
+layout(set = 0, binding = 1) readonly buffer S { float s[]; };
+layout(set = 0, binding = 2) readonly buffer X { float x[]; };
+layout(set = 0, binding = 3) writeonly buffer Y { float y[]; };
+
+shared float red[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint lane = tid & 63u;
+    uint slot = tid >> 6;
+    uint r = (p.row_base + gl_WorkGroupID.x) * 4u + slot;
+    uint words = p.cols >> 3;
+    uint ng = p.cols / p.group;
+    float acc = 0.0;
+    if (r < p.rows) {
+        uint base = r * words;
+        for (uint i = lane; i < words; i += 64u) {
+            uint u = w[base + i];
+            float sc = s[r * ng + (i << 3) / p.group];
+            uint c = p.x_off + (i << 3);
+            float part = 0.0;
+            for (uint k = 0u; k < 8u; k++)
+                part += (float((u >> (4u * k)) & 0xFu) - 8.0) * x[c + k];
+            acc += part * sc;
+        }
+    }
+    red[tid] = acc;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) {
+        if (lane < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    if (lane == 0u && r < p.rows) y[p.y_off + r] = red[tid];
+}
