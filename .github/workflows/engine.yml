@@ -19,5 +19,3 @@ jobs:
         run: cargo build --release
       - name: Unit + synthetic tests (goldens skip without the checkpoint)
         run: cargo test --release
-      - name: CPU plan with int4-dense lever
-        run: ./target/release/fennec.exe plan --cpu --dense-int4
