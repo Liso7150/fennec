@@ -462,7 +462,7 @@ fn a_planned_stack_splits_one_token_across_cpu_and_device() {
     let mut pre = x0.clone();
     kernel::axpy(&mut pre, &res, 1.0);
     kernel::rmsnorm(&pre, &l.norm_post, eps, &mut buf);
-    let r = l.moe.route(&buf);
+    let r = l.moe.as_ref().unwrap().route(&buf);
     let dev: Vec<usize> = r.ids[..r.ids.len() / 2].to_vec();
     let host: Vec<usize> = all.iter().copied().filter(|e| !dev.contains(e)).collect();
 
@@ -490,7 +490,7 @@ fn a_planned_stack_splits_one_token_across_cpu_and_device() {
     };
     assert_eq!(argmax(&la), argmax(&lb), "the split stack picked a different token");
 
-    let m = &split.layers[0].moe;
+    let m = split.layers[0].moe.as_ref().unwrap();
     let (d, hh, c) = (m.dev_hits.load(Relaxed), m.host_hits.load(Relaxed), m.disk_hits.load(Relaxed));
     assert_eq!(d, dev.len() as u64, "the device tier did not take its picks");
     assert_eq!(hh, (r.ids.len() - dev.len()) as u64, "the host tier did not take its picks");

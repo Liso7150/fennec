@@ -196,7 +196,11 @@ pub fn dense_bytes_layer(cfg: &TextConfig, linear: bool, bpp: usize) -> usize {
     let h = cfg.hidden_size;
     let si = cfg.shared_expert_intermediate_size;
     let e = cfg.num_experts;
-    let moe_dense = 3 * si * h + h + e * h;
+    // The FFN bytes of a routed checkpoint are its shared expert plus the
+    // router; the FFN bytes of a dense one are the single MLP every token
+    // reads. Those terms are zero when there are no experts, which would let
+    // the plan price a dense layer as nothing but its mixer.
+    let ffn = if cfg.is_moe() { 3 * si * h + h + e * h } else { cfg.dense_mlp_params() };
     let attn = if linear {
         cfg.conv_dim() * h
             + cfg.value_dim() * h
@@ -208,7 +212,7 @@ pub fn dense_bytes_layer(cfg: &TextConfig, linear: bool, bpp: usize) -> usize {
             + 2 * cfg.num_key_value_heads * cfg.head_dim * h
             + cfg.num_attention_heads * cfg.head_dim * h
     };
-    (moe_dense + attn) * bpp
+    (ffn + attn) * bpp
 }
 
 /// bf16 in VRAM, f32 in the host copy the CPU kernels read: the same weights at

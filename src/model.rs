@@ -13,7 +13,28 @@ use crate::quant::{DotPrep, Q4};
 use crate::safetensors::{DType, Shards};
 use crate::sched::Plan;
 
-pub const PREFIX: &str = "model.language_model";
+/// The prefix a routed `qwen3_5_moe` checkpoint stores its text stack under.
+/// Dense Qwen3 exports use `model.` instead, and no key in config.json records
+/// the difference, so `bind_prefix` reads it back off the shard index and every
+/// name below is built from `cfg.prefix`.
+pub use crate::config::DEFAULT_PREFIX as PREFIX;
+
+/// Point the config at the prefix this checkpoint actually uses.
+pub fn bind_prefix(sh: &Shards, cfg: &mut TextConfig) {
+    cfg.prefix = detect_prefix(sh);
+}
+
+/// The prefix a shard index stores the text stack under. The embedding tensor
+/// is the one name every architecture here has to have, so its parent is the
+/// prefix; a set without one keeps the default and fails later with the usual
+/// "missing tensor" name in the error.
+pub fn detect_prefix(sh: &Shards) -> String {
+    sh.names()
+        .iter()
+        .find_map(|n| n.strip_suffix(".embed_tokens.weight"))
+        .map(str::to_string)
+        .unwrap_or_else(|| PREFIX.to_string())
+}
 
 pub fn dense(sh: &Shards, name: &str) -> Result<(Vec<f32>, usize, usize)> {
     let i = sh
@@ -222,6 +243,24 @@ pub fn dense_half(sh: &Shards, name: &str) -> Result<(Dense, usize, usize)> {
     Ok((Dense::load(sh, name)?, rows, cols))
 }
 
+/// An RMSNorm weight, in the form `kernel::rmsnorm` expects.
+///
+/// The kernel applies `(1 + w)` because the Qwen3.5/3.6 checkpoints store the
+/// delta. A plain Qwen3 stores the full gain, so the 1 comes off at load: the
+/// forward pass, the device batches and every shader keep exactly one
+/// convention, and the dialect stays a property of the weights rather than of
+/// the code that reads them. The gated delta net's norm is a full gain in both
+/// dialects and does not come through here.
+fn norm_w(sh: &Shards, name: &str, zero_centered: bool) -> Result<Vec<f32>> {
+    let mut w = dense(sh, name)?.0;
+    if !zero_centered {
+        for v in w.iter_mut() {
+            *v -= 1.0;
+        }
+    }
+    Ok(w)
+}
+
 // --- the ORT portability backend: dense projections as MatMul sessions ------
 //
 // With `--backend ort` there is no arena `Gpu` tier, so every dense projection
@@ -282,7 +321,9 @@ impl AttnLayer {
 #[cfg(feature = "ort")]
 impl Layer {
     fn dense_to_ort(&mut self, ort: &crate::ort::Ort) -> Result<()> {
-        self.moe.dense_to_ort(ort)?;
+        if let Some(m) = &mut self.moe {
+            m.dense_to_ort(ort)?;
+        }
         if let Some(g) = &mut self.gdn {
             g.dense_to_ort(ort)?;
         }
@@ -509,7 +550,7 @@ impl MoeLayer {
         stream: Option<Stream>,
         threads: usize,
     ) -> Result<MoeLayer> {
-        let p = format!("{PREFIX}.layers.{layer}.mlp");
+        let p = format!("{}.layers.{layer}.mlp", cfg.prefix);
         let (gate, _, _) = dense_half(sh, &format!("{p}.gate.weight"))?;
         let (s_gate, _, _) = dense_half(sh, &format!("{p}.shared_expert.gate_proj.weight"))?;
         let (s_up, _, _) = dense_half(sh, &format!("{p}.shared_expert.up_proj.weight"))?;
@@ -699,7 +740,7 @@ impl MoeLayer {
             let (dw, ds) = g.upload_q4(&dn.slice_rows(h * s, h * (s + 1)))?;
             bufs.push([gw, gs, dw, ds]);
         }
-        let p = format!("{PREFIX}.layers.{layer}.mlp.shared_expert");
+        let p = format!("{}.layers.{layer}.mlp.shared_expert", self.cfg.prefix);
         let shared = match (
             half_of(sh, &format!("{p}.gate_proj.weight")),
             half_of(sh, &format!("{p}.up_proj.weight")),
@@ -986,8 +1027,8 @@ pub fn expert_in(gu: &Q4, dn: &Q4, i: usize, h: usize, s: usize, x: &[f32], hh: 
 /// group width, and decoding 64-column scales as 32 would stretch every scale
 /// over twice its columns — wrong logits, no error. So it is read back from the
 /// bytes: 3*i*h weights over N scales means a group of 3*i*h/N.
-pub fn packed_group(sh: &Shards, h: usize, i: usize) -> Option<usize> {
-    let p = format!("{PREFIX}.layers.0.mlp.experts.0");
+pub fn packed_group(sh: &Shards, prefix: &str, h: usize, i: usize) -> Option<usize> {
+    let p = format!("{prefix}.layers.0.mlp.experts.0");
     let w = sh.info(&format!("{p}.merged_weight"))?;
     let s = sh.info(&format!("{p}.qs"))?;
     let elems = 3 * i * h;
@@ -1011,13 +1052,14 @@ pub fn packed_group(sh: &Shards, h: usize, i: usize) -> Option<usize> {
 /// still emits tokens, just not ones that mean anything.
 pub fn packed_expert(
     sh: &Shards,
+    prefix: &str,
     layer: usize,
     id: usize,
     h: usize,
     i: usize,
     group: usize,
 ) -> Result<(Q4, Q4)> {
-    let p = format!("{PREFIX}.layers.{layer}.mlp.experts.{id}");
+    let p = format!("{prefix}.layers.{layer}.mlp.experts.{id}");
     let block_bytes = i * h / 2;
     let block_scales = i * (h / group);
     let mut w = sh.slice_bytes(&format!("{p}.merged_weight"), 0, 3 * block_bytes)?;
@@ -1037,6 +1079,7 @@ pub fn packed_expert(
 /// layer at the same group size. `None` means "not cached, quantise it".
 pub fn cached_expert(
     sh: &Shards,
+    prefix: &str,
     layer: usize,
     id: usize,
     h: usize,
@@ -1059,9 +1102,9 @@ pub fn cached_expert(
         }
     }
     // An already-int4 checkpoint needs no cache: it is its own.
-    let name = format!("{PREFIX}.layers.{layer}.mlp.experts.{id}.merged_weight");
+    let name = format!("{prefix}.layers.{layer}.mlp.experts.{id}.merged_weight");
     sh.contains(&name)
-        .then(|| packed_expert(sh, layer, id, h, i, group))
+        .then(|| packed_expert(sh, prefix, layer, id, h, i, group))
 }
 
 /// The host tier without a copy: one borrowed pair of matrices per expert,
@@ -1086,7 +1129,7 @@ pub fn map_experts(
     group: usize,
 ) -> Result<Option<Vec<(Q4, Q4)>>> {
     let (h, i) = (cfg.hidden_size, cfg.moe_intermediate_size);
-    let p = format!("{PREFIX}.layers.{layer}.mlp.experts");
+    let p = format!("{}.layers.{layer}.mlp.experts", cfg.prefix);
     if !sh.contains(&format!("{p}.0.merged_weight")) || h % group != 0 {
         return Ok(None);
     }
@@ -1121,7 +1164,7 @@ pub fn gather_experts(
     threads: usize,
 ) -> Result<(Q4, Q4)> {
     let (h, i) = (cfg.hidden_size, cfg.moe_intermediate_size);
-    let p = format!("{PREFIX}.layers.{layer}.mlp.experts");
+    let p = format!("{}.layers.{layer}.mlp.experts", cfg.prefix);
     let (gu_name, dn_name) = (format!("{p}.gate_up_proj"), format!("{p}.down_proj"));
     let mut gu = Q4::with_capacity(ids.len() * 2 * i, h, group);
     let mut dn = Q4::with_capacity(ids.len() * h, i, group);
@@ -1151,7 +1194,7 @@ pub fn gather_experts(
             .collect();
         kernel::par_rows(&mut blocks, threads, |slice, start| {
             for (k, slot) in slice.iter_mut().enumerate() {
-                *slot = packed_expert(sh, layer, ids[start + k], h, i, group);
+                *slot = packed_expert(sh, &cfg.prefix, layer, ids[start + k], h, i, group);
             }
         });
         for b in blocks {
@@ -1179,8 +1222,8 @@ pub struct MoeParts {
 }
 
 impl MoeParts {
-    pub fn load(sh: &Shards, layer: usize) -> Result<MoeParts> {
-        let p = format!("{PREFIX}.layers.{layer}.mlp");
+    pub fn load(sh: &Shards, prefix: &str, layer: usize) -> Result<MoeParts> {
+        let p = format!("{prefix}.layers.{layer}.mlp");
         Ok(MoeParts {
             gate: dense_half(sh, &format!("{p}.gate.weight"))?.0,
             s_gate: dense_half(sh, &format!("{p}.shared_expert.gate_proj.weight"))?.0,
@@ -1188,6 +1231,57 @@ impl MoeParts {
             s_down: dense_half(sh, &format!("{p}.shared_expert.down_proj.weight"))?.0,
             s_egate: dense(sh, &format!("{p}.shared_expert_gate.weight"))?.0,
         })
+    }
+}
+
+/// The FFN of a dense checkpoint: one SiLU MLP per layer, on every token.
+///
+/// `MoeLayer::shared` is the same gate/up/down chain with different tensor
+/// names, so this reuses `Dense` and its kernels rather than transcribing the
+/// math a second time. `intermediate_size` is the width the MoE lane calls
+/// `moe_intermediate_size`.
+pub struct MlpLayer {
+    pub cfg: Arc<TextConfig>,
+    pub gate: Dense,
+    pub up: Dense,
+    pub down: Dense,
+    pub threads: usize,
+}
+
+impl MlpLayer {
+    pub fn load(sh: &Shards, cfg: Arc<TextConfig>, layer: usize, threads: usize) -> Result<MlpLayer> {
+        let p = format!("{}.layers.{layer}.mlp", cfg.prefix);
+        let mut l = MlpLayer {
+            gate: dense_half(sh, &format!("{p}.gate_proj.weight"))?.0,
+            up: dense_half(sh, &format!("{p}.up_proj.weight"))?.0,
+            down: dense_half(sh, &format!("{p}.down_proj.weight"))?.0,
+            cfg,
+            threads: threads.max(1),
+        };
+        if dense_i8() {
+            let (i, h) = (l.cfg.intermediate_size, l.cfg.hidden_size);
+            l.gate = l.gate.quantize_i8(i, h);
+            l.up = l.up.quantize_i8(i, h);
+            l.down = l.down.quantize_i8(h, i);
+        }
+        Ok(l)
+    }
+
+    /// out (len H) = down @ (silu(gate @ x) * (up @ x)). `u` carries the
+    /// activation once `g` is spent, so the block holds three H/I buffers and
+    /// not four.
+    pub fn forward(&self, x: &[f32], out: &mut [f32]) {
+        let (h, i) = (self.cfg.hidden_size, self.cfg.intermediate_size);
+        let t = self.threads;
+        let _p = prof::start(prof::MIXER_PROJ);
+        let mut g = vec![0f32; i];
+        let mut u = vec![0f32; i];
+        self.gate.gemv(i, h, x, &mut g, t);
+        self.up.gemv(i, h, x, &mut u, t);
+        for j in 0..i {
+            u[j] = kernel::silu(g[j]) * u[j];
+        }
+        self.down.gemv(h, i, &u, out, t);
     }
 }
 
@@ -1248,7 +1342,7 @@ pub struct GdnLayer {
 
 impl GdnLayer {
     pub fn load(sh: &Shards, cfg: Arc<TextConfig>, layer: usize, threads: usize) -> Result<GdnLayer> {
-        let p = format!("{PREFIX}.layers.{layer}.linear_attn");
+        let p = format!("{}.layers.{layer}.linear_attn", cfg.prefix);
         let (h, cd, vd, nv) = (
             cfg.hidden_size,
             cfg.conv_dim(),
@@ -1285,7 +1379,7 @@ impl GdnLayer {
     /// with them the conv weights, A_log, dt_bias and the gated norm plus two
     /// zeroed state buffers, so the whole mixer can run on the device.
     pub fn attach_dense(&mut self, sh: &Shards, layer: usize, gpu: Arc<Mutex<Gpu>>) -> Result<()> {
-        let p = format!("{PREFIX}.layers.{layer}.linear_attn");
+        let p = format!("{}.layers.{layer}.linear_attn", self.cfg.prefix);
         let names = [
             format!("{p}.in_proj_qkv.weight"),
             format!("{p}.in_proj_z.weight"),
@@ -1633,7 +1727,7 @@ pub struct AttnLayer {
 
 impl AttnLayer {
     pub fn load(sh: &Shards, cfg: Arc<TextConfig>, layer: usize, max_pos: usize, threads: usize) -> Result<AttnLayer> {
-        let p = format!("{PREFIX}.layers.{layer}.self_attn");
+        let p = format!("{}.layers.{layer}.self_attn", cfg.prefix);
         let mut cos = Vec::new();
         let mut sin = Vec::new();
         kernel::rope_tables(cfg.rope_theta, cfg.rotary_dim(), max_pos, &mut cos, &mut sin);
@@ -1644,14 +1738,15 @@ impl AttnLayer {
             cfg.head_dim,
         );
         let q_out = if cfg.attn_output_gate { nh * hd * 2 } else { nh * hd };
+        let zc = cfg.norm_zero_centered;
         let mut l = AttnLayer {
             cfg,
             q: dense_half(sh, &format!("{p}.q_proj.weight"))?.0,
             k: dense_half(sh, &format!("{p}.k_proj.weight"))?.0,
             v: dense_half(sh, &format!("{p}.v_proj.weight"))?.0,
             o: dense_half(sh, &format!("{p}.o_proj.weight"))?.0,
-            q_norm: dense(sh, &format!("{p}.q_norm.weight"))?.0,
-            k_norm: dense(sh, &format!("{p}.k_norm.weight"))?.0,
+            q_norm: norm_w(sh, &format!("{p}.q_norm.weight"), zc)?,
+            k_norm: norm_w(sh, &format!("{p}.k_norm.weight"), zc)?,
             cos,
             sin,
             threads: threads.max(1),
@@ -1670,7 +1765,7 @@ impl AttnLayer {
     /// stay on the CPU: they read the cache, which is host memory that grows
     /// with the sequence and has no business being re-uploaded every token.
     pub fn attach_dense(&mut self, sh: &Shards, layer: usize, gpu: Arc<Mutex<Gpu>>) -> Result<()> {
-        let p = format!("{PREFIX}.layers.{layer}.self_attn");
+        let p = format!("{}.layers.{layer}.self_attn", self.cfg.prefix);
         let names = [
             format!("{p}.q_proj.weight"),
             format!("{p}.k_proj.weight"),
@@ -1746,8 +1841,11 @@ impl AttnLayer {
         let eps = cfg.rms_norm_eps as f32;
         let q_out = if cfg.attn_output_gate { nh * hd * 2 } else { nh * hd };
 
-        // q_proj is [nh, head_dim*2] per head: query first, then the output gate
-        let stride = hd * 2;
+        // q_proj is [nh, head_dim*2] per head when the checkpoint gates the
+        // output: query first, then the gate. A dense Qwen3 has no gate, so the
+        // heads are packed one head_dim apart and reading them at 2*hd would
+        // stride every other head into the following row.
+        let stride = if cfg.attn_output_gate { hd * 2 } else { hd };
         let mut ibuf = vec![0f32; q_out + 2 * nkv * hd];
         match &self.dev {
             Some(d) => {
@@ -1851,10 +1949,14 @@ impl AttnLayer {
 }
 
 pub struct Layer {
+    pub cfg: Arc<TextConfig>,
     pub kind: LayerKind,
     pub norm_in: Vec<f32>,
     pub norm_post: Vec<f32>,
-    pub moe: MoeLayer,
+    /// Routed-expert FFN: `Some` only when the checkpoint has experts.
+    pub moe: Option<MoeLayer>,
+    /// Dense SiLU FFN: `Some` exactly when `moe` is `None`.
+    pub mlp: Option<MlpLayer>,
     pub gdn: Option<GdnLayer>,
     pub attn: Option<AttnLayer>,
 }
@@ -1891,8 +1993,16 @@ impl Layer {
         kv_cap: usize,
     ) -> Result<Layer> {
         let kind = cfg.layer_types[layer];
-        let p = format!("{PREFIX}.layers.{layer}");
-        let moe = MoeLayer::load_set(sh, cfg.clone(), layer, ids, stream, group, threads)?;
+        let p = format!("{}.layers.{layer}", cfg.prefix);
+        let zc = cfg.norm_zero_centered;
+        let (moe, mlp) = if cfg.is_moe() {
+            (
+                Some(MoeLayer::load_set(sh, cfg.clone(), layer, ids, stream, group, threads)?),
+                None,
+            )
+        } else {
+            (None, Some(MlpLayer::load(sh, cfg.clone(), layer, threads)?))
+        };
         let gdn = match kind {
             LayerKind::Linear => Some(GdnLayer::load(sh, cfg.clone(), layer, threads)?),
             LayerKind::Full => None,
@@ -1902,10 +2012,12 @@ impl Layer {
             LayerKind::Linear => None,
         };
         Ok(Layer {
+            cfg,
             kind,
-            norm_in: dense(sh, &format!("{p}.input_layernorm.weight"))?.0,
-            norm_post: dense(sh, &format!("{p}.post_attention_layernorm.weight"))?.0,
+            norm_in: norm_w(sh, &format!("{p}.input_layernorm.weight"), zc)?,
+            norm_post: norm_w(sh, &format!("{p}.post_attention_layernorm.weight"), zc)?,
             moe,
+            mlp,
             gdn,
             attn,
         })
@@ -1929,7 +2041,7 @@ impl Layer {
 
     pub fn forward(&self, x: &mut [f32], st: &mut LayerState, pos: usize) {
         let h = x.len();
-        let eps = self.moe.cfg.rms_norm_eps as f32;
+        let eps = self.cfg.rms_norm_eps as f32;
         let mut buf = vec![0f32; h];
         let mut res = vec![0f32; h];
         {
@@ -1949,10 +2061,20 @@ impl Layer {
             let _t = prof::start(prof::NORM);
             kernel::rmsnorm(x, &self.norm_post, eps, &mut buf);
         }
-        let (moe_out, _) = self.moe.forward(&buf);
         let _t = prof::start(prof::RESIDUAL);
-        for i in 0..h {
-            x[i] += moe_out[i];
+        match (&self.moe, &self.mlp) {
+            (Some(moe), _) => {
+                let (moe_out, _) = moe.forward(&buf);
+                for i in 0..h {
+                    x[i] += moe_out[i];
+                }
+            }
+            (None, mlp) => {
+                mlp.as_ref().unwrap().forward(&buf, &mut res);
+                for i in 0..h {
+                    x[i] += res[i];
+                }
+            }
         }
     }
 }
@@ -2064,7 +2186,9 @@ impl Model {
             crate::mem::report("lm_head");
             let t = std::time::Instant::now();
             for (l, lp) in model.layers.iter_mut().zip(&plan.layers) {
-                l.moe.attach_gpu(sh, lp.layer, g.clone(), &lp.resident, group)?;
+                if let Some(m) = &mut l.moe {
+                    m.attach_gpu(sh, lp.layer, g.clone(), &lp.resident, group)?;
+                }
                 if lp.dense_on_device {
                     l.attach_dense(sh, lp.layer, g.clone())?;
                 }
@@ -2073,19 +2197,28 @@ impl Model {
             crate::mem::report("device upload");
         }
         let (used, held) = model.layers.iter().fold((0usize, 0usize), |(u, h), l| {
-            (u + l.moe.host_bytes(), h + l.moe.host_bytes_held())
+            match &l.moe {
+                Some(m) => (u + m.host_bytes(), h + m.host_bytes_held()),
+                None => (u, h),
+            }
         });
-        let mapped = model.layers.iter().filter(|l| l.moe.host_is_mapped()).count();
+        let mapped = model
+            .layers
+            .iter()
+            .filter(|l| l.moe.as_ref().is_some_and(|m| m.host_is_mapped()))
+            .count();
         eprintln!(
             "[fennec] load phases: host pool {:.1} s | dense+embed {:.1} s | lm_head {:.1} s | device upload {:.1} s",
             host_ms / 1e3, finish_ms / 1e3, head_ms / 1e3, dev_ms / 1e3
         );
-        eprintln!(
-            "[fennec] host experts: {:.2} GiB of matrix, {:.2} GiB of allocator capacity, {mapped}/{} layers borrowed from the mapping",
-            used as f64 / 2f64.powi(30),
-            held as f64 / 2f64.powi(30),
-            model.layers.len()
-        );
+        if model.cfg.is_moe() {
+            eprintln!(
+                "[fennec] host experts: {:.2} GiB of matrix, {:.2} GiB of allocator capacity, {mapped}/{} layers borrowed from the mapping",
+                used as f64 / 2f64.powi(30),
+                held as f64 / 2f64.powi(30),
+                model.layers.len()
+            );
+        }
         Ok(model)
     }
 
@@ -2138,10 +2271,17 @@ impl Model {
         layers: Vec<Layer>,
         threads: usize,
     ) -> Result<Model> {
+        // A tied checkpoint may still ship a copy of the head; when it does not,
+        // the embedding table *is* the head and the same bf16 rows read through
+        // the same gemv, so the only difference is the tensor name.
+        let head = match (cfg.tie_word_embeddings, sh.contains("lm_head.weight")) {
+            (true, false) => format!("{}.embed_tokens.weight", cfg.prefix),
+            _ => "lm_head.weight".to_string(),
+        };
         Ok(Model {
-            embed: format!("{PREFIX}.embed_tokens.weight"),
-            head: "lm_head.weight".to_string(),
-            norm: dense(sh, &format!("{PREFIX}.norm.weight"))?.0,
+            embed: format!("{}.embed_tokens.weight", cfg.prefix),
+            head,
+            norm: norm_w(sh, &format!("{}.norm.weight", cfg.prefix), cfg.norm_zero_centered)?,
             cfg,
             first,
             layers,
@@ -2349,9 +2489,9 @@ mod tests {
         let (h, i, group) = (64usize, 32usize, 16usize);
         let (d, w, s) = container("packed", h, i, group);
         let sh = Shards::open(&d).unwrap();
-        assert_eq!(packed_group(&sh, h, i), Some(group));
+        assert_eq!(packed_group(&sh, PREFIX, h, i), Some(group));
 
-        let (gu, dn) = packed_expert(&sh, 0, 0, h, i, group).unwrap();
+        let (gu, dn) = packed_expert(&sh, PREFIX, 0, 0, h, i, group).unwrap();
         // gate|up is the first two thirds, down the last: no repack, no requantise.
         let cut = 2 * (i * h / 2);
         let scut = 2 * (i * (h / group));
@@ -2386,7 +2526,7 @@ mod tests {
         for group in [8usize, 16, 32] {
             let (d, _, _) = container(&format!("g{group}"), h, i, group);
             let sh = Shards::open(&d).unwrap();
-            assert_eq!(packed_group(&sh, h, i), Some(group), "group {group}");
+            assert_eq!(packed_group(&sh, PREFIX, h, i), Some(group), "group {group}");
             std::fs::remove_dir_all(&d).ok();
         }
     }
@@ -2400,7 +2540,7 @@ mod tests {
             (&format!("{p}.gate_up_proj"), "BF16", vec![4, 8], vec![0u8; 64]),
         ]);
         let sh = Shards::open(&d).unwrap();
-        assert_eq!(packed_group(&sh, 8, 2), None);
+        assert_eq!(packed_group(&sh, PREFIX, 8, 2), None);
         assert!(!sh.contains(&format!("{p}.0.merged_weight")));
         std::fs::remove_dir_all(&d).ok();
     }

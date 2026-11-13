@@ -199,7 +199,8 @@ fn checkpoint() -> Option<(Arc<Shards>, Arc<TextConfig>)> {
 
 /// The group width belongs to the checkpoint when its experts are already int4.
 fn group_of(sh: &Shards, c: &TextConfig) -> usize {
-    fennec::model::packed_group(sh, c.hidden_size, c.moe_intermediate_size).unwrap_or(32)
+    let prefix = fennec::model::detect_prefix(sh);
+    fennec::model::packed_group(sh, &prefix, c.hidden_size, c.moe_intermediate_size).unwrap_or(32)
 }
 
 #[test]
@@ -580,7 +581,11 @@ fn eight_tokens_walk_the_decoder_stack_to_the_lm_head() {
     println!(
         "  {n_layers} layers resident in {:.1} s ({:.2} GiB of FQ4 experts)",
         t0.elapsed().as_secs_f64(),
-        m.layers.iter().map(|l| l.moe.host_bytes() as f64).sum::<f64>() / 2f64.powi(30)
+        m.layers
+            .iter()
+            .map(|l| l.moe.as_ref().unwrap().host_bytes() as f64)
+            .sum::<f64>()
+            / 2f64.powi(30)
     );
 
     let e = fx("fwd.embed");
@@ -627,7 +632,8 @@ fn eight_tokens_walk_the_decoder_stack_to_the_lm_head() {
             let mut x_mid = x_in.clone();
             kernel::axpy(&mut x_mid, &res, 1.0);
             kernel::rmsnorm(&x_mid, &lay.norm_post, eps, &mut buf);
-            let (out, r) = lay.moe.forward(&buf);
+            let moe = lay.moe.as_ref().unwrap();
+            let (out, r) = moe.forward(&buf);
             let want: Vec<usize> = row(&rid.data, t, r.ids.len())
                 .iter()
                 .map(|v| *v as usize)
@@ -640,7 +646,7 @@ fn eight_tokens_walk_the_decoder_stack_to_the_lm_head() {
                     .fold(0f64, |m, (x, y)| m.max((x - *y as f64).abs())),
             );
             let mut sh = vec![0f32; h];
-            lay.moe.shared(&buf, &mut sh);
+            moe.shared(&buf, &mut sh);
             // Unlike the standalone shared check above, `buf` here is Fennec's own
             // rmsnorm of (x_in + mixer), so it already carries the mixer's f32
             // ordering error - measured up to 6.9e-7 across the four layers - on
@@ -657,7 +663,7 @@ fn eight_tokens_walk_the_decoder_stack_to_the_lm_head() {
             );
             // the routed sum, taken back out of the block output with the gate the
             // reference applies to the shared expert
-            let g = kernel::sigmoid(kernel::dot(&lay.moe.s_egate, &buf));
+            let g = kernel::sigmoid(kernel::dot(&moe.s_egate, &buf));
             if l == 0 && t == 0 {
                 let i = c.moe_intermediate_size;
                 let (hh_ref, y_ref) = (fx("fwd.qs0.exp_hh"), fx("fwd.qs0.exp_y"));
@@ -668,13 +674,13 @@ fn eight_tokens_walk_the_decoder_stack_to_the_lm_head() {
                     check_q(
                         &format!("gu row {e0}*2I+{r}"),
                         &row(&gu_ref.data, k, h),
-                        &lay.moe.host_gu_row(e0 * 2 * i + r),
+                        &moe.host_gu_row(e0 * 2 * i + r),
                         1e-6,
                     );
                     check_q(
                         &format!("dn row {e0}*H+{}", r % c.hidden_size),
                         &row(&dn_ref.data, k, i),
-                        &lay.moe.host_dn_row(e0 * h + r % c.hidden_size),
+                        &moe.host_dn_row(e0 * h + r % c.hidden_size),
                         1e-6,
                     );
                 }
@@ -690,7 +696,7 @@ fn eight_tokens_walk_the_decoder_stack_to_the_lm_head() {
                         .unwrap_or_else(|| panic!("expert {id} is not in the reference route"));
                     let mut hh = vec![0f32; i];
                     let mut y = vec![0f32; h];
-                    lay.moe.expert(id, &buf, &mut hh, &mut y);
+                    moe.expert(id, &buf, &mut hh, &mut y);
                     check_q(
                         &format!("expert {id} gate_up"),
                         &row(&hh_ref.data, e, i),

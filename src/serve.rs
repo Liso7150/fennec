@@ -425,11 +425,13 @@ impl Server {
                 let m = self.model.lock().map_err(|_| "model mutex poisoned")?;
                 let first = m.first;
                 let layers: Vec<Value> = m.layers.iter().enumerate().map(|(i, l)| {
-                    let moe = &l.moe;
+                    // A dense checkpoint routes nothing, so its layers report
+                    // zero hits rather than an error: the shape stays the same.
+                    let moe = l.moe.as_ref();
                     json!({"layer": first + i,
-                           "device_hits": moe.dev_hits.load(Relaxed),
-                           "host_hits": moe.host_hits.load(Relaxed),
-                           "disk_hits": moe.disk_hits.load(Relaxed)})
+                           "device_hits": moe.map_or(0, |m| m.dev_hits.load(Relaxed)),
+                           "host_hits": moe.map_or(0, |m| m.host_hits.load(Relaxed)),
+                           "disk_hits": moe.map_or(0, |m| m.disk_hits.load(Relaxed))})
                 }).collect();
                 write_json(sock, 200, &json!({"layers": layers, "num_experts": self.cfg.num_experts,
                                               "top_k": self.cfg.num_experts_per_tok}))

@@ -193,16 +193,19 @@ fn attach_cache(opts: &Opts, dir: &str, sh: &mut Shards) -> Result<(), String> {
 
 fn open(opts: &Opts) -> Result<(Arc<TextConfig>, Arc<Shards>), String> {
     let dir = opts.dir();
-    let cfg = Arc::new(TextConfig::from_file(&format!("{dir}/config.json"))?);
+    let mut cfg = TextConfig::from_file(&format!("{dir}/config.json"))?;
     let mut sh = Shards::open(&dir)?;
+    // Nothing in config.json records the tensor prefix, so read it back off
+    // the shard index before any name is built from it.
+    fennec::model::bind_prefix(&sh, &mut cfg);
     attach_cache(opts, &dir, &mut sh)?;
-    Ok((cfg, Arc::new(sh)))
+    Ok((Arc::new(cfg), Arc::new(sh)))
 }
 
 /// The group width belongs to the checkpoint when its experts are already int4;
 /// `--group` only picks a width for weights Fennec has to quantise itself.
 fn group_for(opts: &Opts, sh: &Shards, cfg: &TextConfig) -> usize {
-    fennec::model::packed_group(sh, cfg.hidden_size, cfg.moe_intermediate_size)
+    fennec::model::packed_group(sh, &cfg.prefix, cfg.hidden_size, cfg.moe_intermediate_size)
         .unwrap_or_else(|| opts.usize_at("group", 32))
 }
 
@@ -230,10 +233,18 @@ fn info(opts: &Opts) -> Result<(), String> {
         cfg.num_hidden_layers - cfg.n_linear_layers()
     );
     println!("hidden / vocab   {} / {}", cfg.hidden_size, cfg.vocab_size);
-    println!(
-        "experts          {} routed, {} per token, moe_i {}, shared_i {}",
-        cfg.num_experts, cfg.num_experts_per_tok, cfg.moe_intermediate_size, cfg.shared_expert_intermediate_size
-    );
+    if cfg.is_moe() {
+        println!(
+            "experts          {} routed, {} per token, moe_i {}, shared_i {}",
+            cfg.num_experts, cfg.num_experts_per_tok, cfg.moe_intermediate_size, cfg.shared_expert_intermediate_size
+        );
+    } else {
+        println!(
+            "ffn              dense SiLU, intermediate {}, tied head {}",
+            cfg.intermediate_size, cfg.tie_word_embeddings
+        );
+    }
+    println!("tensors under    {}", cfg.prefix);
     println!(
         "attn             {} q heads x {}, {} kv heads x {}, rotary {}, output gate {}",
         cfg.num_attention_heads,
@@ -243,14 +254,16 @@ fn info(opts: &Opts) -> Result<(), String> {
         cfg.rotary_dim(),
         cfg.attn_output_gate
     );
-    println!(
-        "linear attn      {} key heads x {}, {} value heads x {}, conv {}",
-        cfg.linear_num_key_heads,
-        cfg.linear_key_head_dim,
-        cfg.linear_num_value_heads,
-        cfg.linear_value_head_dim,
-        cfg.linear_conv_kernel_dim
-    );
+    if cfg.has_gdn() {
+        println!(
+            "linear attn      {} key heads x {}, {} value heads x {}, conv {}",
+            cfg.linear_num_key_heads,
+            cfg.linear_key_head_dim,
+            cfg.linear_num_value_heads,
+            cfg.linear_value_head_dim,
+            cfg.linear_conv_kernel_dim
+        );
+    }
     println!(
         "params           {:.2} B total, {:.2} B active per token",
         cfg.total_params() as f64 / 1e9,
@@ -261,21 +274,28 @@ fn info(opts: &Opts) -> Result<(), String> {
     for (dt, (n, b)) in &by_dtype {
         println!("  {dt:<5} {n:>5} tensors  {:>9.2} GiB", gib(*b));
     }
-    println!(
-        "checkpoint       {:.2} GiB, of which {:.2} GiB ({:.1}%) is expert weights in {expert_tensors} tensors",
-        gib(sh.total_bytes as usize),
-        gib(expert_bytes),
-        100.0 * expert_bytes as f64 / sh.total_bytes.max(1) as f64
-    );
     let eb = fennec::sched::expert_bytes(&cfg, group);
-    println!(
-        "FQ4 expert       {:.1} MiB each -> {:.2} GiB per layer, {:.2} GiB for all {} (from {:.2} GiB bf16)",
-        mib(eb),
-        gib(eb * cfg.num_experts),
-        gib(eb * cfg.num_experts * cfg.num_hidden_layers),
-        cfg.num_hidden_layers,
-        gib(expert_bytes / cfg.num_hidden_layers)
-    );
+    if cfg.is_moe() {
+        println!(
+            "checkpoint       {:.2} GiB, of which {:.2} GiB ({:.1}%) is expert weights in {expert_tensors} tensors",
+            gib(sh.total_bytes as usize),
+            gib(expert_bytes),
+            100.0 * expert_bytes as f64 / sh.total_bytes.max(1) as f64
+        );
+        println!(
+            "FQ4 expert       {:.1} MiB each -> {:.2} GiB per layer, {:.2} GiB for all {} (from {:.2} GiB bf16)",
+            mib(eb),
+            gib(eb * cfg.num_experts),
+            gib(eb * cfg.num_experts * cfg.num_hidden_layers),
+            cfg.num_hidden_layers,
+            gib(expert_bytes / cfg.num_hidden_layers)
+        );
+    } else {
+        // Nothing is routed here, so an expert share and an FQ4 sizing would
+        // both read as zeros: every parameter the checkpoint holds is read by
+        // every token.
+        println!("checkpoint       {:.2} GiB", gib(sh.total_bytes as usize));
+    }
     if opts.has("json") {
         println!(
             "{}",
@@ -439,23 +459,30 @@ fn setup(opts: &Opts, cfg: &Arc<TextConfig>, group: usize) -> Result<Setup, Stri
     } else {
         Bandwidth::laptop_4060()
     };
-    let usage = match find_usage(opts, &opts.dir()) {
-        Some(p) => {
-            eprintln!("[fennec] router histogram: {p}");
-            let u = Usage::load(&p)?;
-            // A histogram for a different model would silently drop layers or
-            // index past the expert table, so refuse it rather than guess.
-            if u.layers != cfg.num_hidden_layers || u.experts != cfg.num_experts {
-                return Err(format!(
-                    "router histogram is {}x{} but the model is {}x{}",
-                    u.layers, u.experts, cfg.num_hidden_layers, cfg.num_experts
-                ));
+    let usage = if !cfg.is_moe() {
+        // A dense checkpoint routes nothing, so there is no histogram to look
+        // for and nothing to warn about when none is found: the plan's expert
+        // tiers simply stay empty.
+        Usage::uniform(cfg.num_hidden_layers, 0)
+    } else {
+        match find_usage(opts, &opts.dir()) {
+            Some(p) => {
+                eprintln!("[fennec] router histogram: {p}");
+                let u = Usage::load(&p)?;
+                // A histogram for a different model would silently drop layers or
+                // index past the expert table, so refuse it rather than guess.
+                if u.layers != cfg.num_hidden_layers || u.experts != cfg.num_experts {
+                    return Err(format!(
+                        "router histogram is {}x{} but the model is {}x{}",
+                        u.layers, u.experts, cfg.num_hidden_layers, cfg.num_experts
+                    ));
+                }
+                u
             }
-            u
-        }
-        None => {
-            eprintln!("[fennec] no histogram; assuming a flat router");
-            Usage::uniform(cfg.num_hidden_layers, cfg.num_experts)
+            None => {
+                eprintln!("[fennec] no histogram; assuming a flat router");
+                Usage::uniform(cfg.num_hidden_layers, cfg.num_experts)
+            }
         }
     };
     let plan = Plan::build(cfg, &usage, device, host, reserve, &bw, group, gpu);
@@ -604,7 +631,7 @@ fn probe() {
         let group = Shards::open(DEFAULT_MODEL)
             .ok()
             .and_then(|sh| {
-                fennec::model::packed_group(&sh, cfg.hidden_size, cfg.moe_intermediate_size)
+                fennec::model::packed_group(&sh, &cfg.prefix, cfg.hidden_size, cfg.moe_intermediate_size)
             })
             .unwrap_or(32);
         let eb = fennec::sched::expert_bytes(&cfg, group);
@@ -647,9 +674,13 @@ fn doctor(opts: &Opts) -> Result<(), String> {
 
     let cfg = match TextConfig::from_file(&format!("{dir}/config.json")) {
         Ok(c) => {
-            add(&mut checks, "config", "ok",
+            add(&mut checks, "config", "ok", if c.is_moe() {
                 format!("{} layers, {} experts, top-{}, hidden {}",
-                    c.num_hidden_layers, c.num_experts, c.num_experts_per_tok, c.hidden_size));
+                    c.num_hidden_layers, c.num_experts, c.num_experts_per_tok, c.hidden_size)
+            } else {
+                format!("{} layers, dense FFN i {}, hidden {}",
+                    c.num_hidden_layers, c.intermediate_size, c.hidden_size)
+            });
             Some(Arc::new(c))
         }
         Err(e) => {
@@ -676,20 +707,31 @@ fn doctor(opts: &Opts) -> Result<(), String> {
     }
 
     let packed = match (cfg.as_ref(), shards.as_ref()) {
-        (Some(c), Some(sh)) => fennec::model::packed_group(sh, c.hidden_size, c.moe_intermediate_size),
+        (Some(c), Some(sh)) => {
+            let prefix = fennec::model::detect_prefix(sh);
+            fennec::model::packed_group(sh, &prefix, c.hidden_size, c.moe_intermediate_size)
+        }
         _ => None,
     };
-    if let Some(sh) = shards.as_mut() {
-        match attach_cache(opts, &dir, sh) {
-            Ok(()) if sh.fq4().is_some() => {
-                add(&mut checks, "fq4-cache", "ok", "expert cache attached: cold load copies int4".into());
+    // An expert cache is a thing only a routed checkpoint can have. On a dense
+    // one every branch below would either stay silent or print advice about
+    // re-quantising experts that are not in the model.
+    if cfg.as_ref().is_some_and(|c| c.is_moe()) {
+        if let Some(sh) = shards.as_mut() {
+            match attach_cache(opts, &dir, sh) {
+                Ok(()) if sh.fq4().is_some() => add(
+                    &mut checks,
+                    "fq4-cache",
+                    "ok",
+                    "expert cache attached: cold load copies int4".into(),
+                ),
+                Ok(()) if packed.is_some() => add(&mut checks, "fq4-cache", "ok",
+                    format!("checkpoint is already int4 at group {}: cold load copies it, no cache needed", packed.unwrap())),
+                Ok(()) => add(&mut checks, "fq4-cache", "warn",
+                    "no FQ4 cache: every start re-quantises the experts from bf16. \
+                     Build one with `fennec quant --layers all --out <path>` and pass --fq4.".into()),
+                Err(e) => add(&mut checks, "fq4-cache", "bad", e),
             }
-            Ok(()) if packed.is_some() => add(&mut checks, "fq4-cache", "ok",
-                format!("checkpoint is already int4 at group {}: cold load copies it, no cache needed", packed.unwrap())),
-            Ok(()) => add(&mut checks, "fq4-cache", "warn",
-                "no FQ4 cache: every start re-quantises the experts from bf16. \
-                 Build one with `fennec quant --layers all --out <path>` and pass --fq4.".into()),
-            Err(e) => add(&mut checks, "fq4-cache", "bad", e),
         }
     }
 
@@ -763,13 +805,16 @@ fn quant(opts: &Opts, threads: usize) -> Result<(), String> {
     let (cfg, sh) = open(opts)?;
     let group = group_for(opts, &sh, &cfg);
     let out = opts.str("out").unwrap_or_else(|| "fennec.fq4".to_string());
+    if !cfg.is_moe() {
+        return Err(format!("{} is a dense checkpoint: it has no routed experts to quantise.", cfg.name));
+    }
     let e = cfg.num_experts;
     let h = cfg.hidden_size;
     let i = cfg.moe_intermediate_size;
     let mut w = SidecarWriter::new(&out)?;
     let mut total = 0usize;
     for l in layers_of(opts, cfg.num_hidden_layers)? {
-        let p = format!("{}.layers.{l}.mlp", fennec::model::PREFIX);
+        let p = format!("{}.layers.{l}.mlp", cfg.prefix);
         let gu_src = sh.tensor_f32(&format!("{p}.experts.gate_up_proj"))?;
         let dn_src = sh.tensor_f32(&format!("{p}.experts.down_proj"))?;
         let t0 = Instant::now();
@@ -876,6 +921,9 @@ fn bench(opts: &Opts, threads: usize) -> Result<(), String> {
     let (cfg, sh) = open(opts)?;
     let group = group_for(opts, &sh, &cfg);
     let l = layers_of(opts, cfg.num_hidden_layers)?[0];
+    if !cfg.is_moe() {
+        return Err(format!("bench times the routed expert block; {} is dense - use `decode` for the whole model.", cfg.name));
+    }
     let reps = opts.usize_at("reps", 16).max(1);
     let e = cfg.num_experts;
     let h = cfg.hidden_size;
@@ -1005,20 +1053,34 @@ fn decode(opts: &Opts, threads: usize) -> Result<(), String> {
     let fq4: usize = m
         .layers
         .iter()
-        .map(|l| l.moe.host_bytes())
+        .map(|l| l.moe.as_ref().map_or(0, |m| m.host_bytes()))
         .sum();
-    let on_dev: usize = m.layers.iter().map(|l| l.moe.dev.as_ref().map_or(0, |d| d.bufs.len())).sum();
-    println!(
-        "[fennec] layers {first}..{} of {}: {on_dev} experts in VRAM, {pooled} in RAM, \
-         {cold} streamable, {} in the router's top {} \
-         loaded in {:.1} s ({:.2} GiB FQ4 host)",
-        first + count,
-        cfg.num_hidden_layers,
-        cfg.num_experts_per_tok,
-        cfg.num_experts,
-        t0.elapsed().as_secs_f64(),
-        gib(fq4),
-    );
+    let on_dev: usize = m
+        .layers
+        .iter()
+        .map(|l| l.moe.as_ref().map_or(0, |x| x.dev.as_ref().map_or(0, |d| d.bufs.len())))
+        .sum();
+    if cfg.is_moe() {
+        println!(
+            "[fennec] layers {first}..{} of {}: {on_dev} experts in VRAM, {pooled} in RAM, \
+             {cold} streamable, {} in the router's top {} \
+             loaded in {:.1} s ({:.2} GiB FQ4 host)",
+            first + count,
+            cfg.num_hidden_layers,
+            cfg.num_experts_per_tok,
+            cfg.num_experts,
+            t0.elapsed().as_secs_f64(),
+            gib(fq4),
+        );
+    } else {
+        println!(
+            "[fennec] dense layers {first}..{} of {} (FFN i {}), loaded in {:.1} s",
+            first + count,
+            cfg.num_hidden_layers,
+            cfg.intermediate_size,
+            t0.elapsed().as_secs_f64()
+        );
+    }
 
     let h = cfg.hidden_size;
     let eps = cfg.rms_norm_eps as f32;
@@ -1096,7 +1158,7 @@ fn decode(opts: &Opts, threads: usize) -> Result<(), String> {
 
     let (mut hits, mut misses, mut ring_bytes, mut read_ms, mut quant_ms) = (0u64, 0u64, 0usize, 0f64, 0f64);
     for l in &m.layers {
-        if let Some(pool) = &l.moe.stream {
+        if let Some(pool) = l.moe.as_ref().and_then(|m| m.stream.as_ref()) {
             let st = pool.lock().unwrap();
             hits += st.hits;
             misses += st.misses;
@@ -1111,7 +1173,7 @@ fn decode(opts: &Opts, threads: usize) -> Result<(), String> {
          {:.0} ms shard reads {:.0} ms quantise",
         100.0 * hits as f64 / picks.max(1.0),
         gib(ring_bytes),
-        m.layers.iter().filter(|l| l.moe.stream.is_some()).count(),
+        m.layers.iter().filter(|l| l.moe.as_ref().and_then(|m| m.stream.as_ref()).is_some()).count(),
         read_ms,
         quant_ms,
     );
@@ -1119,10 +1181,10 @@ fn decode(opts: &Opts, threads: usize) -> Result<(), String> {
         (0u64, 0u64, 0u64, 0u64),
         |(a, b, c, d), l| {
             (
-                a + l.moe.dev_hits.load(std::sync::atomic::Ordering::Relaxed),
-                b + l.moe.host_hits.load(std::sync::atomic::Ordering::Relaxed),
-                c + l.moe.disk_hits.load(std::sync::atomic::Ordering::Relaxed),
-                d + l.moe.overlap_ns.load(std::sync::atomic::Ordering::Relaxed),
+                a + l.moe.as_ref().map_or(0, |m| m.dev_hits.load(std::sync::atomic::Ordering::Relaxed)),
+                b + l.moe.as_ref().map_or(0, |m| m.host_hits.load(std::sync::atomic::Ordering::Relaxed)),
+                c + l.moe.as_ref().map_or(0, |m| m.disk_hits.load(std::sync::atomic::Ordering::Relaxed)),
+                d + l.moe.as_ref().map_or(0, |m| m.overlap_ns.load(std::sync::atomic::Ordering::Relaxed)),
             )
         },
     );
@@ -1263,12 +1325,25 @@ fn load_engine(opts: &Opts, threads: usize) -> Result<Engine, String> {
         }
         m
     };
-    let on_dev: usize = m.layers.iter().map(|l| l.moe.dev.as_ref().map_or(0, |d| d.bufs.len())).sum();
+    let on_dev: usize = m
+        .layers
+        .iter()
+        .map(|l| l.moe.as_ref().map_or(0, |x| x.dev.as_ref().map_or(0, |d| d.bufs.len())))
+        .sum();
     let pooled: usize = s.plan.layers.iter().map(|l| l.pooled.len()).sum();
-    eprintln!(
-        "[fennec] {} layers, {on_dev} experts in VRAM, {pooled} in RAM, loaded in {:.1} s",
-        m.layers.len(), t0.elapsed().as_secs_f64()
-    );
+    // A dense stack routes nothing, so the expert counts would only ever read
+    // zero; say what the layer actually holds instead.
+    if m.cfg.is_moe() {
+        eprintln!(
+            "[fennec] {} layers, {on_dev} experts in VRAM, {pooled} in RAM, loaded in {:.1} s",
+            m.layers.len(), t0.elapsed().as_secs_f64()
+        );
+    } else {
+        eprintln!(
+            "[fennec] {} dense layers (FFN i {}), loaded in {:.1} s",
+            m.layers.len(), m.cfg.intermediate_size, t0.elapsed().as_secs_f64()
+        );
+    }
     let id = Path::new(&dir).file_name().map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "fennec".into());
     // coli's serve took --api-key, so launchers that still pass it keep working.

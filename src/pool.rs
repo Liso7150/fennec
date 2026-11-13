@@ -28,6 +28,7 @@ struct Slot {
 
 pub struct Stream {
     sh: Arc<Shards>,
+    prefix: String,
     gu_name: String,
     dn_name: String,
     layer: usize,
@@ -53,7 +54,7 @@ impl Stream {
         threads: usize,
         cap: usize,
     ) -> Stream {
-        let p = format!("{}.layers.{layer}.mlp.experts", crate::model::PREFIX);
+        let p = format!("{}.layers.{layer}.mlp.experts", cfg.prefix);
         Stream {
             gu_name: format!("{p}.gate_up_proj"),
             dn_name: format!("{p}.down_proj"),
@@ -61,6 +62,7 @@ impl Stream {
             h: cfg.hidden_size,
             i: cfg.moe_intermediate_size,
             sh,
+            prefix: cfg.prefix.clone(),
             group,
             threads: threads.max(1),
             cap: cap.max(1),
@@ -96,7 +98,7 @@ impl Stream {
     pub fn with<R>(&mut self, id: usize, f: impl FnOnce(&Q4, &Q4) -> R) -> Result<R> {
         // destructure so the counters stay writable while a slot is borrowed
         let Self {
-            sh, gu_name, dn_name, layer, h, i, group, threads, cap, ring, clock,
+            sh, prefix, gu_name, dn_name, layer, h, i, group, threads, cap, ring, clock,
             hits, misses, read_ms, quant_ms, ..
         } = self;
         *clock += 1;
@@ -111,7 +113,7 @@ impl Stream {
         let t0 = Instant::now();
         // The cache turns the slow tier's quantisation pass into a memcpy; the
         // disk read is still there, but it now reads int4 instead of bf16.
-        let (gu, dn, t_read) = match crate::model::cached_expert(sh, *layer, id, *h, *i, *group) {
+        let (gu, dn, t_read) = match crate::model::cached_expert(sh, prefix.as_str(), *layer, id, *h, *i, *group) {
             Some(r) => {
                 let (gu, dn) = r?;
                 (gu, dn, t0.elapsed())
