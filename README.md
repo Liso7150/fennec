@@ -101,6 +101,21 @@ Host: Intel Core Ultra 7 155H (16 cores / 22 logical), 31.5 GB RAM, RTX 4060 Lap
 | Host-expert kernel | **int8 activations** over the container's own int4 nibbles, AVX2 `maddubs` | **integer dot** (`xf_dot_i8_avx2`) over planar nibbles repacked at load | now like for like. An earlier attempt here was recorded as "did not pay off"; that was a bug, not a verdict — the activation dequant scale was missing, so the dot came out ~141× too large. With it folded in, host experts measured **92.04 → 38.16 ms/token** on the CPU tier |
 | Startup | CPU cell **26.9 s**, builds the whole host pool up front | CPU cell **9.0 s**, defers work | **startup is not load**: the honest comparison is Fennec CUDA **13.1 s** vs Colibrì Vulkan **25.1 s**, and Fennec wins it |
 
+### Precision formats on Vulkan
+
+![Vulkan precision matrix: int4 and bf16/f16 measured; int8/int16/fp4/fp8 unavailable](docs/precision-vulkan.png)
+
+| format | Fennec Vulkan | Colibri Vulkan | note |
+|---|---|---|---|
+| int4 | 11.016 tok/s | **19.481 tok/s** | routed experts; Colibri 1.77× |
+| bf16/f16 | 10.696 tok/s | unsupported | Fennec bf16 export (cold 282 s); Colibri exited 1 |
+| int8 | — | — | no weight GEMV (I8 = activations only) |
+| int16 | — | — | no code path |
+| fp4 | — | — | no code path |
+| fp8 | — | — | no code path |
+
+Colibri is upstream [`JustVugg/colibri`](https://github.com/JustVugg/colibri) @ `68cfbb5d` (0 commits behind). Unavailable formats are recorded with evidence, never estimated.
+
 ### Lanes that could not run
 
 Asked for across CPU, Vulkan, ONNX/ORT and Burn + CubeCL on both engines, Metal on Apple. **Two lanes do not exist in either engine, one cannot be built here, one now runs at kernel level only.** Each is recorded with evidence, never an estimate:
