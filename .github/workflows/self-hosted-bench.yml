@@ -37,7 +37,9 @@ jobs:
           cargo test --release --offline --test golden
       - name: Backend matrix vs Colibri (3 pairs, <=8 threads)
         shell: powershell
-        run: python D:/Fennec-Suite/engine-bench/bench-backend-matrix.py --pairs 3
+        env:
+          FENNEC_DENSE_INT4: "1"
+        run: python D:/Fennec-Suite/engine-bench/bench-backend-matrix.py --pairs 3 --only fennec-cuda --merge
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
