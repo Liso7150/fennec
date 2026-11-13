@@ -41,9 +41,23 @@ pub fn set_dense_int4(v: bool) {
 }
 pub fn dense_int4() -> bool { DENSE_INT4.load(std::sync::atomic::Ordering::Relaxed) }
 
+/// Opt-in: hold the mixer's dense projections at one byte per weight on the
+/// host instead of two. On the CPU tier those projections are the largest block
+/// of the token (~2.3 GiB of bf16 per token) and they are bandwidth-bound, so
+/// halving the weight traffic halves the block. The 8-bit round trip costs about
+/// a tenth of a percent on the dot - far less than the int4 routed experts
+/// already carry - but it does move the last digits, so the default stays the
+/// exact bf16/f16 path and the golden bands stay as they are. A/B with
+/// `--dense-i8`.
+static DENSE_I8: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn set_dense_i8(v: bool) { DENSE_I8.store(v, std::sync::atomic::Ordering::Relaxed); }
+pub fn dense_i8() -> bool { DENSE_I8.load(std::sync::atomic::Ordering::Relaxed) }
+
 pub enum Dense {
     F32(Vec<f32>),
     Half(Vec<u8>, kernel::Half),
+    /// One byte per weight plus a scale per row, for the host dot (`--dense-i8`).
+    I8(I8Mat),
     /// The projection parked in an ONNX Runtime session (the `ort` portability
     /// backend). Building it consumes the CPU weights; `gemv` then runs the
     /// MatMul graph on the device's provider instead of the host kernel. The
@@ -69,10 +83,19 @@ impl Dense {
         }
     }
 
+    /// One byte per weight plus a row scale, when `--dense-i8` is on.
+    pub fn quantize_i8(self, rows: usize, cols: usize) -> Dense {
+        match I8Mat::quantize(&self, rows, cols) {
+            Some(m) => Dense::I8(m),
+            None => self,
+        }
+    }
+
     pub fn gemv(&self, rows: usize, cols: usize, x: &[f32], out: &mut [f32], threads: usize) {
         match self {
             Dense::F32(w) => kernel::gemv(w, rows, cols, x, out, threads),
             Dense::Half(w, f) => kernel::gemv_half(w, rows, cols, x, out, threads, *f),
+            Dense::I8(m) => kernel::gemv_i8(&m.w, &m.wsum, &m.scale, rows, cols, x, out, threads),
             // ORT manages its own thread pool and already knows its shape; the
             // host `rows`/`cols`/`threads` are the CPU kernel's contract only.
             #[cfg(feature = "ort")]
@@ -88,6 +111,7 @@ impl Dense {
         match self {
             Dense::F32(w) => w.is_empty(),
             Dense::Half(w, _) => w.is_empty(),
+            Dense::I8(m) => m.w.is_empty(),
             #[cfg(feature = "ort")]
             Dense::Ort(_) => false,
         }
@@ -101,9 +125,93 @@ impl Dense {
         let d = match self {
             Dense::Half(w, f) => ort.dense(&w, rows, cols, matches!(f, kernel::Half::F16))?,
             Dense::F32(w) => ort.dense_f32(&w, rows, cols)?,
+            Dense::I8(m) => ort.dense_f32(&m.to_f32(), rows, cols)?,
             Dense::Ort(d) => d,
         };
         Ok(Dense::Ort(d))
+    }
+}
+
+/// A projection held at one byte per weight, with one scale per row, so the host
+/// dot reads half the bytes of the bf16 original.
+pub struct I8Mat {
+    pub w: Vec<i8>,
+    /// `sum(w)` per row, which is what the offset-binary activations owe back.
+    pub wsum: Vec<i32>,
+    pub scale: Vec<f32>,
+}
+
+impl I8Mat {
+    /// Quantise `rows x cols` out of a dense projection. A shape mismatch is a
+    /// caller bug rather than something to paper over, so it returns `None` and
+    /// the caller keeps the weights it had.
+    fn quantize(src: &Dense, rows: usize, cols: usize) -> Option<I8Mat> {
+        if rows == 0 || cols == 0 {
+            return None;
+        }
+        let mut w = vec![0i8; rows * cols];
+        let mut wsum = vec![0i32; rows];
+        let mut scale = vec![0f32; rows];
+        let mut put = |r: usize, c: usize, v: f32, inv: f32| {
+            let q = (v * inv).round().clamp(-127.0, 127.0) as i8;
+            w[r * cols + c] = q;
+            wsum[r] += q as i32;
+        };
+        match src {
+            Dense::Half(bytes, fmt) => {
+                if bytes.len() != rows * cols * 2 {
+                    return None;
+                }
+                // Decode each row once into a scratch row: the fold needs a max
+                // before the quantise pass, and decoding bf16 twice per element
+                // added ~7 s to the load on its own.
+                let mut tmp = vec![0f32; cols];
+                for r in 0..rows {
+                    let row = &bytes[r * cols * 2..(r + 1) * cols * 2];
+                    for (c, t) in tmp.iter_mut().enumerate() {
+                        *t = fmt.decode(u16::from_le_bytes([row[c * 2], row[c * 2 + 1]]));
+                    }
+                    let amax = tmp.iter().fold(0f32, |m, x| m.max(x.abs()));
+                    scale[r] = if amax > 0.0 { amax / 127.0 } else { 0.0 };
+                    let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+                    for c in 0..cols {
+                        put(r, c, tmp[c], inv);
+                    }
+                }
+            }
+            Dense::F32(v) => {
+                if v.len() != rows * cols {
+                    return None;
+                }
+                for r in 0..rows {
+                    let row = &v[r * cols..(r + 1) * cols];
+                    let amax = row.iter().fold(0f32, |m, x| m.max(x.abs()));
+                    scale[r] = if amax > 0.0 { amax / 127.0 } else { 0.0 };
+                    let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+                    for c in 0..cols {
+                        put(r, c, row[c], inv);
+                    }
+                }
+            }
+            #[cfg(feature = "ort")]
+            Dense::Ort(_) => return None,
+            Dense::I8(_) => return None,
+        }
+        Some(I8Mat { w, wsum, scale })
+    }
+
+    /// The weights back as f32, for the ONNX Runtime path only.
+    #[cfg(feature = "ort")]
+    fn to_f32(&self) -> Vec<f32> {
+        let rows = self.scale.len().max(1);
+        let cols = self.w.len() / rows;
+        let mut out = Vec::with_capacity(self.w.len());
+        for (r, s) in self.scale.iter().enumerate() {
+            for c in 0..cols {
+                out.push(self.w[r * cols + c] as f32 * s);
+            }
+        }
+        out
     }
 }
 
@@ -582,8 +690,9 @@ impl MoeLayer {
         let mut g = gpu.lock().unwrap();
         let (_, base, stride) = moe_arena(&self.cfg);
         // One slot past the routed picks: the shared expert rides in the same
-        // command buffer rather than running serially after the wait.
-        g.reserve(base + (self.cfg.num_experts_per_tok + 1) * stride)?;
+        // command buffer rather than running serially after the wait. The tail
+        // 16 floats hold the reduce kernel's per-pick weights.
+        g.reserve(base + (self.cfg.num_experts_per_tok + 1) * stride + 16)?;
         let mut bufs = Vec::with_capacity(ids.len());
         for s in 0..ids.len() {
             let (gw, gs) = g.upload_q4(&gu.slice_rows(2 * i * s, 2 * i * (s + 1)))?;
@@ -753,36 +862,74 @@ impl MoeLayer {
             let _submit = prof::start(prof::MOE_UPLOAD);
             let d = self.dev.as_ref().unwrap();
             let (acc, base, stride) = moe_arena(&self.cfg);
+            let w_off = base + (self.cfg.num_experts_per_tok + 1) * stride;
+            let mut weights: Vec<f32> = dev_picks.iter().map(|&n| r.weights[n]).collect();
+            if dev_shared.is_some() {
+                weights.push(shared_gate);
+            }
             let mut g = d.gpu.lock().unwrap();
             g.write(0, x);
+            g.write(w_off, &weights);
             drop(_submit);
             {
                 let _record = prof::start(prof::MOE_RECORD);
                 let mut b = g.batch().unwrap();
-                for (j, &n) in dev_picks.iter().enumerate() {
-                    let [gw, gs, dw, ds] = d.bufs[d.slot[r.ids[n]] as usize];
-                    let gu_off = base + j * stride;
-                    let hh_off = gu_off + 2 * i;
-                    let out_off = gu_off + 4 * i;
-                    b.gemv_q4(gw, gs, 2 * i, h, d.group, 0, gu_off).unwrap();
-                    b.silu_mul(i, gu_off, gu_off + i, hh_off).unwrap();
-                    b.gemv_q4(dw, ds, h, i, d.group, hh_off, out_off).unwrap();
-                    // The first accumulation stores rather than adds, so the
-                    // accumulator never needs a zero-fill: that was 8 KiB of
-                    // blocking host-to-device copy per layer, 40 layers a token.
-                    // The launches are in-order on one stream, so "first" is
-                    // well defined even though the picks are routed dynamically.
-                    b.axpy(h, out_off, acc, r.weights[n], j == 0).unwrap();
-                }
-                if let Some([sg, su, sd]) = dev_shared {
-                    let gu_off = base + dev_picks.len() * stride;
-                    let hh_off = gu_off + 2 * i;
-                    let out_off = gu_off + 4 * i;
-                    b.gemv_half(sg, i, h, 0, gu_off).unwrap();
-                    b.gemv_half(su, i, h, 0, gu_off + i).unwrap();
-                    b.silu_mul(i, gu_off, gu_off + i, hh_off).unwrap();
-                    b.gemv_half(sd, h, i, hh_off, out_off).unwrap();
-                    b.axpy(h, out_off, acc, shared_gate, dev_picks.is_empty()).unwrap();
+                match &mut b {
+                    crate::gpu::Batch::Vk(v) => {
+                        // Phase-batched: every expert's gate_up gemv is recorded
+                        // without a barrier, so independent experts overlap on
+                        // the device; one barrier separates the phases and one
+                        // reduce replaces the per-expert axpy chain. The old
+                        // barrier-after-every-dispatch serialised the whole layer.
+                        for (j, &n) in dev_picks.iter().enumerate() {
+                            let [gw, gs, _, _] = d.bufs[d.slot[r.ids[n]] as usize];
+                            v.gemv_q4_nb(gw, gs, 2 * i, h, d.group, 0, base + j * stride).unwrap();
+                        }
+                        if let Some([sg, su, _]) = dev_shared {
+                            let gu_off = base + dev_picks.len() * stride;
+                            v.gemv_half_nb(sg, i, h, 0, gu_off).unwrap();
+                            v.gemv_half_nb(su, i, h, 0, gu_off + i).unwrap();
+                        }
+                        v.barrier().unwrap();
+                        for j in 0..weights.len() {
+                            let gu_off = base + j * stride;
+                            v.silu_mul_nb(i, gu_off, gu_off + i, gu_off + 2 * i).unwrap();
+                        }
+                        v.barrier().unwrap();
+                        for (j, &n) in dev_picks.iter().enumerate() {
+                            let [_, _, dw, ds] = d.bufs[d.slot[r.ids[n]] as usize];
+                            let gu_off = base + j * stride;
+                            v.gemv_q4_nb(dw, ds, h, i, d.group, gu_off + 2 * i, gu_off + 4 * i).unwrap();
+                        }
+                        if let Some([_, _, sd]) = dev_shared {
+                            let gu_off = base + dev_picks.len() * stride;
+                            v.gemv_half_nb(sd, h, i, gu_off + 2 * i, gu_off + 4 * i).unwrap();
+                        }
+                        v.barrier().unwrap();
+                        v.moe_reduce(weights.len(), h, stride, base, 4 * i, acc, w_off).unwrap();
+                    }
+                    crate::gpu::Batch::Cuda(c) => {
+                        for (j, &n) in dev_picks.iter().enumerate() {
+                            let [gw, gs, dw, ds] = d.bufs[d.slot[r.ids[n]] as usize];
+                            let gu_off = base + j * stride;
+                            let hh_off = gu_off + 2 * i;
+                            let out_off = gu_off + 4 * i;
+                            c.gemv_q4(gw, gs, 2 * i, h, d.group, 0, gu_off).unwrap();
+                            c.silu_mul(i, gu_off, gu_off + i, hh_off).unwrap();
+                            c.gemv_q4(dw, ds, h, i, d.group, hh_off, out_off).unwrap();
+                            c.axpy(h, out_off, acc, r.weights[n], j == 0).unwrap();
+                        }
+                        if let Some([sg, su, sd]) = dev_shared {
+                            let gu_off = base + dev_picks.len() * stride;
+                            let hh_off = gu_off + 2 * i;
+                            let out_off = gu_off + 4 * i;
+                            c.gemv_half(sg, i, h, 0, gu_off).unwrap();
+                            c.gemv_half(su, i, h, 0, gu_off + i).unwrap();
+                            c.silu_mul(i, gu_off, gu_off + i, hh_off).unwrap();
+                            c.gemv_half(sd, h, i, hh_off, out_off).unwrap();
+                            c.axpy(h, out_off, acc, shared_gate, dev_picks.is_empty()).unwrap();
+                        }
+                    }
                 }
                 b.submit().unwrap();
             }
@@ -1102,7 +1249,13 @@ pub struct GdnLayer {
 impl GdnLayer {
     pub fn load(sh: &Shards, cfg: Arc<TextConfig>, layer: usize, threads: usize) -> Result<GdnLayer> {
         let p = format!("{PREFIX}.layers.{layer}.linear_attn");
-        Ok(GdnLayer {
+        let (h, cd, vd, nv) = (
+            cfg.hidden_size,
+            cfg.conv_dim(),
+            cfg.value_dim(),
+            cfg.linear_num_value_heads,
+        );
+        let mut l = GdnLayer {
             cfg,
             in_qkv: dense_half(sh, &format!("{p}.in_proj_qkv.weight"))?.0,
             in_z: dense_half(sh, &format!("{p}.in_proj_z.weight"))?.0,
@@ -1115,7 +1268,17 @@ impl GdnLayer {
             out_proj: dense_half(sh, &format!("{p}.out_proj.weight"))?.0,
             threads: threads.max(1),
             dev: None,
-        })
+        };
+        if dense_i8() {
+            // The five projections are this tier's dense read; at one byte per
+            // weight they cost half the bytes.
+            l.in_qkv = l.in_qkv.quantize_i8(cd, h);
+            l.in_z = l.in_z.quantize_i8(vd, h);
+            l.in_b = l.in_b.quantize_i8(nv, h);
+            l.in_a = l.in_a.quantize_i8(nv, h);
+            l.out_proj = l.out_proj.quantize_i8(h, vd);
+        }
+        Ok(l)
     }
 
     /// Move the five projections to VRAM and drop the host's copies, and
@@ -1222,10 +1385,15 @@ impl GdnLayer {
         let read_syncs = g.read_syncs();
         {
             let mut bt = g.batch().unwrap();
-            bt.gemv_half(d.qkv, cd, h, DENSE_OFF, ib).unwrap();
-            bt.gemv_half(d.z, vd, h, DENSE_OFF, ib + cd).unwrap();
-            bt.gemv_half(d.b, nv, h, DENSE_OFF, ib + cd + vd).unwrap();
-            bt.gemv_half(d.a, nv, h, DENSE_OFF, ib + cd + vd + nv).unwrap();
+            // The four input projections read the same x and write disjoint
+            // slices, so they are independent. Recorded barrier-free they fill
+            // the device together; one barrier then covers everything conv,
+            // the recursion and out_proj read back.
+            bt.gemv_half_indep(d.qkv, cd, h, DENSE_OFF, ib).unwrap();
+            bt.gemv_half_indep(d.z, vd, h, DENSE_OFF, ib + cd).unwrap();
+            bt.gemv_half_indep(d.b, nv, h, DENSE_OFF, ib + cd + vd).unwrap();
+            bt.gemv_half_indep(d.a, nv, h, DENSE_OFF, ib + cd + vd + nv).unwrap();
+            bt.barrier().unwrap();
             bt.gdn_conv(m.conv_w, m.conv_state, ib, cd, cfg.linear_conv_kernel_dim, st.hist).unwrap();
             bt.gdn_rec(m.params, m.rec_state, ib, normed, kd, nv, dk, dv, nv / nk, cfg.rms_norm_eps as f32).unwrap();
             bt.gemv_half(d.out, h, vd, normed, DENSE_OFF).unwrap();
@@ -1252,10 +1420,11 @@ impl GdnLayer {
         g.write(DENSE_OFF, x);
         {
             let mut bt = g.batch().unwrap();
-            bt.gemv_half(d.qkv, cd, h, DENSE_OFF, DENSE_OFF + h).unwrap();
-            bt.gemv_half(d.z, vd, h, DENSE_OFF, DENSE_OFF + h + cd).unwrap();
-            bt.gemv_half(d.b, nv, h, DENSE_OFF, DENSE_OFF + h + cd + vd).unwrap();
-            bt.gemv_half(d.a, nv, h, DENSE_OFF, DENSE_OFF + h + cd + vd + nv).unwrap();
+            bt.gemv_half_indep(d.qkv, cd, h, DENSE_OFF, DENSE_OFF + h).unwrap();
+            bt.gemv_half_indep(d.z, vd, h, DENSE_OFF, DENSE_OFF + h + cd).unwrap();
+            bt.gemv_half_indep(d.b, nv, h, DENSE_OFF, DENSE_OFF + h + cd + vd).unwrap();
+            bt.gemv_half_indep(d.a, nv, h, DENSE_OFF, DENSE_OFF + h + cd + vd + nv).unwrap();
+            bt.barrier().unwrap();
             bt.run().unwrap();
         }
         g.read_into(DENSE_OFF + h, buf);
@@ -1290,6 +1459,10 @@ impl GdnLayer {
                 self.dev_inputs(d, x, &mut ibuf);
             }
             None => {
+                // The four input projections are the mixer's own 25 MiB of dense
+                // weights per layer and they used to run between two timers, so
+                // their cost showed up only as "unaccounted" stack time.
+                let _p = prof::start(prof::MIXER_PROJ);
                 let (m, r) = ibuf.split_at_mut(cd);
                 let (zz, r) = r.split_at_mut(vd);
                 let (bb, aa) = r.split_at_mut(nv);
@@ -1399,6 +1572,10 @@ impl GdnLayer {
             );
             kernel::rmsnorm_gated(x, g, &self.norm_w, cfg.rms_norm_eps as f32, &mut normed[hv * dv..(hv + 1) * dv]);
         }
+        // out_proj is a projection, not part of the recursion: close the mixer
+        // timer here so the two stages stay disjoint (a nested timer would be
+        // counted twice, which showed up as negative unaccounted stack time).
+        drop(_cpu);
         match &self.dev {
             Some(d) => {
                 let mut g = d.gpu.lock().unwrap();
@@ -1410,7 +1587,10 @@ impl GdnLayer {
                 }
                 g.read_into(DENSE_OFF + vd, out);
             }
-            None => self.out_proj.gemv(h, vd, &normed, out, t),
+            None => {
+                let _p = prof::start(prof::MIXER_PROJ);
+                self.out_proj.gemv(h, vd, &normed, out, t)
+            }
         }
         st.filled = (st.filled + 1).min(st.hist);
     }
@@ -1457,7 +1637,14 @@ impl AttnLayer {
         let mut cos = Vec::new();
         let mut sin = Vec::new();
         kernel::rope_tables(cfg.rope_theta, cfg.rotary_dim(), max_pos, &mut cos, &mut sin);
-        Ok(AttnLayer {
+        let (h, nh, nkv, hd) = (
+            cfg.hidden_size,
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+        );
+        let q_out = if cfg.attn_output_gate { nh * hd * 2 } else { nh * hd };
+        let mut l = AttnLayer {
             cfg,
             q: dense_half(sh, &format!("{p}.q_proj.weight"))?.0,
             k: dense_half(sh, &format!("{p}.k_proj.weight"))?.0,
@@ -1469,7 +1656,14 @@ impl AttnLayer {
             sin,
             threads: threads.max(1),
             dev: None,
-        })
+        };
+        if dense_i8() {
+            l.q = l.q.quantize_i8(q_out, h);
+            l.k = l.k.quantize_i8(nkv * hd, h);
+            l.v = l.v.quantize_i8(nkv * hd, h);
+            l.o = l.o.quantize_i8(h, nh * hd);
+        }
+        Ok(l)
     }
 
     /// q/k/v/o to VRAM. The per-head norms, rope, the KV append and the softmax
@@ -1524,14 +1718,17 @@ impl AttnLayer {
         {
             let mut bt = g.batch().unwrap();
             if d.q4 {
-                bt.gemv_q4(d.q, d.qs[0], q_out, h, d.group, DENSE_OFF, DENSE_OFF + h).unwrap();
-                bt.gemv_q4(d.k, d.qs[1], nkv * hd, h, d.group, DENSE_OFF, DENSE_OFF + h + q_out).unwrap();
-                bt.gemv_q4(d.v, d.qs[2], nkv * hd, h, d.group, DENSE_OFF, DENSE_OFF + h + q_out + nkv * hd).unwrap();
+                bt.gemv_q4_indep(d.q, d.qs[0], q_out, h, d.group, DENSE_OFF, DENSE_OFF + h).unwrap();
+                bt.gemv_q4_indep(d.k, d.qs[1], nkv * hd, h, d.group, DENSE_OFF, DENSE_OFF + h + q_out).unwrap();
+                bt.gemv_q4_indep(d.v, d.qs[2], nkv * hd, h, d.group, DENSE_OFF, DENSE_OFF + h + q_out + nkv * hd).unwrap();
             } else {
-                bt.gemv_half(d.q, q_out, h, DENSE_OFF, DENSE_OFF + h).unwrap();
-                bt.gemv_half(d.k, nkv * hd, h, DENSE_OFF, DENSE_OFF + h + q_out).unwrap();
-                bt.gemv_half(d.v, nkv * hd, h, DENSE_OFF, DENSE_OFF + h + q_out + nkv * hd).unwrap();
+                bt.gemv_half_indep(d.q, q_out, h, DENSE_OFF, DENSE_OFF + h).unwrap();
+                bt.gemv_half_indep(d.k, nkv * hd, h, DENSE_OFF, DENSE_OFF + h + q_out).unwrap();
+                bt.gemv_half_indep(d.v, nkv * hd, h, DENSE_OFF, DENSE_OFF + h + q_out + nkv * hd).unwrap();
             }
+            // q, k and v are independent projections of the same x: one
+            // barrier before the host reads them back, not three.
+            bt.barrier().unwrap();
             bt.run().unwrap();
         }
         g.read_into(DENSE_OFF + h, buf);
@@ -1558,6 +1755,7 @@ impl AttnLayer {
                 self.dev_inputs(d, x, &mut ibuf);
             }
             None => {
+                let _p = prof::start(prof::MIXER_PROJ);
                 let (q, r) = ibuf.split_at_mut(q_out);
                 let (k, v) = r.split_at_mut(nkv * hd);
                 self.q.gemv(q_out, h, x, q, t);
@@ -1628,6 +1826,7 @@ impl AttnLayer {
                 }
             }
         }
+        drop(_cpu);
         match &self.dev {
             Some(d) => {
                 let mut g = d.gpu.lock().unwrap();
@@ -1643,7 +1842,10 @@ impl AttnLayer {
                 }
                 g.read_into(DENSE_OFF + nh * hd, out);
             }
-            None => self.o.gemv(h, nh * hd, &attn, out, t),
+            None => {
+                let _p = prof::start(prof::MIXER_PROJ);
+                self.o.gemv(h, nh * hd, &attn, out, t)
+            }
         }
     }
 }

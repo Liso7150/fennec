@@ -104,6 +104,7 @@ fn main() {
     let threads = opts.usize_at("threads", cores);
     kernel::set_threads(threads);
     fennec::model::set_dense_int4(opts.has("dense-int4"));
+    fennec::model::set_dense_i8(opts.has("dense-i8"));
     fennec::quant::set_planar_dot(opts.has("planar-dot"));
     let r = match cmd.as_str() {
         "info" => info(&opts),
@@ -168,7 +169,8 @@ fn usage() {
          \x20 --allow-remote    permit a non-loopback bind (no TLS, model in RAM)\n\
          \x20 --ctx 32768       context window `run`/`serve` allocates state for\n\
          \x20 --ngen 4096       generation ceiling per request\n\
-         \x20 --auto-tier       turn the device tier on without spelling out --gpu\n\n\
+         \x20 --auto-tier       turn the device tier on without spelling out --gpu\n\
+         \x20 --dense-i8        one byte per weight for the host dense projections (CPU tier)\n\n\
          default model dir: {DEFAULT_MODEL}",
         fennec::VERSION
     );

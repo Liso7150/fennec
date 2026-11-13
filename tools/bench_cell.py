@@ -14,6 +14,9 @@ BACKEND = sys.argv[3] if len(sys.argv) > 3 else "cuda"
 THREADS = sys.argv[4] if len(sys.argv) > 4 else "8"
 N = int(sys.argv[5]) if len(sys.argv) > 5 else 3
 PORT = 8199
+# The server signs every route, `/health` included, so the readiness probe has to
+# carry the same key the completion request does.
+AUTH = {"Authorization": "Bearer local"}
 
 env = dict(os.environ)
 proc = subprocess.Popen([EXE, "serve", "--model", MODEL, "--auto-tier",
@@ -24,7 +27,7 @@ base = f"http://127.0.0.1:{PORT}"
 try:
     for _ in range(60):
         try:
-            urllib.request.urlopen(base + "/health", timeout=2); break
+            urllib.request.urlopen(urllib.request.Request(base + "/health", headers=AUTH), timeout=2); break
         except Exception: time.sleep(1)
     else:
         print("engine did not become healthy"); sys.exit(2)
@@ -35,7 +38,7 @@ try:
         t0 = time.time(); first = None; toks = None
         r = urllib.request.urlopen(urllib.request.Request(
             base + "/v1/chat/completions", data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json", "Authorization": "Bearer local"}), timeout=180)
+            headers={**AUTH, "Content-Type": "application/json"}), timeout=180)
         for line in r:
             line = line.decode().strip()
             if not line.startswith("data:"): continue

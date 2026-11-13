@@ -472,9 +472,10 @@ pub enum Op {
     GemvF16 = 5,
     GdnConv = 6,
     GdnRec = 7,
+    MoeReduce = 8,
 }
 
-const SPV: [&[u8]; 8] = [
+const SPV: [&[u8]; 9] = [
     include_bytes!("shaders/gemv_bf16.spv"),
     include_bytes!("shaders/gemv_q4.spv"),
     include_bytes!("shaders/rmsnorm.spv"),
@@ -483,6 +484,7 @@ const SPV: [&[u8]; 8] = [
     include_bytes!("shaders/gemv_f16.spv"),
     include_bytes!("shaders/gdn_conv.spv"),
     include_bytes!("shaders/gdn_rec.spv"),
+    include_bytes!("shaders/moe_reduce.spv"),
 ];
 
 pub struct VkGpu {
@@ -1243,6 +1245,17 @@ impl VkGpu {
     }
 
     fn record(&mut self, op: Op, bufs: [usize; 4], push: &[u32], groups: u32, rows: u32, tall: bool) -> Result<()> {
+        self.record_inner(op, bufs, push, groups, rows, tall, true)
+    }
+
+    /// Like `record` but without the trailing pipeline barrier. Independent
+    /// dispatches (one expert's gemv vs another's) can then overlap on the
+    /// device; the caller inserts a barrier at the next real dependency.
+    fn record_nb(&mut self, op: Op, bufs: [usize; 4], push: &[u32], groups: u32, rows: u32, tall: bool) -> Result<()> {
+        self.record_inner(op, bufs, push, groups, rows, tall, false)
+    }
+
+    fn record_inner(&mut self, op: Op, bufs: [usize; 4], push: &[u32], groups: u32, rows: u32, tall: bool, barrier: bool) -> Result<()> {
         let set = self.set(bufs)?;
         let mut pc = [0u32; 8];
         pc[..push.len()].copy_from_slice(push);
@@ -1264,7 +1277,9 @@ impl VkGpu {
                     base += n;
                 }
             }
-            self.barrier(PIPELINE_STAGE_COMPUTE_SHADER, PIPELINE_STAGE_COMPUTE_SHADER, ACCESS_SHADER_WRITE, ACCESS_SHADER_READ);
+            if barrier {
+                self.barrier(PIPELINE_STAGE_COMPUTE_SHADER, PIPELINE_STAGE_COMPUTE_SHADER, ACCESS_SHADER_WRITE, ACCESS_SHADER_READ);
+            }
         }
         Ok(())
     }
@@ -1327,6 +1342,63 @@ impl<'a> VkBatch<'a> {
             rows as u32,
             rows as u32,
             true,
+        )?;
+        self.ops += 1;
+        Ok(self)
+    }
+
+    /// Expert gemvs recorded without a barrier after each one: every expert in
+    /// a phase writes its own arena slot, so they are independent and the device
+    /// can run them concurrently. A `barrier` separates the phases.
+    pub fn gemv_q4_nb(&mut self, w: usize, sc: usize, rows: usize, cols: usize, group: usize, x_off: usize, y_off: usize) -> Result<&mut VkBatch<'a>> {
+        let s = self.gpu.scratch;
+        self.gpu.record_nb(
+            Op::GemvQ4,
+            [w, sc, s, s],
+            &[rows as u32, cols as u32, group as u32, x_off as u32, y_off as u32],
+            rows as u32,
+            rows as u32,
+            true,
+        )?;
+        self.ops += 1;
+        Ok(self)
+    }
+
+    pub fn gemv_half_nb(&mut self, w: usize, rows: usize, cols: usize, x_off: usize, y_off: usize) -> Result<&mut VkBatch<'a>> {
+        assert!(cols % 2 == 0, "half pairs need an even column count");
+        let s = self.gpu.scratch;
+        let op = if self.gpu.bufs[w].f16 { Op::GemvF16 } else { Op::GemvBf16 };
+        let groups = (rows as u32 + 3) / 4;
+        self.gpu.record_nb(op, [w, s, s, w], &[rows as u32, cols as u32, x_off as u32, y_off as u32], groups, groups, true)?;
+        self.ops += 1;
+        Ok(self)
+    }
+
+    pub fn silu_mul_nb(&mut self, n: usize, a_off: usize, b_off: usize, y_off: usize) -> Result<&mut VkBatch<'a>> {
+        let s = self.gpu.scratch;
+        let d = self.gpu.dummy;
+        self.gpu.record_nb(Op::SiluMul, [s, s, s, d], &[n as u32, a_off as u32, b_off as u32, y_off as u32], n.div_ceil(256) as u32, 1, false)?;
+        self.ops += 1;
+        Ok(self)
+    }
+
+    pub fn barrier(&mut self) -> Result<&mut VkBatch<'a>> {
+        self.gpu.barrier(PIPELINE_STAGE_COMPUTE_SHADER, PIPELINE_STAGE_COMPUTE_SHADER, ACCESS_SHADER_WRITE, ACCESS_SHADER_READ);
+        Ok(self)
+    }
+
+    /// One weighted sum of every expert slot into the accumulator, in pick
+    /// order, replacing the per-expert axpy chain and its barriers.
+    pub fn moe_reduce(&mut self, n: usize, h: usize, stride: usize, base: usize, out_off: usize, acc_off: usize, w_off: usize) -> Result<&mut VkBatch<'a>> {
+        let s = self.gpu.scratch;
+        let d = self.gpu.dummy;
+        self.gpu.record(
+            Op::MoeReduce,
+            [s, s, s, d],
+            &[n as u32, h as u32, stride as u32, base as u32, out_off as u32, acc_off as u32, w_off as u32],
+            h.div_ceil(256) as u32,
+            1,
+            false,
         )?;
         self.ops += 1;
         Ok(self)
@@ -1707,6 +1779,38 @@ impl<'a> Batch<'a> {
             Batch::Vk(b) => { b.gemv_q4(w, sc, rows, cols, group, x_off, y_off)?; }
             Batch::Cuda(b) => { b.gemv_q4(w, sc, rows, cols, group, x_off, y_off)?; }
         };
+        Ok(self)
+    }
+
+    /// A projection recorded without a trailing pipeline barrier, for kernels
+    /// that write disjoint slices and read the same input. On the Vulkan tier
+    /// they then fill the device together instead of serializing on a
+    /// COMPUTE->COMPUTE barrier each; the caller places one `barrier` at the
+    /// next real dependency. CUDA launches into one in-order stream, which
+    /// already orders them, so its arm is the plain recording call.
+    pub fn gemv_half_indep(&mut self, w: usize, rows: usize, cols: usize, x_off: usize, y_off: usize) -> Result<&mut Batch<'a>> {
+        match self {
+            Batch::Vk(b) => { b.gemv_half_nb(w, rows, cols, x_off, y_off)?; }
+            Batch::Cuda(b) => { b.gemv_half(w, rows, cols, x_off, y_off)?; }
+        };
+        Ok(self)
+    }
+
+    /// Same, for an FQ4 weight block.
+    pub fn gemv_q4_indep(&mut self, w: usize, sc: usize, rows: usize, cols: usize, group: usize, x_off: usize, y_off: usize) -> Result<&mut Batch<'a>> {
+        match self {
+            Batch::Vk(b) => { b.gemv_q4_nb(w, sc, rows, cols, group, x_off, y_off)?; }
+            Batch::Cuda(b) => { b.gemv_q4(w, sc, rows, cols, group, x_off, y_off)?; }
+        };
+        Ok(self)
+    }
+
+    /// Close a phase of independent kernels. A no-op on CUDA, where the stream
+    /// already orders every launch behind the previous one's writes.
+    pub fn barrier(&mut self) -> Result<&mut Batch<'a>> {
+        if let Batch::Vk(b) = self {
+            b.barrier()?;
+        }
         Ok(self)
     }
 

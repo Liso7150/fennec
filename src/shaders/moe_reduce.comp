@@ -1,0 +1,26 @@
+#version 450
+// acc[e] = sum_j w[j] * slot_j.out[e], summed in pick order so the result
+// matches the sequential axpy chain it replaces. One dispatch for the whole
+// layer instead of one axpy (plus a pipeline barrier) per expert.
+layout(local_size_x = 256) in;
+layout(push_constant) uniform P {
+    uint n;
+    uint h;
+    uint stride;
+    uint base;
+    uint out_off;
+    uint acc_off;
+    uint w_off;
+} p;
+layout(set = 0, binding = 0) readonly buffer W { float w[]; };
+layout(set = 0, binding = 1) readonly buffer X { float x[]; };
+layout(set = 0, binding = 2) buffer Y { float y[]; };
+
+void main() {
+    uint e = gl_GlobalInvocationID.x;
+    if (e >= p.h) return;
+    float s = w[p.w_off] * x[p.base + p.out_off + e];
+    for (uint j = 1u; j < p.n; j++)
+        s += w[p.w_off + j] * x[p.base + j * p.stride + p.out_off + e];
+    y[p.acc_off + e] = s;
+}

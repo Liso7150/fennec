@@ -27,13 +27,14 @@ pub const MIXER_CPU: usize = 8;
 pub const HEAD: usize = 9;
 pub const NORM: usize = 10;
 pub const RESIDUAL: usize = 11;
+pub const MIXER_PROJ: usize = 12;
 
 /// `moe submit` split in two and `moe device wait` split in two, because the
 /// lumped numbers could not say whether the cost was the blocking activation
 /// upload, the launch loop, the fence, or the readback — and those have four
 /// different fixes. `lm_head` was missing entirely: on the CPU tier it is a
 /// 248320x2048 half-precision read per token and nothing named it.
-pub const STAGES: [&str; 12] = [
+pub const STAGES: [&str; 13] = [
     "route",
     "moe upload",
     "moe record+launch",
@@ -46,10 +47,11 @@ pub const STAGES: [&str; 12] = [
     "lm_head",
     "rmsnorm",
     "residual",
+    "mixer projections",
 ];
 
 static ON: AtomicBool = AtomicBool::new(false);
-static NS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+static NS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 
 pub fn enable() {
     ON.store(true, Relaxed);
@@ -66,8 +68,8 @@ pub fn reset() {
 }
 
 /// Milliseconds per stage, in `STAGES` order.
-pub fn millis() -> [f64; 12] {
-    let mut out = [0f64; 12];
+pub fn millis() -> [f64; 13] {
+    let mut out = [0f64; 13];
     for (i, c) in NS.iter().enumerate() {
         out[i] = c.load(Relaxed) as f64 / 1e6;
     }

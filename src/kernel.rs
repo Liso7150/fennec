@@ -430,7 +430,7 @@ pub enum Half {
 
 impl Half {
     #[inline]
-    fn decode(self, bits: u16) -> f32 {
+    pub fn decode(self, bits: u16) -> f32 {
         match self {
             Half::Bf16 => f32::from_bits((bits as u32) << 16),
             Half::F16 => crate::safetensors::f16_to_f32(bits),
@@ -482,6 +482,211 @@ pub fn gemv_half(
             *o = row_dot(row, x, fmt, vec);
         }
     });
+}
+
+/// `out[r] = scale[r] * sum_c w[r*cols+c] * x[c]`, with the weights at one byte
+/// each and the activations quantised per token at 8 bits.
+///
+/// The byte count is the point: on the CPU tier the dense mixer projections read
+/// ~2.3 GiB of bf16 per token and are bandwidth-bound, so halving the weight
+/// traffic halves the block. The arithmetic has to get *cheaper* at the same
+/// time or the win evaporates - an int8 weight with f32 activations needs a
+/// sign-extend plus an int-to-float per 8 weights, and measured 1.9x slower than
+/// the bf16 it replaced. `maddubs` does 32 weights per instruction, so both
+/// operands are int8 here.
+///
+/// `wsum[r]` is `sum(w)` for the row, fixed at load: `maddubs` wants an unsigned
+/// operand, so the token's activations go in at offset binary (`x_i8 + 128`) and
+/// that costs exactly `128 * sum(w)` per row, which the kernel subtracts back out
+/// in integer arithmetic.
+pub fn gemv_i8(
+    w: &[i8],
+    wsum: &[i32],
+    scale: &[f32],
+    rows: usize,
+    cols: usize,
+    x: &[f32],
+    out: &mut [f32],
+    threads: usize,
+) {
+    debug_assert_eq!(w.len(), rows * cols);
+    debug_assert_eq!(wsum.len(), rows);
+    debug_assert_eq!(scale.len(), rows);
+    debug_assert_eq!(x.len(), cols);
+    debug_assert_eq!(out.len(), rows);
+    let t = budget(threads, rows, cols);
+    // One scale for the whole activation vector, quantised once per call and
+    // shared by every row: the prep is 2048 floats against a 25 MiB matrix.
+    //
+    // The grid is 6 bits wide, not 8, because `maddubs` sums two products into
+    // an i16 and saturates: with 7-bit weights (|w| <= 127) the activations can
+    // only carry 63, otherwise 2*127*127 overflows and the row silently clamps.
+    let amax = x.iter().fold(0f32, |m, v| m.max(v.abs()));
+    let sx = if amax > 0.0 { amax / 63.0 } else { 1.0 };
+    let inv = 1.0 / sx;
+    let mut xu = vec![0u8; cols];
+    for (i, &v) in x.iter().enumerate() {
+        // offset binary in [1, 127]: `maddubs` needs its first operand unsigned
+        let q = (v * inv).round().clamp(-63.0, 63.0) as i32;
+        xu[i] = (q + 64) as u8;
+    }
+    #[cfg(target_arch = "x86_64")]
+    let vec = cols >= 32 && std::is_x86_feature_detected!("avx2");
+    #[cfg(not(target_arch = "x86_64"))]
+    let vec = false;
+    par_rows(out, t, |part, start| {
+        for (i, o) in part.iter_mut().enumerate() {
+            let r = start + i;
+            let row = &w[r * cols..(r + 1) * cols];
+            *o = row_dot_i8(row, &xu, wsum[r], scale[r] * sx, vec);
+        }
+    });
+}
+
+#[inline]
+fn row_dot_i8(row: &[i8], xu: &[u8], wsum: i32, scale: f32, vec: bool) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    let acc: i32 = if vec {
+        unsafe { i8_avx::row(row.as_ptr(), xu.as_ptr(), xu.len()) }
+    } else {
+        scalar_i8(row, xu)
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let acc: i32 = scalar_i8(row, xu);
+    let _ = vec;
+    // undo the offset binary of the activations, in integers
+    (acc - 64 * wsum) as f32 * scale
+}
+
+#[inline]
+fn scalar_i8(row: &[i8], xu: &[u8]) -> i32 {
+    let mut s = 0i32;
+    for c in 0..row.len() {
+        s += (xu[c] as i32 - 64) * row[c] as i32;
+    }
+    s
+}
+
+#[cfg(target_arch = "x86_64")]
+mod i8_avx {
+    use std::arch::x86_64::*;
+
+    /// 32 weights per `maddubs`, 64 per iteration into two integer accumulators.
+    /// Products are 8-bit x 8-bit so a pair sums to at most 2*127*127 = 32258,
+    /// inside i16; each i32 lane then accumulates at most 64*4 of them.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn row(w: *const i8, xu: *const u8, cols: usize) -> i32 {
+        let one = _mm256_set1_epi16(1);
+        let mut a0 = _mm256_setzero_si256();
+        let mut a1 = _mm256_setzero_si256();
+        let mut k = 0usize;
+        while k + 64 <= cols {
+            let p0 = _mm256_maddubs_epi16(
+                _mm256_loadu_si256(xu.add(k) as *const __m256i),
+                _mm256_loadu_si256(w.add(k) as *const __m256i),
+            );
+            let p1 = _mm256_maddubs_epi16(
+                _mm256_loadu_si256(xu.add(k + 32) as *const __m256i),
+                _mm256_loadu_si256(w.add(k + 32) as *const __m256i),
+            );
+            a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(p0, one));
+            a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(p1, one));
+            k += 64;
+        }
+        while k + 32 <= cols {
+            let p = _mm256_maddubs_epi16(
+                _mm256_loadu_si256(xu.add(k) as *const __m256i),
+                _mm256_loadu_si256(w.add(k) as *const __m256i),
+            );
+            a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(p, one));
+            k += 32;
+        }
+        let v = _mm256_add_epi32(a0, a1);
+        let s = _mm_add_epi32(
+            _mm256_castsi256_si128(v),
+            _mm256_extracti128_si256::<1>(v),
+        );
+        let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0b0100_1110>(s));
+        let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0b1011_0001>(s));
+        let mut total = _mm_cvtsi128_si32(s);
+        while k < cols {
+            total += (*xu.add(k) as i32 - 64) * *w.add(k) as i32;
+            k += 1;
+        }
+        total
+    }
+}
+
+#[cfg(test)]
+mod i8_tests {
+    use super::*;
+
+    fn quantise(w: &[f32], rows: usize, cols: usize) -> (Vec<i8>, Vec<i32>, Vec<f32>) {
+        let mut q = vec![0i8; rows * cols];
+        let mut wsum = vec![0i32; rows];
+        let mut scale = vec![0f32; rows];
+        for r in 0..rows {
+            let row = &w[r * cols..(r + 1) * cols];
+            let amax = row.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let s = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+            scale[r] = s;
+            let mut sum = 0i32;
+            for c in 0..cols {
+                let v = (row[c] / s).round().clamp(-127.0, 127.0) as i8;
+                q[r * cols + c] = v;
+                sum += v as i32;
+            }
+            wsum[r] = sum;
+        }
+        (q, wsum, scale)
+    }
+
+    /// Two separate claims: the integer kernel must reproduce the dequantised
+    /// matrix to f32 rounding, and the 8-bit round trip itself must stay inside
+    /// its documented budget (far tighter than the int4 experts already are).
+    #[test]
+    fn an_int8_gemv_tracks_the_exact_dot() {
+        let (rows, cols) = (9usize, 256usize);
+        let mut seed = 0x9e37_79b9u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed as f64 / u64::MAX as f64) as f32 - 0.5
+        };
+        let w: Vec<f32> = (0..rows * cols).map(|_| next() * 0.08).collect();
+        let x: Vec<f32> = (0..cols).map(|_| next() * 2.0).collect();
+        let (q, wsum, scale) = quantise(&w, rows, cols);
+        let mut got = vec![0f32; rows];
+        gemv_i8(&q, &wsum, &scale, rows, cols, &x, &mut got, 4);
+        let amax = x.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let sx = amax / 63.0;
+        for r in 0..rows {
+            let dequant: f32 = (0..cols).map(|c| q[r * cols + c] as f32 * scale[r] * x[c]).sum();
+            let want: f32 = (0..cols).map(|c| w[r * cols + c] * x[c]).sum();
+            let kern = (got[r] - dequant).abs() / dequant.abs().max(1e-6);
+            let quant = (got[r] - want).abs() / want.abs().max(1e-6);
+            // The kernel quantises the activations too, so its drift against the
+            // unquantised dot is the 6-bit grid, not f32 rounding.
+            assert!(kern < 2e-2, "row {r}: kernel drift {kern:.2e} (activation grid {sx:.2e})");
+            assert!(quant < 3e-2, "row {r}: 8-bit round trip {quant:.2e} of {want}");
+        }
+    }
+
+    /// The offset-binary correction is the part that can silently go wrong: a
+    /// row whose weights sum to zero must still match, and a constant row must
+    /// come out exact.
+    #[test]
+    fn the_offset_correction_survives_a_constant_row() {
+        let cols = 64usize;
+        let w = vec![0.5f32; cols];
+        let x: Vec<f32> = (0..cols).map(|c| (c as f32) * 0.01 - 0.3).collect();
+        let (q, wsum, scale) = quantise(&w, 1, cols);
+        let mut got = vec![0f32; 1];
+        gemv_i8(&q, &wsum, &scale, 1, cols, &x, &mut got, 1);
+        let want: f32 = (0..cols).map(|c| w[c] * x[c]).sum();
+        assert!((got[0] - want).abs() / want.abs().max(1e-6) < 3e-2, "{got:?} vs {want}");
+    }
 }
 
 #[inline]
