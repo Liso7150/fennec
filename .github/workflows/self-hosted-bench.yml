@@ -17,12 +17,13 @@ jobs:
       - name: Build engine (with int4-dense lever)
         shell: powershell
         run: |
+          cd D:/Fennec
           cargo build --release --offline -j 6
       - name: Sign built binaries (SAC)
         shell: powershell
         run: |
           $c = Get-ChildItem Cert:\CurrentUser\My | Where-Object Subject -eq 'CN=Fennec Local Dev Signing' | Select-Object -First 1
-          Get-ChildItem -Path target -Recurse -Include *.exe,*.dll -ErrorAction SilentlyContinue | ForEach-Object {
+          Get-ChildItem -Path D:/Fennec/target -Recurse -Include *.exe,*.dll -ErrorAction SilentlyContinue | ForEach-Object {
             if ((Get-AuthenticodeSignature $_.FullName).Status -ne 'Valid') {
               Set-AuthenticodeSignature -FilePath $_.FullName -Certificate $c -HashAlgorithm SHA256 | Out-Null
             }
@@ -31,7 +32,9 @@ jobs:
         shell: powershell
         env:
           FENNEC_GOLDEN_MODEL: D:/MEGAsync-sync/colibri-models/qwen36-35b
-        run: cargo test --release --offline --test golden
+        run: |
+          cd D:/Fennec
+          cargo test --release --offline --test golden
       - name: Backend matrix vs Colibri (3 pairs, <=8 threads)
         shell: powershell
         run: python D:/Fennec-Suite/engine-bench/bench-backend-matrix.py --pairs 3
