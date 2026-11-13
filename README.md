@@ -9,10 +9,10 @@ Replaces [fox](https://github.com/ferrumox/fox), [Colibrì](https://github.com/J
 
 | metric | value | basis |
 |---|---|---|
-| Decode, best tier (CUDA) | **14.553 tok/s** | HTTP protocol, median of 3 |
-| Decode, leader (Colibrì Vulkan) | **18.579 tok/s** | **1.28×** ahead of Fennec |
-| Cold start (CUDA) | **10.6 s** | vs Colibrì Vulkan 26.2 s |
-| Decode, CPU only | 6.330 tok/s | vs Colibrì CPU 7.651 |
+| Decode, best tier (CUDA) | **14.716 tok/s** | HTTP protocol, median of 3 |
+| Decode, leader (Colibrì Vulkan) | **19.108 tok/s** | **1.30×** ahead of Fennec |
+| Cold start (CUDA) | **10.1 s** | vs Colibrì Vulkan 25.1 s |
+| Decode, CPU only | 6.109 tok/s | vs Colibrì CPU 7.680 |
 | Device residency | **30.1%** — 3855 picks | 8945 host picks, **0** disk |
 | Host expert pool | **13.08 GiB** | zero-copy borrow, 40/40 layers |
 | Checkpoint | 22.8 GiB int4 | 43 shards, 10240 experts, top-8 of 256 |
@@ -69,16 +69,16 @@ Every live cell: `serve`, then one streaming `/v1/chat/completions`. Same checkp
 ![Cold start per engine and backend](docs/matrix-coldstart.png)
 
 > [!IMPORTANT]
-> **Colibrì still wins.** Its Vulkan tier is **18.579 tok/s** against Fennec's best (CUDA) at **14.553** — a **1.28×** gap. Fennec wins cold start: **10.6 s against 26.2 s**. On CPU alone the gap is 1.21× (6.330 vs 7.651), so the device tier pays for itself (2.30× over Fennec's own CPU-only tier) but the host kernel underneath it is not competitive. It is not "best in everything".
+> **Colibrì still wins.** Its Vulkan tier is **19.108 tok/s** against Fennec's best (CUDA) at **14.716** — a **1.30×** gap. Fennec wins cold start: **10.1 s against 25.1 s**. On CPU alone the gap is 1.26× (6.109 vs 7.680), so the device tier pays for itself (2.41× over Fennec's own CPU-only tier) but the host kernel underneath it is not competitive. It is not "best in everything".
 
 | engine | backend | tok/s | head s | TTFT s | TPOT ms | total s | cold s |
 |---|---|---|---|---|---|---|---|
-| Colibrì | CPU | 7.651 | 1.777 | 1.907 | 130.7 | 10.079 | 10.0 |
-| **Colibrì** | **Vulkan** | **18.579** | **0.423** | **0.563** | **53.8** | **4.000** | 26.2 |
-| Fennec | CPU | 6.330 | 3.467 | 3.625 | 158.0 | 13.594 | 13.8 |
-| Fennec | Vulkan | 10.780 | 2.079 | 2.172 | 92.8 | 8.016 | 14.2 |
-| **Fennec** | **CUDA** | 14.553 | 1.767 | 1.828 | 68.7 | 5.969 | **10.6** |
-| rabbit | CPU | 1.461 | 17.149 | 17.813 | 684.5 | 61.532 | 7.8 |
+| Colibrì | CPU | 7.680 | 1.657 | 1.657 | 130.2 | 10.0 | 9.3 |
+| **Colibrì** | **Vulkan** | **19.108** | **0.423** | **0.515** | **52.3** | **4.0** | 25.1 |
+| Fennec | CPU | 6.109 | 3.467 | 3.844 | 163.7 | 13.6 | 13.0 |
+| Fennec | Vulkan | 10.418 | 2.079 | 2.344 | 96.0 | 8.0 | 13.6 |
+| **Fennec** | **CUDA** | 14.716 | 1.767 | 1.578 | 68.0 | 6.0 | **10.1** |
+| rabbit | CPU | 1.374 | 17.149 | 17.063 | 727.9 | 61.5 | 7.8 |
 
 **Winner tally (lower is better except decode): Colibrì 5 · rabbit 1 · Fennec 0.** Total latency is the measured wall time of the request, TTFT included; cold start is process launch to `/v1/models` answering, before any token. Run 1 of each cell is a cold start and slower; the table quotes the **median**, not the best run.
 
@@ -192,7 +192,7 @@ The median run's stack, profiled per token (`FENNEC_PROFILE=1`, **wall time** �
 | stack | 79.09 | | 85.85 | |
 | unaccounted | 0.24 | | 0.34 | |
 
-1. **The host is the bottleneck, not the device** — 36.6 ms of CPU expert work against 3.3 ms of device wait; the GPU idles most of the token. Largest lever, **not closed**. Two candidates were implemented and **measured as regressions**, so both stay off by default: fusing the dense input projections (−14.4%, reverted) and int4-dense attention residency (`--dense-int4`: 6.1 vs 14.7 tok/s, cold 24.2 vs 10.1 s — the 1-row/workgroup `gemv_q4` is slower for dense and on-load quantization adds cold-start). Remaining candidates: a multi-row int4 device gemv, planar-activation f32 dot (~1.3× in a microbenchmark, not applied), P-core affinity for pool workers (6 P-cores at logical 0–11, 8 E-cores, 2 LP-E; **no thread affinity anywhere** today), spin-then-park barrier instead of mutex+condvar. Untested hypothesis: the microbenchmark reuses 8 L3-resident experts (0.146 ms each) while decode touches ~194 distinct experts per token, all out of DRAM.
+1. **The host is the bottleneck, not the device** — 36.6 ms of CPU expert work against 3.3 ms of device wait; the GPU idles most of the token. Largest lever, **not closed**. Two candidates were implemented and **measured as regressions**, so both stay off by default: fusing the dense input projections (−14.4%, reverted) and int4-dense attention residency (`--dense-int4`: 6.1 vs 14.7 tok/s, cold 24.2 vs 10.1 s — the 1-row/workgroup `gemv_q4` is slower for dense and on-load quantization adds cold-start). Remaining candidates: a multi-row int4 device gemv, P-core affinity for pool workers (6 P-cores at logical 0–11, 8 E-cores, 2 LP-E; **no thread affinity anywhere** today), spin-then-park barrier instead of mutex+condvar. The planar-activation f32 host dot (~1.3× in a microbenchmark) is now implemented behind `--planar-dot` (default off); its end-to-end A/B is pending because Smart App Control blocks executing newly-built engine binaries on the dev box. Untested hypothesis: the microbenchmark reuses 8 L3-resident experts (0.146 ms each) while decode touches ~194 distinct experts per token, all out of DRAM.
 2. **`mixer device`, 23.8 – 27.0 ms** — the 10 full-attention layers are not yet one fused batch like the delta net (~2.5 ms estimated). The per-head `scores` buffer was hoisted out of the head loop (one allocation per step instead of ~160/token; 13/13 goldens pass); it does not close the decode gap.
 3. **Device residency, 30.1%** — dense layers sit in VRAM as f16 (2.30 GiB); int4 would free ~1.7 GiB for roughly 900 more resident experts.
 4. **`lm_head` on CPU costs 143.3 ms** — 43% of the 332.9 ms CPU-only token; 7.9 ms on device.
