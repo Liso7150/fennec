@@ -1,0 +1,42 @@
+name: Self-hosted GPU bench
+
+# Runs on the local GPU box (fennec-gpu-box) which has the RTX 4060, the 22.8 GiB
+# checkpoint and Colibri. SAC blocks unsigned binaries, so every built exe/dll is
+# signed with the local dev cert before it is executed. This is the SAC-managed
+# perf re-bench the hosted runners cannot do (no GPU / no checkpoint there).
+on:
+  workflow_dispatch:
+  push:
+    paths: ["src/**", ".github/workflows/self-hosted-bench.yml"]
+
+jobs:
+  bench:
+    runs-on: [self-hosted, Windows, X64, gpu]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build engine (with int4-dense lever)
+        shell: pwsh
+        run: |
+          cargo build --release --offline -j 6
+      - name: Sign built binaries (SAC)
+        shell: pwsh
+        run: |
+          $c = Get-ChildItem Cert:\CurrentUser\My | Where-Object Subject -eq 'CN=Fennec Local Dev Signing' | Select-Object -First 1
+          Get-ChildItem -Path target -Recurse -Include *.exe,*.dll -ErrorAction SilentlyContinue | ForEach-Object {
+            if ((Get-AuthenticodeSignature $_.FullName).Status -ne 'Valid') {
+              Set-AuthenticodeSignature -FilePath $_.FullName -Certificate $c -HashAlgorithm SHA256 | Out-Null
+            }
+          }
+      - name: Golden correctness (int4 container)
+        shell: pwsh
+        env:
+          FENNEC_GOLDEN_MODEL: D:/MEGAsync-sync/colibri-models/qwen36-35b
+        run: cargo test --release --offline --test golden
+      - name: Backend matrix vs Colibri (3 pairs, <=8 threads)
+        shell: pwsh
+        run: python D:/Fennec-Suite/engine-bench/bench-backend-matrix.py --pairs 3
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-matrix
+          path: D:/Fennec-Suite/benchmarks/results-backend-matrix.json
