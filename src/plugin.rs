@@ -16,14 +16,19 @@
 //! # Example
 //!
 //! ```rust
-//! use fennec::plugin::{Plugin, Service, Context, effect};
+//! use fennec::plugin::{Plugin, Service, Context, PluginError};
+//!
+//! struct MyService;
+//! impl Service for MyService {
+//!     fn name(&self) -> &'static str { "my-service" }
+//! }
 //!
 //! struct MyPlugin;
 //!
 //! impl Plugin for MyPlugin {
 //!     fn name(&self) -> &'static str { "my-plugin" }
 //!
-//!     fn apply(&self, ctx: &mut Context) -> Result<(), Box<dyn std::error::Error>> {
+//!     fn apply(&self, ctx: &mut Context) -> Result<(), PluginError> {
 //!         // Register a service
 //!         ctx.register_service("my-service", MyService)?;
 //!
@@ -35,7 +40,6 @@
 //!         // Register a reversible effect
 //!         ctx.effect(|| {
 //!             println!("Plugin loaded");
-//!             || println!("Plugin unloaded")
 //!         })?;
 //!
 //!         Ok(())

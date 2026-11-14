@@ -40,9 +40,24 @@
 - Zero performance change (same token-by-token path as before)
 - Enables Phase 2: actual device batching
 
-**Testing:** All 100 tests pass, build clean (zero warnings)
+**Testing:** All 30 tests pass (14 unit + 9 GPU + 6 tokenizer + 1 doctest), build clean (one dead_code warning in gguf.rs)
 
 **Next:** Phase 2 will implement actual GPU batching (dense GEMV + expert grouping)
+
+### 3. Plugin System Doctest Fix ✅
+
+**Problem:** The plugin module's doctest had incorrect signatures and closure syntax.
+
+**Solution:** Fixed the example to use correct `PluginError` return type, proper closure syntax, and added missing `MyService` definition.
+
+**Files Modified:**
+- `src/plugin.rs`: Fixed doctest example (lines 16-44)
+
+**Impact:**
+- Doctests now compile and pass
+- Example code is accurate and runnable
+
+**Testing:** All 30 tests pass including the fixed doctest
 
 ---
 
@@ -127,17 +142,18 @@
 ## Code Quality Improvements
 
 ### Completed
-- ✅ All tests pass (100 engine tests + 236 core tests + 48 CLI tests + 46 installer tests)
+- ✅ All tests pass (30 engine tests: 14 unit + 9 GPU + 6 tokenizer + 1 doctest)
 - ✅ Memory pressure fix reduces startup cost (~1.8 GiB saved)
 - ✅ Device prefill batching Phase 1 infrastructure in place
-- ✅ Code is well-documented with inline comments explaining "why"
-- ✅ No compiler warnings
+- ✅ Plugin system doctest fixed and passing
+- ✅ Code compiles clean (one dead_code warning in gguf.rs)
 - ✅ Comprehensive documentation created (CHANGELOG, IMPROVEMENTS, guides)
 
 ### Pending
 - ⏳ Benchmark Phase 1 to verify no regression
-- ⏳ Implement Phase 2 (actual device batching)
+- ⏳ Implement Phase 2 (actual device batching) - see DEVICE_PREFILL_BATCHING_GUIDE.md
 - ⏳ Update README with benchmark results
+- ⏳ Fix dead_code warning in gguf.rs (path field)
 
 ---
 

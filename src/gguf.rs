@@ -209,6 +209,11 @@ impl GgufReader {
         })
     }
 
+    /// Get the file path
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Get tensor data as f32 (dequantizing if necessary)
     pub fn tensor_f32(&mut self, name: &str) -> Result<Vec<f32>> {
         let info = self.tensors.get(name)
