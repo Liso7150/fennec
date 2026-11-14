@@ -112,20 +112,25 @@ TextConfig {
 - ✅ Edge0 model detection from metadata
 - ✅ Configuration generation for Edge0-145B and Edge0-120B
 - ✅ Hybrid layer type support (Linear + Full attention)
+- ✅ Edge0 inference architecture documentation
+- ✅ Latent MoE layer structure (D/U projections)
+- ✅ DeltaNet linear attention layer structure
+- ✅ PLE n-gram table structure
 
 ### In Progress
 
-- 🔄 Latent MoE layer with D/U projections
-- 🔄 PLE n-gram table streaming from SSD
-- 🔄 DeltaNet linear attention kernel
-- 🔄 Full inference pipeline integration
+- 🔄 Integration with model.rs inference pipeline
+- 🔄 Loading D/U projection weights from GGUF
+- 🔄 DeltaNet recurrent state management
+- 🔄 PLE table memory-mapping and lookup
 
 ### Future Work
 
 - ⏳ Optimized int4 quantization for latent experts
 - ⏳ GPU kernels for D/U projection groups
-- ⏳ Memory-mapped PLE table with prefetching
 - ⏳ Batched prefill for latent MoE
+- ⏳ DeltaNet kernel optimization
+- ⏳ PLE cache coherence and prefetching
 
 ## Performance Expectations
 
@@ -148,5 +153,6 @@ Actual benchmarks pending full implementation.
 
 - `src/gguf.rs` - GGUF format reader
 - `src/edge0.rs` - Edge0 model detection and configuration
+- `src/edge0_inference.rs` - Edge0 inference architecture (latent MoE, DeltaNet, PLE)
 - `src/config.rs` - TextConfig structure (extended for Edge0)
 - `src/lib.rs` - Module exports

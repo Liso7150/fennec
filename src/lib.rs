@@ -25,6 +25,7 @@ pub mod cuda;
 pub mod cudagpu;
 pub mod dx;
 pub mod edge0;
+pub mod edge0_inference;
 pub mod gguf;
 pub mod gpu;
 pub mod kernel;
