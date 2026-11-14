@@ -399,14 +399,7 @@ impl Shards {
 
 #[cfg(test)]
 pub(crate) mod testutil {
-    use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    pub fn tmp(tag: &str) -> PathBuf {
-        static N: AtomicUsize = AtomicUsize::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("fennec-{}-{tag}-{n}.safetensors", std::process::id()))
-    }
+    use std::path::Path;
 
     /// One shard holding (name, dtype, shape, payload) in the order given.
     pub fn shard(path: &Path, tensors: &[(&str, &str, Vec<usize>, Vec<u8>)]) {
