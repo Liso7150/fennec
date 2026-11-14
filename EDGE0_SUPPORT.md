@@ -112,25 +112,35 @@ TextConfig {
 - ✅ Edge0 model detection from metadata
 - ✅ Configuration generation for Edge0-145B and Edge0-120B
 - ✅ Hybrid layer type support (Linear + Full attention)
-- ✅ Edge0 inference architecture documentation
-- ✅ Latent MoE layer structure (D/U projections)
-- ✅ DeltaNet linear attention layer structure
-- ✅ PLE n-gram table structure
-
-### In Progress
-
-- 🔄 Integration with model.rs inference pipeline
-- 🔄 Loading D/U projection weights from GGUF
-- 🔄 DeltaNet recurrent state management
-- 🔄 PLE table memory-mapping and lookup
+- ✅ **Latent MoE layer with D/U projections**
+  - 8 expert groups per layer
+  - D projection: [H=2560] → [L=1792]
+  - U projection: [L=1792] → [H=2560]
+  - Shared expert path with SiLU activation
+  - Group-weighted output combination
+- ✅ **DeltaNet linear attention**
+  - Q/K/V/O projections with optional beta gating
+  - Conv1D for local context (kernel_size=4)
+  - Recurrent state management across tokens
+  - DeltaNet recurrence: S_t = S_{t-1} + β_t * (k_t ⊗ v_t)
+- ✅ **PLE n-gram table**
+  - Memory-mapped 51.2 GiB table
+  - Trigram hashing for long-range context
+  - 8 heads per n-gram
+  - Lazy mmap loading
+- ✅ **Full integration with model.rs**
+  - Weight loading from GGUF/safetensors
+  - Fallback paths for dense models
+  - State management infrastructure
 
 ### Future Work
 
 - ⏳ Optimized int4 quantization for latent experts
-- ⏳ GPU kernels for D/U projection groups
+- ⏳ GPU kernels for D/U projection groups (Vulkan/Metal/CUDA)
 - ⏳ Batched prefill for latent MoE
-- ⏳ DeltaNet kernel optimization
-- ⏳ PLE cache coherence and prefetching
+- ⏳ DeltaNet kernel optimization (vectorized recurrence)
+- ⏳ PLE cache coherence and prefetching strategies
+- ⏳ End-to-end inference benchmarks vs Colibri
 
 ## Performance Expectations
 
