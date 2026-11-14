@@ -24,6 +24,8 @@ pub mod config;
 pub mod cuda;
 pub mod cudagpu;
 pub mod dx;
+pub mod edge0;
+pub mod gguf;
 pub mod gpu;
 pub mod kernel;
 pub mod mem;

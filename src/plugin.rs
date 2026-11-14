@@ -378,7 +378,6 @@ mod tests {
         fn apply(&self, ctx: &mut Context) -> Result<(), PluginError> {
             ctx.effect(|| {
                 println!("Test plugin loaded");
-                || println!("Test plugin unloaded")
             })?;
             Ok(())
         }
