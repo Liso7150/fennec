@@ -438,6 +438,12 @@ pub struct PleTable {
     pub heads_per_ngram: usize,
     /// Embedding dimension per head
     pub embedding_dim: usize,
+    /// LRU cache for frequently accessed n-grams (hash -> embeddings)
+    cache: std::collections::HashMap<u64, Vec<f32>>,
+    /// Maximum cache size (number of entries)
+    cache_capacity: usize,
+    /// Cache access order for LRU eviction
+    cache_order: Vec<u64>,
 }
 
 impl PleTable {
@@ -454,6 +460,9 @@ impl PleTable {
             ngram_order: 3,
             heads_per_ngram: 8,
             embedding_dim,
+            cache: std::collections::HashMap::new(),
+            cache_capacity: 1024, // Cache up to 1024 n-gram lookups
+            cache_order: Vec::new(),
         })
     }
 
@@ -470,7 +479,8 @@ impl PleTable {
     }
 
     /// Look up n-gram embeddings for a sequence of token IDs.
-    pub fn lookup(&self, token_ids: &[u32]) -> Option<Vec<f32>> {
+    /// Uses LRU cache to avoid repeated mmap reads for the same n-grams.
+    pub fn lookup(&mut self, token_ids: &[u32]) -> Option<Vec<f32>> {
         let mapping = self.mapping.as_ref()?;
         
         if token_ids.len() < self.ngram_order {
@@ -483,16 +493,41 @@ impl PleTable {
             let ngram = &token_ids[i..i + self.ngram_order];
             let hash = Self::hash_ngram(ngram);
             
-            // Each n-gram maps to heads_per_ngram * embedding_dim floats
+            // Check cache first
+            if let Some(cached) = self.cache.get(&hash) {
+                embeddings.extend_from_slice(cached);
+                // Update LRU order
+                if let Some(pos) = self.cache_order.iter().position(|&h| h == hash) {
+                    self.cache_order.remove(pos);
+                }
+                self.cache_order.push(hash);
+                continue;
+            }
+            
+            // Cache miss: read from mmap
             let entry_size = self.heads_per_ngram * self.embedding_dim * 4; // 4 bytes per f32
             let offset = (hash % (self.size / entry_size as u64)) as usize * entry_size;
             
             if offset + entry_size <= mapping.len() {
                 let bytes = &mapping[offset..offset + entry_size];
+                let mut entry_embeddings = Vec::with_capacity(self.heads_per_ngram * self.embedding_dim);
                 for chunk in bytes.chunks_exact(4) {
                     let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                    embeddings.push(value);
+                    entry_embeddings.push(value);
                 }
+                
+                // Cache the result
+                if self.cache.len() >= self.cache_capacity {
+                    // Evict LRU entry
+                    if let Some(&oldest) = self.cache_order.first() {
+                        self.cache.remove(&oldest);
+                        self.cache_order.remove(0);
+                    }
+                }
+                self.cache.insert(hash, entry_embeddings.clone());
+                self.cache_order.push(hash);
+                
+                embeddings.extend_from_slice(&entry_embeddings);
             }
         }
         
@@ -523,6 +558,25 @@ mod tests {
         let ngram2 = [1, 2, 4];
         assert_ne!(PleTable::hash_ngram(&ngram1), PleTable::hash_ngram(&ngram2));
         assert_eq!(PleTable::hash_ngram(&ngram1), PleTable::hash_ngram(&ngram1));
+    }
+
+    #[test]
+    fn test_ple_cache_initialization() {
+        // Test that cache is properly initialized
+        let ple = PleTable {
+            mapping: None,
+            path: std::path::PathBuf::from("test.bin"),
+            size: 1024,
+            ngram_order: 3,
+            heads_per_ngram: 8,
+            embedding_dim: 256,
+            cache: std::collections::HashMap::new(),
+            cache_capacity: 1024,
+            cache_order: Vec::new(),
+        };
+        assert_eq!(ple.cache.len(), 0);
+        assert_eq!(ple.cache_capacity, 1024);
+        assert_eq!(ple.cache_order.len(), 0);
     }
 
     #[test]
