@@ -2395,16 +2395,12 @@ impl Layer {
             (Some(moe), _) => {
                 let (moe_out, _) = moe.forward(&buf);
                 let _t = prof::start(prof::RESIDUAL);
-                for i in 0..h {
-                    x[i] += moe_out[i];
-                }
+                kernel::axpy(x, &moe_out, 1.0);
             }
             (None, mlp) => {
                 mlp.as_ref().unwrap().forward(&buf, &mut res);
                 let _t = prof::start(prof::RESIDUAL);
-                for i in 0..h {
-                    x[i] += res[i];
-                }
+                kernel::axpy(x, &res, 1.0);
             }
         }
     }
@@ -2450,9 +2446,7 @@ impl Layer {
                 // written before it is read back.
                 if moe.prefill(&buf, &mut res) {
                     let _t = prof::start(prof::RESIDUAL);
-                    for j in 0..xs.len() {
-                        xs[j] += res[j];
-                    }
+                    kernel::axpy(xs, &res, 1.0);
                 } else {
                     for i in 0..n {
                         let (moe_out, _) = moe.forward(&buf[i * h..(i + 1) * h]);
@@ -2464,9 +2458,7 @@ impl Layer {
             (None, mlp) => {
                 mlp.as_ref().unwrap().prefill(&buf, &mut res);
                 let _t = prof::start(prof::RESIDUAL);
-                for i in 0..xs.len() {
-                    xs[i] += res[i];
-                }
+                kernel::axpy(xs, &res, 1.0);
             }
         }
     }
@@ -2737,10 +2729,10 @@ impl Model {
     pub fn prefill_device(&self, xs: &mut [f32], st: &mut [LayerState], pos0: usize) {
         let h = self.cfg.hidden_size;
         let n = xs.len() / h;
-        // For now, fall back to token-by-token forward (no behavior change).
-        // Phase 2 will batch the dense projections on device.
+        // Reuse a single buffer instead of allocating per token
+        let mut x = vec![0f32; h];
         for i in 0..n {
-            let mut x = xs[i * h..(i + 1) * h].to_vec();
+            x.copy_from_slice(&xs[i * h..(i + 1) * h]);
             self.forward(&mut x, st, pos0 + i);
             xs[i * h..(i + 1) * h].copy_from_slice(&x);
         }
