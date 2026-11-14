@@ -98,6 +98,11 @@ pub fn set_threads(n: usize) {
     POOL_SIZE.store(n.max(1), std::sync::atomic::Ordering::Relaxed);
 }
 
+/// How many worker threads the pool is currently configured for.
+pub fn get_threads() -> usize {
+    POOL_SIZE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// How many physical cores the machine reports, or 0 when its topology cannot
 /// be read here.
 pub fn physical_cores() -> usize {

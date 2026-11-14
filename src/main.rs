@@ -109,6 +109,13 @@ fn mib(b: usize) -> f64 {
 fn main() {
     let all: Vec<String> = std::env::args().skip(1).collect();
     let cmd = all.first().cloned().unwrap_or_else(|| "help".to_string());
+    
+    // Handle version flags before command parsing
+    if cmd == "--version" || cmd == "-V" || cmd == "-v" {
+        println!("fennec {}", fennec::VERSION);
+        return;
+    }
+    
     let opts = parse(&all[1.min(all.len())..]);
     let cores = kernel::default_threads();
     let threads = opts.usize_at("threads", cores);
@@ -144,7 +151,8 @@ fn main() {
 fn usage() {
     println!(
         "fennec {} — one engine built from fox + colibri + rabbit\n\n\
-         usage: fennec <command> [dir] [options]\n\n\
+         usage: fennec <command> [dir] [options]\n\
+         \x20       fennec --version\n\n\
          commands\n\
          \x20 info              checkpoint config, shards and tensor inventory\n\
          \x20 doctor            named health checks as JSON, for the desktop panel\n\
@@ -154,7 +162,8 @@ fn usage() {
          \x20 bench             int4 expert throughput on real weights\n\
          \x20 decode            run the plan: greedy tokens, measured against predicted ms\n\
          \x20 run               one prompt, streamed to the terminal\n\
-         \x20 serve             OpenAI-compatible HTTP on loopback\n\n\
+         \x20 serve             OpenAI-compatible HTTP on loopback\n\
+         \x20 help              show this help message\n\n\
          options\n\
          \x20 --group 32        quant group width (32 is the AVX2 path)\n\
          \x20 --threads N       default: one worker per physical core\n\
@@ -227,7 +236,7 @@ fn info(opts: &Opts) -> Result<(), String> {
     let mut expert_tensors = 0usize;
     let mut expert_bytes = 0usize;
     for name in sh.names() {
-        let i = sh.info(name).unwrap();
+        let i = sh.info(name).ok_or_else(|| format!("missing tensor info for {name}"))?;
         let e = by_dtype.entry(format!("{:?}", i.dtype)).or_insert((0, 0));
         e.0 += 1;
         e.1 += i.bytes();
@@ -886,7 +895,12 @@ impl SidecarWriter {
             .clone();
         let at = |k: &str| -> Result<(usize, usize), String> {
             let a = item[k].as_array().ok_or_else(|| format!("{name}: {k} is not a pair"))?;
-            Ok((a[0].as_u64().unwrap() as usize, a[1].as_u64().unwrap() as usize))
+            if a.len() < 2 {
+                return Err(format!("{name}: {k} array has {} elements, expected 2", a.len()));
+            }
+            let v0 = a[0].as_u64().ok_or_else(|| format!("{name}: {k}[0] is not a u64"))?;
+            let v1 = a[1].as_u64().ok_or_else(|| format!("{name}: {k}[1] is not a u64"))?;
+            Ok((v0 as usize, v1 as usize))
         };
         let off = self.len;
         let (d0, d1) = at("data")?;

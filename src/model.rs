@@ -1670,6 +1670,7 @@ impl GdnLayer {
         let (h, cd, kd, vd) = (cfg.hidden_size, cfg.conv_dim(), cfg.key_dim(), cfg.value_dim());
         let (nv, nk) = (cfg.linear_num_value_heads, cfg.linear_num_key_heads);
         let (dk, dv) = (cfg.linear_key_head_dim, cfg.linear_value_head_dim);
+        debug_assert!(nk > 0, "linear_num_key_heads must be > 0 for GDN layers");
         let mut g = d.gpu.lock().unwrap();
         if !st.mirrored {
             g.write_buf(m.conv_state, 0, &f32_bytes(&st.conv)).unwrap();
@@ -2206,6 +2207,8 @@ impl AttnLayer {
         let nh = cfg.num_attention_heads;
         let nkv = cfg.num_key_value_heads;
         let hd = cfg.head_dim;
+        debug_assert!(nkv > 0, "num_key_value_heads must be > 0 for attention layers");
+        debug_assert!(nh >= nkv, "num_attention_heads must be >= num_key_value_heads");
         let rot = cfg.rotary_dim();
         let eps = cfg.rms_norm_eps as f32;
         let stride = if cfg.attn_output_gate { hd * 2 } else { hd };

@@ -507,11 +507,62 @@ impl Server {
                 let m = self.model.lock().map_err(|_| "model mutex poisoned")?;
                 write_json(sock, 200, &json!({
                     "layers_loaded": m.layers.len(),
+                    "layers_total": self.cfg.num_hidden_layers,
+                    "first_layer": m.first,
                     "hidden_size": self.cfg.hidden_size,
-                    "num_hidden_layers": self.cfg.num_hidden_layers,
-                    "vocab_size": self.cfg.vocab_size,
-                    "device": m.gpu.is_some(),
-                    "threads": m.threads,
+                    "num_experts": self.cfg.num_experts,
+                    "moe_intermediate_size": self.cfg.moe_intermediate_size,
+                    "is_moe": self.cfg.is_moe(),
+                }))
+            }
+            ("GET", "/diagnostics") => {
+                // Comprehensive diagnostics for desktop app and IDE plugins.
+                // Combines health, metrics, system info, and device status.
+                let m = self.model.lock().map_err(|_| "model mutex poisoned")?;
+                let g = self.stats.generated.load(Relaxed);
+                let busy = self.stats.busy_ns.load(Relaxed) as f64 / 1e9;
+                let expert_stats: Vec<Value> = m.layers.iter().enumerate().map(|(i, l)| {
+                    let moe = l.moe.as_ref();
+                    json!({
+                        "layer": m.first + i,
+                        "device_hits": moe.map_or(0, |m| m.dev_hits.load(Relaxed)),
+                        "host_hits": moe.map_or(0, |m| m.host_hits.load(Relaxed)),
+                        "disk_hits": moe.map_or(0, |m| m.disk_hits.load(Relaxed)),
+                    })
+                }).collect();
+                write_json(sock, 200, &json!({
+                    "engine": {
+                        "name": "fennec",
+                        "version": crate::VERSION,
+                        "status": "ok",
+                        "uptime_s": self.started.elapsed().as_secs(),
+                    },
+                    "model": {
+                        "id": self.model_id,
+                        "layers_loaded": m.layers.len(),
+                        "layers_total": self.cfg.num_hidden_layers,
+                        "first_layer": m.first,
+                        "hidden_size": self.cfg.hidden_size,
+                        "num_experts": self.cfg.num_experts,
+                        "moe_intermediate_size": self.cfg.moe_intermediate_size,
+                        "is_moe": self.cfg.is_moe(),
+                        "max_context": self.max_ctx,
+                        "vision": false,
+                    },
+                    "performance": {
+                        "requests": self.stats.requests.load(Relaxed),
+                        "prompt_tokens": self.stats.prompt_tokens.load(Relaxed),
+                        "generated_tokens": g,
+                        "busy_seconds": busy,
+                        "tokens_per_second": if busy > 0.0 { g as f64 / busy } else { 0.0 },
+                    },
+                    "experts": expert_stats,
+                    "system": {
+                        "threads": crate::kernel::get_threads(),
+                        "physical_cores": crate::kernel::physical_cores(),
+                        "dense_int4": crate::model::dense_int4(),
+                        "dense_i8": crate::model::dense_i8(),
+                    },
                 }))
             }
             ("POST", "/v1/chat/completions") => {
