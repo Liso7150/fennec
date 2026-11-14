@@ -560,12 +560,16 @@ fn dense_projections_on_the_device_match_the_cpu_stack() {
 
     // A silent fallback to the CPU would pass the numeric comparison and prove
     // nothing, so assert the move happened and the host copies were released.
+    // A device plan therefore has no batched prompt path either (`prefill_ready`
+    // is false), which is measured, not assumed: see `Model::prefill_ready`.
     let gdn = dev.layers[0].gdn.as_ref().unwrap();
     let attn = dev.layers[1].attn.as_ref().unwrap();
     assert!(gdn.dev.is_some(), "the delta net did not move to the device");
     assert!(attn.dev.is_some(), "attention did not move to the device");
     assert!(gdn.in_qkv.is_empty() && gdn.out_proj.is_empty(), "the delta net host copy was not released");
     assert!(attn.q.is_empty() && attn.o.is_empty(), "the attention host copy was not released");
+    assert!(!dev.prefill_ready(), "a device plan claims a batch prompt path it dropped");
+    assert!(cpu.prefill_ready(), "the host stack keeps its batch prompt path");
 
     let toks = [15059usize, 9948, 271, 1024];
     let (mut sa, mut sb) = (cpu.states(8), dev.states(8));

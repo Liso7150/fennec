@@ -20,6 +20,32 @@ use crate::model::Model;
 use crate::safetensors::Shards;
 use crate::tokenizer::{chat_prompt, Tokenizer};
 
+/// Prompt tokens per prefill chunk. A chunk is the batch the dense trunk's
+/// weight rows are reused across, so bigger is cheaper until the chunk's own
+/// activations stop fitting a core's L2: at the shipped model's 2048-wide
+/// hidden state the slab is 128 KiB at 16 tokens and 256 KiB at 32, against
+/// 1-2 MB of L2. Long prompts simply run the loop again, and the buffers stay
+/// one chunk wide either way.
+///
+/// 32 beat 16 in every pairing of a four-run session (TTFT 1.875 s twice,
+/// against 1.906 s then 2.015 s at 16) and left TPOT to the session drift, as
+/// it should: the experts a token routes to are per-token work no chunk size
+/// amortises, so this buys back the dense trunk passes and nothing else.
+const PREFILL_CHUNK: usize = 32;
+
+/// Where the token-by-token loop starts. The chunked prefill leaves the prompt
+/// in the layer states up to the last token, so the loop resumes there; a
+/// device tier has no batched path, and then the loop owns every prompt token.
+/// Getting this wrong is not slow, it is silent: the model answers the last
+/// prompt token as if it were the whole conversation.
+fn first_forward(prompt_len: usize, batched: bool) -> usize {
+    if batched {
+        prompt_len.saturating_sub(1)
+    } else {
+        0
+    }
+}
+
 pub struct Stats {
     pub requests: AtomicU64,
     pub prompt_tokens: AtomicU64,
@@ -202,17 +228,45 @@ impl Server {
         let mut produced = 0usize;
         let mut finish = "length";
 
-        for t in 0..ids.len() + max_new {
+        // Prefill takes the prompt in chunks, one pass over the dense trunk per
+        // chunk instead of one per token, and stops one token short so the
+        // logits path below stays exactly where it was. Generation stays token
+        // by token: a new token is the argument to the next forward. A device
+        // tier uses device-side batched prefill (Phase 1: loops through forward,
+        // Phase 2: actual GPU batching). Running the device prompt through host
+        // kernels measured 2166 ms against 1750 ms on the VRAM path, so the
+        // device tier keeps its own batched path.
+        let prompt_len = ids.len();
+        let batched = prompt_len > 1 && (model.prefill_ready() || model.prefill_device_ready());
+        let first = first_forward(prompt_len, batched);
+        if batched {
+            let mut xs = vec![0f32; PREFILL_CHUNK.min(first) * h];
+            let nrow = xs.len() / h;
+            let mut c0 = 0usize;
+            while c0 < first {
+                let n = nrow.min(first - c0);
+                for (i, &id) in ids[c0..c0 + n].iter().enumerate() {
+            let row = model.embed_row(&self.shards, id as usize)?;
+                    xs[i * h..(i + 1) * h].copy_from_slice(&row);
+                }
+                if model.prefill_device_ready() {
+                    model.prefill_device(&mut xs[..n * h], &mut st, c0);
+                } else {
+                    model.prefill(&mut xs[..n * h], &mut st, c0);
+                }
+                c0 += n;
+            }
+            crate::prof::split(first);
+        }
+        let end = prompt_len + max_new;
+        for t in first..end {
             let mut x = model.embed_row(&self.shards, ids[t] as usize)?;
             model.forward(&mut x, &mut st, t);
             if t + 1 < ids.len() {
                 continue;
             }
             crate::kernel::rmsnorm(&x, &model.norm, eps, &mut hn);
-            {
-                let _t = crate::prof::start(crate::prof::HEAD);
-                model.logits(&self.shards, &hn, &mut logits)?;
-            }
+            model.logits(&self.shards, &hn, &mut logits)?;
             let next = s.pick(&logits, &mut rng) as u32;
             if self.tok.eos.contains(&next) {
                 finish = "stop";
@@ -277,11 +331,23 @@ impl Server {
             let role = m["role"].as_str().ok_or("each message needs a role")?;
             let content = match &m["content"] {
                 Value::String(s) => s.clone(),
-                Value::Array(parts) => parts
-                    .iter()
-                    .filter_map(|p| p["text"].as_str())
-                    .collect::<Vec<_>>()
-                    .join(""),
+                Value::Array(parts) => {
+                    let mut text = String::new();
+                    for part in parts {
+                        match part["text"].as_str() {
+                            Some(t) => text.push_str(t),
+                            // A part without readable text used to be filtered out, so an
+                            // image-bearing request was answered from its caption alone and
+                            // every client showed that as an analyzed image. This checkpoint
+                            // has no vision tower: refuse instead of quietly losing input.
+                            None => return Err(format!(
+                                "content part `{}` is not text: this engine analyzes no images",
+                                part["type"].as_str().unwrap_or("unknown")
+                            )),
+                        }
+                    }
+                    text
+                }
                 Value::Null => String::new(),
                 _ => return Err("content must be a string or an array of text parts".into()),
             };
@@ -349,7 +415,7 @@ impl Server {
             self.stats.prompt_tokens.fetch_add(n_prompt as u64, Relaxed);
             self.stats.generated.fetch_add(n as u64, Relaxed);
             self.stats.busy_ns.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
-            profile_dump(n, t0.elapsed().as_secs_f64() * 1e3);
+            profile_dump(t0.elapsed().as_secs_f64() * 1e3);
             let usage = json!({"prompt_tokens": n_prompt, "completion_tokens": n,
                                "total_tokens": n_prompt + n});
             let last = json!({
@@ -377,7 +443,7 @@ impl Server {
         self.stats.prompt_tokens.fetch_add(n_prompt as u64, Relaxed);
         self.stats.generated.fetch_add(n as u64, Relaxed);
         self.stats.busy_ns.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
-        profile_dump(n, t0.elapsed().as_secs_f64() * 1e3);
+        profile_dump(t0.elapsed().as_secs_f64() * 1e3);
         let mut message = json!({"role": "assistant", "content": content});
         if !reasoning.is_empty() {
             message["reasoning_content"] = json!(reasoning);
@@ -401,6 +467,7 @@ impl Server {
         match (method, path) {
             ("GET", "/health") => write_json(sock, 200, &json!({
                 "status": "ok", "engine": "fennec", "version": crate::VERSION,
+                "vision": false,
                 "model": self.model_id, "uptime_s": self.started.elapsed().as_secs(),
             })),
             ("GET", "/v1/models") => write_json(sock, 200, &json!({
@@ -543,18 +610,10 @@ fn write_json(sock: &mut TcpStream, code: u16, v: &Value) -> Result<(), String> 
 /// The stage split for one request, when FENNEC_PROFILE is on. `serve` is what
 /// the benchmark harness drives, and it warms up first: a breakdown from `run`
 /// or `decode` instead would be measuring cold page faults, not steady state.
-fn profile_dump(n: usize, wall_ms: f64) {
-    if !crate::prof::enabled() {
-        return;
+fn profile_dump(wall_ms: f64) {
+    if crate::prof::enabled() {
+        eprint!("{}", crate::prof::report(wall_ms));
     }
-    let steps = n.max(1) as f64;
-    let ms = crate::prof::millis();
-    let sum: f64 = ms.iter().sum();
-    eprintln!("  stage breakdown (ms/token, {n} steps, prefill included):");
-    for (name, v) in crate::prof::STAGES.iter().zip(&ms) {
-        eprintln!("    {name:<20} {:7.2}  {:5.1}%", v / steps, 100.0 * v / sum.max(1e-9));
-    }
-    eprintln!("    {:<20} {:7.2}  (wall {:.2})", "accounted", sum / steps, wall_ms / steps);
 }
 
 /// Read one request. Bodies are capped: this is a loopback engine, not a proxy,
@@ -715,5 +774,44 @@ mod tests {
         };
         assert_eq!(run(0x5EED), run(0x5EED));
         assert_ne!(run(0x5EED), run(0x5EEE));
+    }
+
+    #[test]
+    fn text_parts_join_and_an_image_part_refuses_to_be_ignored() {
+        let plain = json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "look at "}, {"type": "input_text", "text": "this"}]}]});
+        assert_eq!(Server::messages(&plain).unwrap(),
+                   vec![("user".to_string(), "look at this".to_string())]);
+
+        for image in [
+            json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}),
+            json!({"type": "input_image", "url": "data:image/png;base64,AAAA"}),
+        ] {
+            let body = json!({"messages": [{"role": "user", "content": [
+                {"type": "text", "text": "what is in this?"}, image]}]});
+            let error = Server::messages(&body).unwrap_err();
+            assert!(error.contains("analyzes no images"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_batched_prefill_hands_the_loop_the_last_prompt_token_only() {
+        // The chunked prefill covers the prompt up to the token whose logits
+        // come first, so the token loop resumes there. `saturating_sub` because
+        // a one-token prompt has nothing to prefill.
+        assert_eq!(first_forward(30, true), 29);
+        assert_eq!(first_forward(1, true), 0);
+        assert_eq!(first_forward(0, true), 0);
+    }
+
+    #[test]
+    fn a_plan_without_a_batched_path_walks_the_whole_prompt() {
+        // This is the device tier: `prefill_ready` is false because the dense
+        // projections live in VRAM, so starting the loop at the last prompt
+        // token would drop everything before it. The output stays fluent and
+        // the TTFT looks wonderful, which is why the bound is a named function.
+        for prompt_len in [0usize, 1, 2, 30, 4096] {
+            assert_eq!(first_forward(prompt_len, false), 0, "{prompt_len} tokens");
+        }
     }
 }

@@ -98,6 +98,28 @@ pub fn set_threads(n: usize) {
     POOL_SIZE.store(n.max(1), std::sync::atomic::Ordering::Relaxed);
 }
 
+/// How many physical cores the machine reports, or 0 when its topology cannot
+/// be read here.
+pub fn physical_cores() -> usize {
+    placement::physical_cores()
+}
+
+/// The thread count to default to: one worker per physical core.
+///
+/// Measured on the CPU tier of a 6-performance + 10-efficiency-core part (22
+/// logical): 16 threads median 8.91 s, 8 threads 10.26 s, and the logical count
+/// 22 was both slower and noisier than either. Siblings beyond a core's own
+/// vector unit split that unit instead of adding one, so `available_parallelism`
+/// is the wrong ceiling for a bandwidth-bound kernel. Where the topology is
+/// unreadable, keep the logical count.
+pub fn default_threads() -> usize {
+    let logical = std::thread::available_parallelism().map(|v| v.get()).unwrap_or(1);
+    match placement::physical_cores() {
+        0 => logical,
+        phys => phys.min(logical).max(1),
+    }
+}
+
 /// Which logical processors belong to the fast cores, and pinning to them.
 ///
 /// A hybrid part schedules a freshly spawned thread wherever it likes. An
@@ -122,9 +144,10 @@ mod placement {
         fn SetThreadAffinityMask(thread: *mut c_void, mask: usize) -> usize;
     }
 
-    /// Affinity masks of the highest-efficiency-class cores, one per physical
-    /// core. Empty when the topology cannot be read or has no classes to split.
-    pub fn performance_masks() -> Vec<u64> {
+    /// One entry per physical core: its efficiency class and, for the cores
+    /// inside the first processor group, the mask of the logical processors that
+    /// live in it.
+    fn cores() -> Vec<(u8, Option<u64>)> {
         let mut len = 0u32;
         // The first call is a size query and is expected to fail.
         unsafe { GetLogicalProcessorInformationEx(RELATION_PROCESSOR_CORE, std::ptr::null_mut(), &mut len) };
@@ -137,7 +160,7 @@ mod placement {
             return Vec::new();
         }
         let base = buf.as_ptr() as *const u8;
-        let mut cores: Vec<(u8, u64)> = Vec::new();
+        let mut out = Vec::new();
         let mut at = 0usize;
         while at + 48 <= len as usize {
             // SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX: Relationship u32 @0,
@@ -147,16 +170,23 @@ mod placement {
             if size < 48 || at + size > len as usize {
                 break;
             }
-            if unsafe { *(base.add(at) as *const u32) } == RELATION_PROCESSOR_CORE
-                && unsafe { *(base.add(at + 30) as *const u16) } == 1
-            {
+            if unsafe { *(base.add(at) as *const u32) } == RELATION_PROCESSOR_CORE {
                 // More than one processor group means more than 64 logical CPUs,
-                // where a mask alone does not identify a core. Leave those
-                // machines unpinned rather than pin to the wrong group.
-                cores.push((unsafe { *base.add(at + 9) }, unsafe { *(base.add(at + 32) as *const u64) }));
+                // where a mask alone does not identify a core. The core still
+                // counts as a core; only its mask is unknowable here.
+                let mask = (unsafe { *(base.add(at + 30) as *const u16) } == 1)
+                    .then(|| unsafe { *(base.add(at + 32) as *const u64) });
+                out.push((unsafe { *base.add(at + 9) }, mask));
             }
             at += size;
         }
+        out
+    }
+
+    /// Affinity masks of the highest-efficiency-class cores, one per physical
+    /// core. Empty when the topology cannot be read or has no classes to split.
+    pub fn performance_masks() -> Vec<u64> {
+        let cores = cores();
         let best = match cores.iter().map(|&(e, _)| e).max() {
             Some(b) => b,
             None => return Vec::new(),
@@ -166,7 +196,14 @@ mod placement {
         if cores.iter().all(|&(e, _)| e == best) {
             return Vec::new();
         }
-        cores.into_iter().filter(|&(e, _)| e == best).map(|(_, m)| m).collect()
+        cores.into_iter().filter(|&(e, _)| e == best).filter_map(|(_, m)| m).collect()
+    }
+
+    /// How many physical cores the machine has. SMT siblings live inside one
+    /// core record, so this is the count of independent vector units rather than
+    /// the logical CPU count `available_parallelism` reports.
+    pub fn physical_cores() -> usize {
+        cores().len()
     }
 
     pub fn pin(mask: u64) -> bool {
@@ -176,13 +213,38 @@ mod placement {
 
 #[cfg(not(windows))]
 mod placement {
-    /// No topology query here yet: Linux and macOS keep the unpinned pool.
+    /// No affinity query here: Linux and macOS keep the unpinned pool.
     pub fn performance_masks() -> Vec<u64> {
         Vec::new()
     }
 
     pub fn pin(_mask: u64) -> bool {
         false
+    }
+
+    /// One physical core per distinct thread-siblings set. CPU enumeration stops
+    /// at the first gap, which is where a machine's numbering always ends.
+    #[cfg(target_os = "linux")]
+    pub fn physical_cores() -> usize {
+        use std::collections::HashSet;
+        let mut sets = HashSet::new();
+        for cpu in 0.. {
+            let dir = format!("/sys/devices/system/cpu/cpu{cpu}");
+            if !std::path::Path::new(&dir).exists() {
+                break;
+            }
+            if let Ok(s) = std::fs::read_to_string(format!("{dir}/topology/thread_siblings_list")) {
+                sets.insert(s.trim().to_string());
+            }
+        }
+        sets.len()
+    }
+
+    /// No topology query on macOS: Apple Silicon ships no SMT, so the logical
+    /// count is already the physical one and the caller's fallback is correct.
+    #[cfg(not(target_os = "linux"))]
+    pub fn physical_cores() -> usize {
+        0
     }
 }
 
@@ -196,7 +258,7 @@ fn pool() -> Arc<Pool> {
             done_cv: Condvar::new(),
         });
         let n = match POOL_SIZE.load(std::sync::atomic::Ordering::Relaxed) {
-            0 => std::thread::available_parallelism().map(|v| v.get()).unwrap_or(1),
+            0 => default_threads(),
             v => v,
         };
         // Pinning only pays when every worker gets a physical core to itself.
@@ -539,6 +601,130 @@ pub fn gemv_i8(
             let r = start + i;
             let row = &w[r * cols..(r + 1) * cols];
             *o = row_dot_i8(row, &xu, wsum[r], scale[r] * sx, vec);
+        }
+    });
+}
+
+/// A chunk of prompt tokens through one `rows` x `cols` projection, in a single
+/// pass over the weights.
+///
+/// Prefill has a whole prompt's worth of activations and the same dense trunk
+/// every token walks. One token at a time re-reads the matrix once per token;
+/// here each weight row is read once and reused for all `n` tokens, so the
+/// weight traffic is independent of the chunk. The cost is the activation slab
+/// (`n` x `cols` floats), which every row re-reads - at a 16-token chunk and a
+/// 4096-wide hidden state that is 256 KiB, which stays in the core's own L2
+/// while the 8 KiB weight row lives in L1.
+///
+/// Every output is still exactly one dot over the same columns in the same
+/// order, on the same side of the same row partition `gemv` would have used, so
+/// the result is bit-identical to `n` single-token calls. `n == 1` forwards to
+/// the single-token kernel and is the same code path decode takes.
+pub fn gemv_batch(w: &[f32], rows: usize, cols: usize, xs: &[f32], out: &mut [f32], threads: usize) {
+    let n = xs.len() / cols;
+    debug_assert_eq!(w.len(), rows * cols);
+    debug_assert_eq!(xs.len(), n * cols);
+    debug_assert_eq!(out.len(), n * rows);
+    if n == 1 {
+        gemv(w, rows, cols, xs, &mut out[..rows], threads);
+        return;
+    }
+    let op = SharedPtr::new(out.as_mut_ptr());
+    par_index(rows, budget(threads, rows, cols), |r0, cnt| {
+        for r in r0..r0 + cnt {
+            let wr = &w[r * cols..(r + 1) * cols];
+            for t in 0..n {
+                let s = dot(wr, &xs[t * cols..(t + 1) * cols]);
+                unsafe { *op.at(t * rows + r) = s };
+            }
+        }
+    });
+}
+
+/// `gemv_batch` for a two-byte checkpoint, decoding each weight pair as it
+/// arrives the way [`gemv_half`] does.
+pub fn gemv_half_batch(
+    w: &[u8],
+    rows: usize,
+    cols: usize,
+    xs: &[f32],
+    out: &mut [f32],
+    threads: usize,
+    fmt: Half,
+) {
+    let n = xs.len() / cols;
+    debug_assert_eq!(w.len(), rows * cols * 2);
+    debug_assert_eq!(xs.len(), n * cols);
+    debug_assert_eq!(out.len(), n * rows);
+    if n == 1 {
+        gemv_half(w, rows, cols, xs, &mut out[..rows], threads, fmt);
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    let vec = cols >= 8
+        && std::is_x86_feature_detected!("avx2")
+        && (fmt == Half::Bf16 || std::is_x86_feature_detected!("f16c"));
+    #[cfg(not(target_arch = "x86_64"))]
+    let vec = false;
+    let op = SharedPtr::new(out.as_mut_ptr());
+    par_index(rows, budget(threads, rows, cols), |r0, cnt| {
+        for r in r0..r0 + cnt {
+            let row = &w[r * cols * 2..(r + 1) * cols * 2];
+            for t in 0..n {
+                let s = row_dot(row, &xs[t * cols..(t + 1) * cols], fmt, vec);
+                unsafe { *op.at(t * rows + r) = s };
+            }
+        }
+    });
+}
+
+/// `gemv_batch` for an int8 projection. Each token gets its own activation scale
+/// and offset-binary copy, which is exactly the prep the single-token kernel
+/// does for its one vector, so the per-token numbers are unchanged.
+pub fn gemv_i8_batch(
+    w: &[i8],
+    wsum: &[i32],
+    scale: &[f32],
+    rows: usize,
+    cols: usize,
+    xs: &[f32],
+    out: &mut [f32],
+    threads: usize,
+) {
+    let n = xs.len() / cols;
+    debug_assert_eq!(w.len(), rows * cols);
+    debug_assert_eq!(xs.len(), n * cols);
+    debug_assert_eq!(out.len(), n * rows);
+    if n == 1 {
+        gemv_i8(w, wsum, scale, rows, cols, xs, &mut out[..rows], threads);
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    let vec = cols >= 32 && std::is_x86_feature_detected!("avx2");
+    #[cfg(not(target_arch = "x86_64"))]
+    let vec = false;
+    let mut xu = vec![0u8; n * cols];
+    let mut sx = vec![1f32; n];
+    for t in 0..n {
+        let x = &xs[t * cols..(t + 1) * cols];
+        let amax = x.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let s = if amax > 0.0 { amax / 63.0 } else { 1.0 };
+        sx[t] = s;
+        let inv = 1.0 / s;
+        let dst = &mut xu[t * cols..(t + 1) * cols];
+        for (i, &v) in x.iter().enumerate() {
+            let q = (v * inv).round().clamp(-63.0, 63.0) as i32;
+            dst[i] = (q + 64) as u8;
+        }
+    }
+    let op = SharedPtr::new(out.as_mut_ptr());
+    par_index(rows, budget(threads, rows, cols), |r0, cnt| {
+        for r in r0..r0 + cnt {
+            let row = &w[r * cols..(r + 1) * cols];
+            for t in 0..n {
+                let s = row_dot_i8(row, &xu[t * cols..(t + 1) * cols], wsum[r], scale[r] * sx[t], vec);
+                unsafe { *op.at(t * rows + r) = s };
+            }
         }
     });
 }
@@ -1134,4 +1320,87 @@ mod tests {
             }
         }
     }
+
+    /// Prefill reads a projection's weights once for a whole chunk of tokens
+    /// instead of once per token. That is only allowed to be a bandwidth change:
+    /// every output still has to be the same dot, over the same columns in the
+    /// same order, on the same side of the same row partition the token loop
+    /// would have used. So this asserts *bits*, not a tolerance - a tolerance
+    /// here would let a real divergence in the shipped prompt path through.
+    ///
+    /// The three layouts are the three a `Dense` can hold, and the three shapes
+    /// cover the cases the row split can collapse: `3 x 2048` falls to one
+    /// worker under `budget`, `5 x 2051` walks the vector tail, and
+    /// `4096 x 512` actually runs eight workers.
+    #[test]
+    fn a_gemv_batch_is_bit_identical_to_the_same_call_per_token() {
+        for (rows, cols) in [(3usize, 2048usize), (5, 2051), (4096, 512)] {
+            let wf: Vec<f32> = (0..rows * cols)
+                .map(|k| (k as f32 * 0.37).sin() * 0.25)
+                .collect();
+            // two-byte and one-byte mirrors of the same numbers, so all three
+            // layouts are checked on weights the eye can trace back to one list
+            let mut wh = vec![0u8; rows * cols * 2];
+            let mut wi = Vec::<i8>::with_capacity(rows * cols);
+            let mut wsum = vec![0i32; rows];
+            for k in 0..rows * cols {
+                let bits = (wf[k].to_bits() >> 16) as u16;
+                wh[k * 2..k * 2 + 2].copy_from_slice(&bits.to_le_bytes());
+                let b = (wf[k] * 127.0).round().clamp(-127.0, 127.0) as i8;
+                wsum[k / cols] += b as i32;
+                wi.push(b);
+            }
+            let scale: Vec<f32> = (0..rows).map(|r| 0.01 + r as f32 * 1e-5).collect();
+            let xs: Vec<f32> = (0..16 * cols).map(|k| (k as f32 * 0.13).sin() * 0.75).collect();
+            // A shared buffer of zeros would pass any equality, so the same
+            // check also insists the batch produced real, finite numbers.
+            let check = |got: &[f32], want: &[f32], what: &str, n: usize, threads: usize| {
+                assert!(
+                    got.iter().all(|v| v.is_finite()) && got.iter().any(|v| *v != 0.0),
+                    "{what}: {rows}x{cols} produced no usable outputs"
+                );
+                for i in 0..got.len() {
+                    assert_eq!(
+                        got[i].to_bits(), want[i].to_bits(),
+                        "{what}: {rows}x{cols} n {n} threads {threads} out {i}: {} vs {}",
+                        got[i], want[i]
+                    );
+                }
+            };
+            for n in [1usize, 2, 7, 16] {
+                for threads in [1usize, 4, 16] {
+                    let mut got = vec![0f32; n * rows];
+                    let mut want = vec![0f32; n * rows];
+                    gemv_batch(&wf, rows, cols, &xs[..n * cols], &mut got, threads);
+                    for t in 0..n {
+                        let o = &mut want[t * rows..(t + 1) * rows];
+                        gemv(&wf, rows, cols, &xs[t * cols..(t + 1) * cols], o, threads);
+                    }
+                    check(&got, &want, "f32", n, threads);
+
+                    got.iter_mut().for_each(|v| *v = 0.0);
+                    want.iter_mut().for_each(|v| *v = 0.0);
+                    gemv_half_batch(&wh, rows, cols, &xs[..n * cols], &mut got, threads, Half::Bf16);
+                    for t in 0..n {
+                        let o = &mut want[t * rows..(t + 1) * rows];
+                        gemv_half(&wh, rows, cols, &xs[t * cols..(t + 1) * cols], o, threads, Half::Bf16);
+                    }
+                    check(&got, &want, "bf16", n, threads);
+
+                    got.iter_mut().for_each(|v| *v = 0.0);
+                    want.iter_mut().for_each(|v| *v = 0.0);
+                    gemv_i8_batch(&wi, &wsum, &scale, rows, cols, &xs[..n * cols], &mut got, threads);
+                    for t in 0..n {
+                        let o = &mut want[t * rows..(t + 1) * rows];
+                        gemv_i8(
+                            &wi, &wsum, &scale, rows, cols, &xs[t * cols..(t + 1) * cols], o, threads,
+                        );
+                    }
+                    check(&got, &want, "i8", n, threads);
+                }
+            }
+            println!("  {rows}x{cols}: f32, bf16 and i8 batches equal the token loop bit for bit");
+        }
+    }
 }
+

@@ -298,3 +298,63 @@ fn eight_tokens_walk_the_dense_stack_to_the_lm_head() {
         "the dense stack picked a different next token than transformers"
     );
 }
+
+/// Prefill reads every dense projection once per chunk of prompt tokens rather
+/// than once per token, which only pays if the answer is the answer the token
+/// loop would have produced. So this asserts exact bits, not a tolerance: the
+/// goldens above measure against transformers, which accumulates in its own
+/// order anyway, and a band that wide would hide a real divergence in the
+/// shipped prompt path.
+///
+/// Chunk sizes of the whole prompt, of one, and of three (so the last chunk is
+/// a remainder) cover what `serve` can hand it, including its bookkeeping.
+#[test]
+fn a_batched_prefill_is_bit_identical_to_the_token_loop() {
+    let Some((sh, c)) = ckpt() else { return };
+    let n_layers = c.num_hidden_layers;
+    let ids = fx("q3.ids");
+    let (n, h) = (ids.data.len(), c.hidden_size);
+    let m = Model::load(&sh, c.clone(), 0, n_layers, 32, 4, n).expect("load dense stack");
+    assert!(m.prefill_ready(), "a host-only stack can batch its projections");
+
+    // Both paths get the same input bytes: Fennec's own gather, not the
+    // reference float64 rows rounded a second time.
+    let emb: Vec<Vec<f32>> = (0..n)
+        .map(|t| m.embed_row(&sh, ids.data[t] as usize).expect("embed row"))
+        .collect();
+
+    let mut stepped = vec![0f32; n * h];
+    {
+        let mut st = m.states(n);
+        for t in 0..n {
+            let mut x = emb[t].clone();
+            m.forward(&mut x, &mut st, t);
+            stepped[t * h..(t + 1) * h].copy_from_slice(&x);
+        }
+    }
+
+    for chunk in [n, 1, 3] {
+        let mut st = m.states(n);
+        let mut xs = vec![0f32; h * chunk.min(n)];
+        let mut seen = 0usize;
+        while seen < n {
+            let k = chunk.min(n - seen);
+            for i in 0..k {
+                xs[i * h..(i + 1) * h].copy_from_slice(&emb[seen + i]);
+            }
+            m.prefill(&mut xs[..k * h], &mut st, seen);
+            for i in 0..k {
+                let a = &stepped[(seen + i) * h..(seen + i + 1) * h];
+                let b = &xs[i * h..(i + 1) * h];
+                let differ = a.iter().zip(b).filter(|(x, y)| x != y).count();
+                assert_eq!(
+                    differ, 0,
+                    "chunks of {chunk}, token {}: {differ} of {h} outputs differ from the loop",
+                    seen + i
+                );
+            }
+            seen += k;
+        }
+        println!("  {n} tokens in chunks of {chunk}: every layer bit-identical to the token loop");
+    }
+}

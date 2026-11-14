@@ -412,10 +412,51 @@ fn moe_block_forward_tracks_the_fp32_block() {
     assert_eq!(m.forward(&row32(&x.data, 0, h)).1.ids.len(), c.num_experts_per_tok);
 }
 
+/// The whole point of grouping a chunk's picks by expert is that the weight read
+/// is shared, so the arithmetic has to stay exactly the token loop's: same dots,
+/// same operands, same reduction order. Exact bits, not a band — the same reason
+/// `eight_tokens_walk_the_decoder_stack_to_the_lm_head` compares `!=` instead of
+/// calling `check`.
+#[test]
+fn grouped_expert_prefill_is_bit_identical_to_the_token_loop() {
+    let Some((sh, c)) = checkpoint() else { return };
+    let m = MoeLayer::load(&sh, c.clone(), 0, group_of(&sh, &c), 8).expect("load layer 0 mlp");
+    let (h, k) = (c.hidden_size, c.num_experts_per_tok);
+    let x = fx("moe.x");
+    let buf = f32s(&x.data);
+    let n = buf.len() / h;
+    let mut grouped = vec![0f32; n * h];
+    assert!(m.prefill(&buf, &mut grouped), "a {n}-row chunk groups its expert picks");
+    let mut differ = 0usize;
+    let mut ids = Vec::with_capacity(n * k);
+    for r in 0..n {
+        let (want, routing) = m.forward(&buf[r * h..(r + 1) * h]);
+        ids.extend(routing.ids);
+        for j in 0..h {
+            if want[j] != grouped[r * h + j] {
+                differ += 1;
+            }
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    println!(
+        "  grouped prefill of {n} rows: {differ} of {} floats differ from the token loop; \
+         {} picks over {} unique experts, so {} weight reads are shared",
+        n * h,
+        n * k,
+        ids.len(),
+        n * k - ids.len()
+    );
+    assert_eq!(differ, 0, "row outputs that differ from `n` calls of forward");
+    let mut one = vec![0f32; h];
+    assert!(!m.prefill(&buf[..h], &mut one), "a single row has no union to group");
+}
+
 #[test]
 fn gated_delta_net_matches_the_reference_recursion() {
     let Some((sh, c)) = checkpoint() else { return };
-    let g = GdnLayer::load(&sh, c.clone(), 0, 4).expect("load layer 0 linear_attn");
+    let g = GdnLayer::load(&sh, c.clone(), 0, 4, true).expect("load layer 0 linear_attn");
     let mut st = GdnState::new(&c);
     let (x, step, pre, states) = (fx("gdn.x"), fx("gdn.step_out"), fx("gdn.out_prefill"), fx("gdn.step_state"));
     let (n, h) = x.as2();
@@ -460,7 +501,7 @@ fn gated_delta_net_matches_the_reference_recursion() {
 #[test]
 fn attention_decodes_one_token_at_a_time_like_the_reference() {
     let Some((sh, c)) = checkpoint() else { return };
-    let a = AttnLayer::load(&sh, c.clone(), 3, 8, 4).expect("load layer 3 self_attn");
+    let a = AttnLayer::load(&sh, c.clone(), 3, 8, 4, true).expect("load layer 3 self_attn");
     let mut st = AttnState::new(&c, 16);
     let (x, want) = (fx("attn.x"), fx("attn.out"));
     let (n, h) = x.as2();
@@ -769,13 +810,39 @@ fn eight_tokens_walk_the_decoder_stack_to_the_lm_head() {
 
     let mut st = m.states(n);
     let mut x = vec![0f32; h];
+    let mut emb = vec![0f32; n * h];
+    let mut stepped = vec![0f32; n * h];
     for t in 0..n {
         x = m.embed_row(&sh, ids.data[t] as usize).expect("embed row");
+        emb[t * h..(t + 1) * h].copy_from_slice(&x);
         m.forward(&mut x, &mut st, t);
+        stepped[t * h..(t + 1) * h].copy_from_slice(&x);
     }
     let mut hn = vec![0f32; h];
     kernel::rmsnorm(&x, &m.norm, c.rms_norm_eps as f32, &mut hn);
     check_q("fwd.norm last tok", &row(&fx("fwd.norm").data, n - 1, h), &hn, 1e-5);
+
+    // Prefill reads each dense projection once for the whole prompt instead of
+    // once per token, so it has to be the token loop's own arithmetic: exact
+    // bits, because the 1e-5 band the checks above use would swallow a real
+    // divergence in the shipped prompt path. This is the copy that covers the
+    // gated-delta-net mixer - the dense lane's own version cannot see it.
+    assert!(m.prefill_ready(), "an all-host plan can batch its projections");
+    let mut px = emb.clone();
+    let mut st2 = m.states(n);
+    m.prefill(&mut px, &mut st2, 0);
+    let differ: Vec<usize> = (0..n)
+        .map(|t| {
+            let a = &stepped[t * h..(t + 1) * h];
+            let b = &px[t * h..(t + 1) * h];
+            a.iter().zip(b).filter(|(u, v)| u != v).count()
+        })
+        .collect();
+    println!(
+        "  batched prefill of {n} tokens: {} outputs differ from the token loop across {n_layers} layers",
+        differ.iter().sum::<usize>()
+    );
+    assert_eq!(differ.iter().sum::<usize>(), 0, "tokens that differ: {differ:?}");
 
     let t0 = std::time::Instant::now();
     let mut lg = vec![0f32; c.vocab_size];

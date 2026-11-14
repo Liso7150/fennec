@@ -30,6 +30,8 @@ pub mod mem;
 pub mod model;
 pub mod npy;
 pub mod ort;
+pub mod plugin;
+pub mod plugins;
 pub mod pool;
 pub mod prof;
 pub mod quant;

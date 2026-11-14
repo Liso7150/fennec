@@ -72,11 +72,21 @@ impl Opts {
     fn has(&self, key: &str) -> bool {
         self.kv.contains_key(key) || self.flags.iter().any(|f| f == key)
     }
+    /// Whether a shipped-by-default flag is on. `--no-{key}` turns it back off,
+    /// `{key}` forces it on, and anything else is the default.
+    fn on(&self, key: &str, default: bool) -> bool {
+        if self.has(&format!("no-{key}")) {
+            return false;
+        }
+        if self.has(key) {
+            return true;
+        }
+        default
+    }
     fn dir(&self) -> String {
         self.str("model")
             .or_else(|| self.pos.first().cloned())
-            .or_else(|| std::env::var("COLI_MODEL").ok())
-            .or_else(|| std::env::var("FENNEC_MODEL").ok())
+            .or_else(|| env_name(&["FENNEC_MODEL", "COLI_MODEL"]))
             .unwrap_or_else(|| DEFAULT_MODEL.to_string())
     }
 }
@@ -100,11 +110,11 @@ fn main() {
     let all: Vec<String> = std::env::args().skip(1).collect();
     let cmd = all.first().cloned().unwrap_or_else(|| "help".to_string());
     let opts = parse(&all[1.min(all.len())..]);
-    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let cores = kernel::default_threads();
     let threads = opts.usize_at("threads", cores);
     kernel::set_threads(threads);
     fennec::model::set_dense_int4(opts.has("dense-int4"));
-    fennec::model::set_dense_i8(opts.has("dense-i8"));
+    fennec::model::set_dense_i8(opts.on("dense-i8", true));
     fennec::quant::set_planar_dot(opts.has("planar-dot"));
     let r = match cmd.as_str() {
         "info" => info(&opts),
@@ -147,7 +157,7 @@ fn usage() {
          \x20 serve             OpenAI-compatible HTTP on loopback\n\n\
          options\n\
          \x20 --group 32        quant group width (32 is the AVX2 path)\n\
-         \x20 --threads N       default: every core\n\
+         \x20 --threads N       default: one worker per physical core\n\
          \x20 --device GiB      GPU budget (default: the whole card)  --reserve 0.5 stays for KV and drivers\n\
          \x20 --host 18.0       system-RAM pool in GiB\n\
          \x20 --cpu             price the plan with no GPU at all\n\
@@ -170,7 +180,8 @@ fn usage() {
          \x20 --ctx 32768       context window `run`/`serve` allocates state for\n\
          \x20 --ngen 4096       generation ceiling per request\n\
          \x20 --auto-tier       turn the device tier on without spelling out --gpu\n\
-         \x20 --dense-i8        one byte per weight for the host dense projections (CPU tier)\n\n\
+         \x20 --dense-i8        one byte per weight for the host dense projections; on by default, --no-dense-i8 restores the exact bf16/f16 dot\n\
+         \x20 --host-gb GiB     system-RAM host pool, default 100 (the plan trims it to what fits)\n\n\
          default model dir: {DEFAULT_MODEL}",
         fennec::VERSION
     );
@@ -320,7 +331,7 @@ fn find_usage(opts: &Opts, dir: &str) -> Option<String> {
 
 /// The RAM pool budget, resolved the same way for every command. `serve` spells
 /// it `--host-gb` because `--host` there is the bind address. An explicit flag
-/// wins over COLI_VK_TIER_HOST_GB, so `plan` prices the pool `serve` will use.
+/// wins over `*_VK_TIER_HOST_GB`, so `plan` prices the pool `serve` will use.
 fn host_gb(opts: &Opts) -> f64 {
     if let Some(v) = opts.str("host-gb").and_then(|v| v.parse::<f64>().ok()) {
         return v;
@@ -328,21 +339,23 @@ fn host_gb(opts: &Opts) -> f64 {
     if opts.kv.contains_key("host") {
         return opts.num("host", 18.0);
     }
-    std::env::var("COLI_VK_TIER_HOST_GB").ok().and_then(|v| v.parse().ok()).unwrap_or(18.0)
+    env_name(&["FENNEC_VK_TIER_HOST_GB", "COLI_VK_TIER_HOST_GB"])
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(18.0)
 }
 
 /// `--gpu` turns the device tier into real VRAM; `--gpu N` picks the ranked
 /// device `probe` printed. `--cpu` wins over both: it is the no-device plan.
 /// One definition of "put the device tier to work", shared by every command.
-/// `serve` used to accept `--auto-tier` and COLI_VULKAN while `plan`/`decode`
+/// `serve` used to accept `--auto-tier` and `*_VULKAN` while `plan`/`decode`
 /// did not, so the plan a user read was not the plan `serve` ran.
 fn gpu_wanted(opts: &Opts) -> bool {
     !opts.has("cpu")
         && (opts.has("auto-tier")
             || opts.has("gpu")
-            || env_flag("COLI_VULKAN")
-            || env_flag("COLI_CUDA")
-            || env_flag("COLI_METAL"))
+            || env_on(&["FENNEC_VULKAN", "COLI_VULKAN"])
+            || env_on(&["FENNEC_CUDA", "COLI_CUDA"])
+            || env_on(&["FENNEC_METAL", "COLI_METAL"]))
 }
 
 fn open_gpu(opts: &Opts) -> Result<Option<Arc<Mutex<Gpu>>>, String> {
@@ -1255,7 +1268,7 @@ fn decode(opts: &Opts, threads: usize) -> Result<(), String> {
 }
 
 fn cores_max() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    kernel::default_threads()
 }
 
 /// Everything `serve` and `run` need: the whole stack loaded once, the
@@ -1271,8 +1284,16 @@ struct Engine {
     ngen: usize,
 }
 
-fn env_flag(k: &str) -> bool {
-    std::env::var(k).map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false)
+/// The first of these environment names that is set. Every Fennec knob is
+/// spelled `FENNEC_*`; the `COLI_*` twin stays readable so launchers written
+/// against Colibri keep working until they move.
+fn env_name(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| std::env::var(*name).ok())
+}
+
+/// The same lookup for the flags that switch the device tier on.
+fn env_on(names: &[&str]) -> bool {
+    env_name(names).is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
 fn load_engine(opts: &Opts, threads: usize) -> Result<Engine, String> {
@@ -1293,7 +1314,10 @@ fn load_engine(opts: &Opts, threads: usize) -> Result<Engine, String> {
     // pool budget cannot also live under that name: resolve it here and hand
     // `setup` a numeric `host` it can read back.
     let pool = opts.str("host-gb").and_then(|v| v.parse::<f64>().ok())
-        .or_else(|| std::env::var("COLI_VK_TIER_HOST_GB").ok().and_then(|v| v.parse().ok()))
+        .or_else(|| {
+            env_name(&["FENNEC_VK_TIER_HOST_GB", "COLI_VK_TIER_HOST_GB"])
+                .and_then(|v| v.parse().ok())
+        })
         .unwrap_or(18.0);
     let mut po = Opts { pos: opts.pos.clone(), kv: opts.kv.clone(), flags: opts.flags.clone() };
     po.kv.insert("host".into(), pool.to_string());
@@ -1347,10 +1371,10 @@ fn load_engine(opts: &Opts, threads: usize) -> Result<Engine, String> {
     let id = Path::new(&dir).file_name().map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "fennec".into());
     // coli's serve took --api-key, so launchers that still pass it keep working.
-    // The env is the preferred channel: argv is world-readable in the process list.
+    // The env is the preferred channel: argv is world-readable in the process
+    // list, and FENNEC_API_KEY is the spelling; COLI_API_KEY is its alias.
     let key = opts.str("api-key")
-        .or_else(|| std::env::var("COLI_API_KEY").ok())
-        .or_else(|| std::env::var("FENNEC_API_KEY").ok())
+        .or_else(|| env_name(&["FENNEC_API_KEY", "COLI_API_KEY"]))
         .unwrap_or_else(|| "local".into());
     Ok(Engine { model: Arc::new(Mutex::new(m)), sh, cfg, tok, id, key, ctx, ngen })
 }
@@ -1411,14 +1435,7 @@ fn run_cmd(opts: &Opts, threads: usize) -> Result<(), String> {
     let dt = t0.elapsed().as_secs_f64();
     eprintln!("\n[fennec] {n} tokens in {dt:.2} s = {:.2} tok/s ({finish})", n as f64 / dt);
     if fennec::prof::enabled() {
-        let steps = n.max(1) as f64;
-        let ms = fennec::prof::millis();
-        let sum: f64 = ms.iter().sum();
-        eprintln!("  stage breakdown (ms/token, {n} steps, prefill included):");
-        for (name, v) in fennec::prof::STAGES.iter().zip(&ms) {
-            eprintln!("    {name:<20} {:7.2}  {:5.1}%", v / steps, 100.0 * v / sum.max(1e-9));
-        }
-        eprintln!("    {:<20} {:7.2}  (wall {:.2})", "accounted", sum / steps, dt * 1e3 / steps);
+        eprint!("{}", fennec::prof::report(dt * 1e3));
     }
     Ok(())
 }

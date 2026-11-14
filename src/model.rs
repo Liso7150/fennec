@@ -62,14 +62,24 @@ pub fn set_dense_int4(v: bool) {
 }
 pub fn dense_int4() -> bool { DENSE_INT4.load(std::sync::atomic::Ordering::Relaxed) }
 
-/// Opt-in: hold the mixer's dense projections at one byte per weight on the
-/// host instead of two. On the CPU tier those projections are the largest block
-/// of the token (~2.3 GiB of bf16 per token) and they are bandwidth-bound, so
-/// halving the weight traffic halves the block. The 8-bit round trip costs about
-/// a tenth of a percent on the dot - far less than the int4 routed experts
-/// already carry - but it does move the last digits, so the default stays the
-/// exact bf16/f16 path and the golden bands stay as they are. A/B with
-/// `--dense-i8`.
+/// Whether the host holds its dense projections at one byte per weight instead
+/// of two. On the CPU tier those projections are the largest block of the token
+/// (~2.3 GiB of bf16 per token) and they are bandwidth-bound, so halving the
+/// weight traffic halves the block: 10.16 s median over five requests of the
+/// matrix prompt against 12.75 s with the flag off - and the off block ran
+/// second, after the on block had warmed the page cache, so the order bias
+/// works against the win, not for it. (Both are pre-prefill-batching.)
+///
+/// It is not free, and the earlier claim here that it cost "a tenth of a
+/// percent" was wrong. Per-row int8 puts about one part in `sqrt(cols)` of the
+/// dot into the result, because each weight agrees to 0.4% while the sum
+/// cancels: measured 12.4% rms on the final logits of the 0.3B dense stack,
+/// 20.7% worst over the eight fixture positions, and one of those eight greedy
+/// tokens changes. `tests/dense_i8.rs` pins that band and the golden token;
+/// the other golden suites keep the exact bf16/f16 dot, because this static
+/// defaults to off and only the CLI turns it on. The trade is still worth
+/// making by default - Colibri's dense trunk has been int8 all along - but the
+/// way back to the exact answer is `--no-dense-i8`.
 static DENSE_I8: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub fn set_dense_i8(v: bool) { DENSE_I8.store(v, std::sync::atomic::Ordering::Relaxed); }
 pub fn dense_i8() -> bool { DENSE_I8.load(std::sync::atomic::Ordering::Relaxed) }
@@ -121,6 +131,25 @@ impl Dense {
             // host `rows`/`cols`/`threads` are the CPU kernel's contract only.
             #[cfg(feature = "ort")]
             Dense::Ort(d) => d.gemv(x, out).expect("ort dense gemv"),
+        }
+    }
+
+    /// `n = xs.len() / cols` tokens through this projection in one weight pass,
+    /// `out` token-major (`out[t * rows + r]`). Bit-identical to `n` calls of
+    /// [`Dense::gemv`]; see [`kernel::gemv_batch`]. A session-hosted ORT
+    /// projection has no batch entry point, so it takes the same call per token.
+    pub fn gemv_batch(&self, rows: usize, cols: usize, xs: &[f32], out: &mut [f32], threads: usize) {
+        match self {
+            Dense::F32(w) => kernel::gemv_batch(w, rows, cols, xs, out, threads),
+            Dense::Half(w, f) => kernel::gemv_half_batch(w, rows, cols, xs, out, threads, *f),
+            Dense::I8(m) => kernel::gemv_i8_batch(&m.w, &m.wsum, &m.scale, rows, cols, xs, out, threads),
+            #[cfg(feature = "ort")]
+            Dense::Ort(d) => {
+                for t in 0..xs.len() / cols {
+                    d.gemv(&xs[t * cols..(t + 1) * cols], &mut out[t * rows..(t + 1) * rows])
+                        .expect("ort dense gemv");
+                }
+            }
         }
     }
 
@@ -1001,6 +1030,163 @@ impl MoeLayer {
         }
         (out, r)
     }
+
+    /// A chunk of prompt tokens through the routed experts, grouped by expert.
+    ///
+    /// Colibri's `moe()` does this union whenever its batch width `S > 1`: every
+    /// unique expert of the batch is read once and multiplied against all the
+    /// positions that picked it. A chunk's `n * k` picks land on fewer distinct
+    /// experts than there are picks, so walking (expert, weight row, positions
+    /// that use it) keeps each weight row in L1 across those positions instead of
+    /// pulling it from DRAM once per pick. Every dot is still the same product
+    /// against the same activation, non-resident picks still run through the
+    /// streaming pool, and each row still sums its picks in pick order with the
+    /// shared expert last, so the chunk is bit-identical to `n` calls of
+    /// [`MoeLayer::forward`].
+    ///
+    /// Returns false when there is nothing to group (`n < 2`), so a caller can
+    /// fall back to the per-token path — which is also the only path that
+    /// overlaps host work with a device batch.
+    pub fn prefill(&self, xs: &[f32], out: &mut [f32]) -> bool {
+        let (h, i) = (self.cfg.hidden_size, self.cfg.moe_intermediate_size);
+        let (e, k) = (self.cfg.num_experts, self.cfg.num_experts_per_tok);
+        let n = xs.len() / h;
+        if n < 2 {
+            return false;
+        }
+        let mut logits = vec![0f32; n * e];
+        {
+            let _t = prof::start(prof::ROUTE);
+            self.gate.gemv_batch(e, h, xs, &mut logits, self.threads);
+        }
+        let mut ids = vec![0usize; n * k];
+        let mut wts = vec![0f32; n * k];
+        for r in 0..n {
+            kernel::softmax_topk(
+                &logits[r * e..(r + 1) * e],
+                k,
+                &mut wts[r * k..(r + 1) * k],
+                &mut ids[r * k..(r + 1) * k],
+            );
+        }
+        // The union of the chunk's picks, in first-seen order, each expert
+        // carrying the flat pick indices that use it.
+        let mut at = vec![usize::MAX; e];
+        let mut union: Vec<(usize, Vec<u32>)> = Vec::new();
+        let mut cold: Vec<usize> = Vec::new();
+        for (q, &id) in ids.iter().enumerate() {
+            if self.slot[id] < 0 {
+                cold.push(q);
+                continue;
+            }
+            let u = at[id];
+            at[id] = if u == usize::MAX {
+                union.push((id, Vec::new()));
+                union.len() - 1
+            } else {
+                u
+            };
+            union[at[id]].1.push(q as u32);
+        }
+        if union.is_empty() {
+            return false;
+        }
+        let mut parts = vec![0f32; n * k * h];
+        {
+            let _cpu = prof::start(prof::MOE_CPU);
+            self.host_hits
+                .fetch_add((n * k - cold.len()) as u64, Relaxed);
+            if !cold.is_empty() {
+                let mut pool = self
+                    .stream
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("a non-resident expert needs a pool"))
+                    .lock()
+                    .unwrap();
+                let mut hh = vec![0f32; i];
+                let mut y = vec![0f32; h];
+                for &q in &cold {
+                    let (id, w, r) = (ids[q], wts[q], q / k);
+                    pool.with(id, |gu, dn| {
+                        expert_in(gu, dn, i, h, 0, &xs[r * h..(r + 1) * h], &mut hh, &mut y)
+                    })
+                    .unwrap_or_else(|er| panic!("streamed expert {id}: {er}"));
+                    kernel::axpy(&mut parts[q * h..(q + 1) * h], &y, w);
+                }
+            }
+            // Within a layer every expert comes from the same pack, so the first
+            // resident one decides whether the integer dot is available to all of
+            // them — the assumption `cpu_picks` already makes.
+            let (gu0, _, _) = self.expert_pair(union[0].0);
+            let int = gu0.wants_int();
+            let mut px: Vec<DotPrep> = (0..n).map(|_| DotPrep::with_int(h, int)).collect();
+            for r in 0..n {
+                px[r].fill(&xs[r * h..(r + 1) * h]);
+            }
+            let nu = union.len();
+            let mut hh = vec![0f32; n * k * i];
+            {
+                let hhp = kernel::SharedPtr::new(hh.as_mut_ptr());
+                kernel::par_index(nu * i, self.threads, |start, len| {
+                    for g in start..start + len {
+                        let u = g / i;
+                        let j = g - u * i;
+                        let (gu, _, s) = self.expert_pair(union[u].0);
+                        let base = s * 2 * i;
+                        for &q in &union[u].1 {
+                            let p = &px[q as usize / k];
+                            let a = gu.dot_prepped(base + j, p);
+                            let b = gu.dot_prepped(base + i + j, p);
+                            unsafe { *hhp.at(q as usize * i + j) = kernel::silu(a) * b };
+                        }
+                    }
+                });
+            }
+            let mut ph: Vec<DotPrep> = (0..n * k).map(|_| DotPrep::with_int(i, int)).collect();
+            for q in 0..n * k {
+                ph[q].fill(&hh[q * i..(q + 1) * i]);
+            }
+            let pp = kernel::SharedPtr::new(parts.as_mut_ptr());
+            kernel::par_index(nu * h, self.threads, |start, len| {
+                for g in start..start + len {
+                    let u = g / h;
+                    let j = g - u * h;
+                    let (_, dn, s) = self.expert_pair(union[u].0);
+                    let row = s * h + j;
+                    for &q in &union[u].1 {
+                        let v = dn.dot_prepped(row, &ph[q as usize]);
+                        unsafe { *pp.at(q as usize * h + j) = wts[q as usize] * v };
+                    }
+                }
+            });
+        }
+        let si = self.cfg.shared_expert_intermediate_size;
+        let mut shared_out = vec![0f32; n * h];
+        {
+            let _t = prof::start(prof::MOE_SHARED);
+            let mut g = vec![0f32; n * si];
+            let mut u = vec![0f32; n * si];
+            self.s_gate.gemv_batch(si, h, xs, &mut g, self.threads);
+            self.s_up.gemv_batch(si, h, xs, &mut u, self.threads);
+            for q in 0..n * si {
+                u[q] = kernel::silu(g[q]) * u[q];
+            }
+            self.s_down.gemv_batch(h, si, &u, &mut shared_out, self.threads);
+        }
+        // Same reduction `forward` does, row by row: pick order, shared expert
+        // last, each step a `+= 1.0 *` so the floating-point order matches.
+        let _res = prof::start(prof::RESIDUAL);
+        for r in 0..n {
+            let gate = kernel::sigmoid(kernel::dot(&self.s_egate, &xs[r * h..(r + 1) * h]));
+            let o = &mut out[r * h..(r + 1) * h];
+            o.fill(0.0);
+            for q in r * k..(r + 1) * k {
+                kernel::axpy(o, &parts[q * h..(q + 1) * h], 1.0);
+            }
+            kernel::axpy(o, &shared_out[r * h..(r + 1) * h], gate);
+        }
+        true
+    }
 }
 
 /// One expert's forward pass over its own two matrices: `s` picks the row block
@@ -1249,7 +1435,7 @@ pub struct MlpLayer {
 }
 
 impl MlpLayer {
-    pub fn load(sh: &Shards, cfg: Arc<TextConfig>, layer: usize, threads: usize) -> Result<MlpLayer> {
+    pub fn load(sh: &Shards, cfg: Arc<TextConfig>, layer: usize, threads: usize, quantize_i8: bool) -> Result<MlpLayer> {
         let p = format!("{}.layers.{layer}.mlp", cfg.prefix);
         let mut l = MlpLayer {
             gate: dense_half(sh, &format!("{p}.gate_proj.weight"))?.0,
@@ -1258,7 +1444,7 @@ impl MlpLayer {
             cfg,
             threads: threads.max(1),
         };
-        if dense_i8() {
+        if quantize_i8 && dense_i8() {
             let (i, h) = (l.cfg.intermediate_size, l.cfg.hidden_size);
             l.gate = l.gate.quantize_i8(i, h);
             l.up = l.up.quantize_i8(i, h);
@@ -1282,6 +1468,24 @@ impl MlpLayer {
             u[j] = kernel::silu(g[j]) * u[j];
         }
         self.down.gemv(h, i, &u, out, t);
+    }
+
+    /// A chunk of prompt tokens through the same three projections, each read
+    /// once for the whole chunk. Same products in the same order as `n` calls
+    /// of [`MlpLayer::forward`], token-major in and out.
+    pub fn prefill(&self, xs: &[f32], out: &mut [f32]) {
+        let (h, i) = (self.cfg.hidden_size, self.cfg.intermediate_size);
+        let t = self.threads;
+        let n = xs.len() / h;
+        let _p = prof::start(prof::MIXER_PROJ);
+        let mut g = vec![0f32; n * i];
+        let mut u = vec![0f32; n * i];
+        self.gate.gemv_batch(i, h, xs, &mut g, t);
+        self.up.gemv_batch(i, h, xs, &mut u, t);
+        for j in 0..u.len() {
+            u[j] = kernel::silu(g[j]) * u[j];
+        }
+        self.down.gemv_batch(h, i, &u, out, t);
     }
 }
 
@@ -1341,7 +1545,7 @@ pub struct GdnLayer {
 }
 
 impl GdnLayer {
-    pub fn load(sh: &Shards, cfg: Arc<TextConfig>, layer: usize, threads: usize) -> Result<GdnLayer> {
+    pub fn load(sh: &Shards, cfg: Arc<TextConfig>, layer: usize, threads: usize, quantize_i8: bool) -> Result<GdnLayer> {
         let p = format!("{}.layers.{layer}.linear_attn", cfg.prefix);
         let (h, cd, vd, nv) = (
             cfg.hidden_size,
@@ -1363,9 +1567,10 @@ impl GdnLayer {
             threads: threads.max(1),
             dev: None,
         };
-        if dense_i8() {
+        if quantize_i8 && dense_i8() {
             // The five projections are this tier's dense read; at one byte per
-            // weight they cost half the bytes.
+            // weight they cost half the bytes. Skip when attach_dense will
+            // re-read from shards and upload to device (#82 memory pressure).
             l.in_qkv = l.in_qkv.quantize_i8(cd, h);
             l.in_z = l.in_z.quantize_i8(vd, h);
             l.in_b = l.in_b.quantize_i8(nv, h);
@@ -1536,13 +1741,8 @@ impl GdnLayer {
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
         let cd = cfg.conv_dim();
-        let kd = cfg.key_dim();
         let vd = cfg.value_dim();
         let nv = cfg.linear_num_value_heads;
-        let nk = cfg.linear_num_key_heads;
-        let dk = cfg.linear_key_head_dim;
-        let dv = cfg.linear_value_head_dim;
-        let kernel_dim = cfg.linear_conv_kernel_dim;
         let t = self.threads;
 
         // one buffer, one layout, whichever tier fills it: qkv | z | b | a
@@ -1570,6 +1770,88 @@ impl GdnLayer {
         let (mixed, r) = ibuf.split_at(cd);
         let (z, r) = r.split_at(vd);
         let (b, a) = r.split_at(nv);
+        let mut normed = vec![0f32; vd];
+        self.mix(mixed, z, b, a, st, &mut normed);
+        drop(_cpu);
+        // out_proj is a projection, not part of the recursion: the mixer timer
+        // closed above so the two stages stay disjoint (a nested timer would be
+        // counted twice, which showed up as negative unaccounted stack time).
+        match &self.dev {
+            Some(d) => {
+                let mut g = d.gpu.lock().unwrap();
+                g.write(DENSE_OFF, &normed);
+                {
+                    let mut bt = g.batch().unwrap();
+                    bt.gemv_half(d.out, h, vd, DENSE_OFF, DENSE_OFF + vd).unwrap();
+                    bt.run().unwrap();
+                }
+                g.read_into(DENSE_OFF + vd, out);
+            }
+            None => {
+                let _p = prof::start(prof::MIXER_PROJ);
+                self.out_proj.gemv(h, vd, &normed, out, t)
+            }
+        }
+    }
+
+    /// A chunk of prompt tokens through the mixer: the four input projections
+    /// and `out_proj` each read their weights once for the whole chunk, and the
+    /// recursion runs token by token because the conv window and the delta state
+    /// are a chain. Host tier only - with a device the projections live in VRAM
+    /// and `step` already batches them into one command buffer.
+    fn prefill(&self, xs: &[f32], st: &mut GdnState, out: &mut [f32]) {
+        debug_assert!(self.dev.is_none());
+        let cfg = &self.cfg;
+        let (h, cd, vd, nv) = (
+            cfg.hidden_size,
+            cfg.conv_dim(),
+            cfg.value_dim(),
+            cfg.linear_num_value_heads,
+        );
+        let t = self.threads;
+        let n = xs.len() / h;
+        let mut qkv = vec![0f32; n * cd];
+        let mut zb = vec![0f32; n * vd];
+        let mut bb = vec![0f32; n * nv];
+        let mut ab = vec![0f32; n * nv];
+        {
+            let _p = prof::start(prof::MIXER_PROJ);
+            self.in_qkv.gemv_batch(cd, h, xs, &mut qkv, t);
+            self.in_z.gemv_batch(vd, h, xs, &mut zb, t);
+            self.in_b.gemv_batch(nv, h, xs, &mut bb, t);
+            self.in_a.gemv_batch(nv, h, xs, &mut ab, t);
+        }
+        let _cpu = prof::start(prof::MIXER_CPU);
+        let mut normed = vec![0f32; n * vd];
+        for i in 0..n {
+            self.mix(
+                &qkv[i * cd..(i + 1) * cd],
+                &zb[i * vd..(i + 1) * vd],
+                &bb[i * nv..(i + 1) * nv],
+                &ab[i * nv..(i + 1) * nv],
+                st,
+                &mut normed[i * vd..(i + 1) * vd],
+            );
+        }
+        drop(_cpu);
+        let _p = prof::start(prof::MIXER_PROJ);
+        self.out_proj.gemv_batch(h, vd, &normed, out, t);
+    }
+
+    /// One token's recursion: the depthwise conv and its rolling window, the
+    /// delta update over the heads, and the gated norm whose read-out the
+    /// caller's `out_proj` consumes. Everything that sits between the input
+    /// projections and `out_proj`, so a prefill chunk can project all its tokens
+    /// at once and then walk this one token at a time.
+    fn mix(&self, mixed: &[f32], z: &[f32], b: &[f32], a: &[f32], st: &mut GdnState, normed: &mut [f32]) {
+        let cfg = &self.cfg;
+        let cd = cfg.conv_dim();
+        let kd = cfg.key_dim();
+        let vd = cfg.value_dim();
+        let (nv, nk) = (cfg.linear_num_value_heads, cfg.linear_num_key_heads);
+        let (dk, dv) = (cfg.linear_key_head_dim, cfg.linear_value_head_dim);
+        let kernel_dim = cfg.linear_conv_kernel_dim;
+        let t = self.threads;
 
         // depthwise causal conv with the rolling window, then SiLU
         let mut conv_out = vec![0f32; cd];
@@ -1657,34 +1939,13 @@ impl GdnLayer {
                 }
             }
         });
-        // gated RMSNorm per value head, then out_proj
-        let mut normed = vec![0f32; vd];
+        // gated RMSNorm per value head
         for hv in 0..nv {
             let (x, g) = (
                 &o[hv * dv..(hv + 1) * dv],
                 &z[hv * dv..(hv + 1) * dv],
             );
             kernel::rmsnorm_gated(x, g, &self.norm_w, cfg.rms_norm_eps as f32, &mut normed[hv * dv..(hv + 1) * dv]);
-        }
-        // out_proj is a projection, not part of the recursion: close the mixer
-        // timer here so the two stages stay disjoint (a nested timer would be
-        // counted twice, which showed up as negative unaccounted stack time).
-        drop(_cpu);
-        match &self.dev {
-            Some(d) => {
-                let mut g = d.gpu.lock().unwrap();
-                g.write(DENSE_OFF, &normed);
-                {
-                    let mut bt = g.batch().unwrap();
-                    bt.gemv_half(d.out, h, vd, DENSE_OFF, DENSE_OFF + vd).unwrap();
-                    bt.run().unwrap();
-                }
-                g.read_into(DENSE_OFF + vd, out);
-            }
-            None => {
-                let _p = prof::start(prof::MIXER_PROJ);
-                self.out_proj.gemv(h, vd, &normed, out, t)
-            }
         }
         st.filled = (st.filled + 1).min(st.hist);
     }
@@ -1726,7 +1987,7 @@ pub struct AttnLayer {
 }
 
 impl AttnLayer {
-    pub fn load(sh: &Shards, cfg: Arc<TextConfig>, layer: usize, max_pos: usize, threads: usize) -> Result<AttnLayer> {
+    pub fn load(sh: &Shards, cfg: Arc<TextConfig>, layer: usize, max_pos: usize, threads: usize, quantize_i8: bool) -> Result<AttnLayer> {
         let p = format!("{}.layers.{layer}.self_attn", cfg.prefix);
         let mut cos = Vec::new();
         let mut sin = Vec::new();
@@ -1752,7 +2013,7 @@ impl AttnLayer {
             threads: threads.max(1),
             dev: None,
         };
-        if dense_i8() {
+        if quantize_i8 && dense_i8() {
             l.q = l.q.quantize_i8(q_out, h);
             l.k = l.k.quantize_i8(nkv * hd, h);
             l.v = l.v.quantize_i8(nkv * hd, h);
@@ -1836,16 +2097,13 @@ impl AttnLayer {
         let nh = cfg.num_attention_heads;
         let nkv = cfg.num_key_value_heads;
         let hd = cfg.head_dim;
-        let rot = cfg.rotary_dim();
         let t = self.threads;
-        let eps = cfg.rms_norm_eps as f32;
         let q_out = if cfg.attn_output_gate { nh * hd * 2 } else { nh * hd };
 
         // q_proj is [nh, head_dim*2] per head when the checkpoint gates the
         // output: query first, then the gate. A dense Qwen3 has no gate, so the
         // heads are packed one head_dim apart and reading them at 2*hd would
         // stride every other head into the following row.
-        let stride = if cfg.attn_output_gate { hd * 2 } else { hd };
         let mut ibuf = vec![0f32; q_out + 2 * nkv * hd];
         match &self.dev {
             Some(d) => {
@@ -1864,6 +2122,93 @@ impl AttnLayer {
         let _cpu = prof::start(prof::MIXER_CPU);
         let (qraw, r) = ibuf.split_at(q_out);
         let (kraw, vv) = r.split_at(nkv * hd);
+        let mut attn = vec![0f32; nh * hd];
+        self.mix(qraw, kraw, vv, pos, st, &mut attn);
+        drop(_cpu);
+        match &self.dev {
+            Some(d) => {
+                let mut g = d.gpu.lock().unwrap();
+                g.write(DENSE_OFF, &attn);
+                {
+                    let mut bt = g.batch().unwrap();
+                    if d.q4 {
+                        bt.gemv_q4(d.o, d.qs[3], h, nh * hd, d.group, DENSE_OFF, DENSE_OFF + nh * hd).unwrap();
+                    } else {
+                        bt.gemv_half(d.o, h, nh * hd, DENSE_OFF, DENSE_OFF + nh * hd).unwrap();
+                    }
+                    bt.run().unwrap();
+                }
+                g.read_into(DENSE_OFF + nh * hd, out);
+            }
+            None => {
+                let _p = prof::start(prof::MIXER_PROJ);
+                self.o.gemv(h, nh * hd, &attn, out, t)
+            }
+        }
+    }
+
+    /// A chunk of prompt tokens through the mixer. q, k, v and o_proj each read
+    /// their weights once for the whole chunk; the cache writes and the scores
+    /// stay token by token because a causal row can only see the rows before it.
+    /// Host tier only - with a device the projections live in VRAM.
+    fn prefill(&self, xs: &[f32], pos0: usize, st: &mut AttnState, out: &mut [f32]) {
+        debug_assert!(self.dev.is_none());
+        let cfg = &self.cfg;
+        let (h, nh, nkv, hd) = (
+            cfg.hidden_size,
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+        );
+        let q_out = if cfg.attn_output_gate { nh * hd * 2 } else { nh * hd };
+        let t = self.threads;
+        let n = xs.len() / h;
+        let mut qb = vec![0f32; n * q_out];
+        let mut kb = vec![0f32; n * nkv * hd];
+        let mut vb = vec![0f32; n * nkv * hd];
+        {
+            let _p = prof::start(prof::MIXER_PROJ);
+            self.q.gemv_batch(q_out, h, xs, &mut qb, t);
+            self.k.gemv_batch(nkv * hd, h, xs, &mut kb, t);
+            self.v.gemv_batch(nkv * hd, h, xs, &mut vb, t);
+        }
+        let _cpu = prof::start(prof::MIXER_CPU);
+        let mut attn = vec![0f32; n * nh * hd];
+        for i in 0..n {
+            self.mix(
+                &qb[i * q_out..(i + 1) * q_out],
+                &kb[i * nkv * hd..(i + 1) * nkv * hd],
+                &vb[i * nkv * hd..(i + 1) * nkv * hd],
+                pos0 + i,
+                st,
+                &mut attn[i * nh * hd..(i + 1) * nh * hd],
+            );
+        }
+        drop(_cpu);
+        let _p = prof::start(prof::MIXER_PROJ);
+        self.o.gemv_batch(h, nh * hd, &attn, out, t);
+    }
+
+    /// One token's attention against the KV cache: rope, the cache row, the
+    /// causal scores and the output gate - everything between the q/k/v
+    /// projections and `o_proj`, so a prefill chunk can project all its tokens
+    /// at once and then walk this one token at a time.
+    fn mix(
+        &self,
+        qraw: &[f32],
+        kraw: &[f32],
+        vv: &[f32],
+        pos: usize,
+        st: &mut AttnState,
+        attn: &mut [f32],
+    ) {
+        let cfg = &self.cfg;
+        let nh = cfg.num_attention_heads;
+        let nkv = cfg.num_key_value_heads;
+        let hd = cfg.head_dim;
+        let rot = cfg.rotary_dim();
+        let eps = cfg.rms_norm_eps as f32;
+        let stride = if cfg.attn_output_gate { hd * 2 } else { hd };
 
         let (c, s) = (
             &self.cos[pos * rot..(pos + 1) * rot],
@@ -1886,7 +2231,6 @@ impl AttnLayer {
         st.v[row..row + st.kv].copy_from_slice(vv);
         st.len += 1;
 
-        let mut attn = vec![0f32; nh * hd];
         let rep = nh / nkv;
         let scale = 1.0f32 / (hd as f32).sqrt();
         // One scores buffer reused across heads; st.len is fixed for this step.
@@ -1924,27 +2268,6 @@ impl AttnLayer {
                 }
             }
         }
-        drop(_cpu);
-        match &self.dev {
-            Some(d) => {
-                let mut g = d.gpu.lock().unwrap();
-                g.write(DENSE_OFF, &attn);
-                {
-                    let mut bt = g.batch().unwrap();
-                    if d.q4 {
-                        bt.gemv_q4(d.o, d.qs[3], h, nh * hd, d.group, DENSE_OFF, DENSE_OFF + nh * hd).unwrap();
-                    } else {
-                        bt.gemv_half(d.o, h, nh * hd, DENSE_OFF, DENSE_OFF + nh * hd).unwrap();
-                    }
-                    bt.run().unwrap();
-                }
-                g.read_into(DENSE_OFF + nh * hd, out);
-            }
-            None => {
-                let _p = prof::start(prof::MIXER_PROJ);
-                self.o.gemv(h, nh * hd, &attn, out, t)
-            }
-        }
     }
 }
 
@@ -1977,11 +2300,13 @@ impl Layer {
         kv_cap: usize,
     ) -> Result<Layer> {
         let all: Vec<usize> = (0..cfg.num_experts).collect();
-        Layer::with_experts(sh, cfg, layer, &all, None, group, threads, kv_cap)
+        Layer::with_experts(sh, cfg, layer, &all, None, group, threads, kv_cap, false)
     }
 
     /// `ids` resident in slot order, the rest answered from `stream`. A plan
     /// that lists its experts hottest-first makes slot 0 the cheapest miss.
+    /// `dense_on_device` skips the int8 quantisation when the dense projections
+    /// will be re-read from shards and uploaded to VRAM by attach_dense (#82).
     pub fn with_experts(
         sh: &Arc<Shards>,
         cfg: Arc<TextConfig>,
@@ -1991,24 +2316,26 @@ impl Layer {
         group: usize,
         threads: usize,
         kv_cap: usize,
+        dense_on_device: bool,
     ) -> Result<Layer> {
         let kind = cfg.layer_types[layer];
         let p = format!("{}.layers.{layer}", cfg.prefix);
         let zc = cfg.norm_zero_centered;
+        let quantize_i8 = !dense_on_device;
         let (moe, mlp) = if cfg.is_moe() {
             (
                 Some(MoeLayer::load_set(sh, cfg.clone(), layer, ids, stream, group, threads)?),
                 None,
             )
         } else {
-            (None, Some(MlpLayer::load(sh, cfg.clone(), layer, threads)?))
+            (None, Some(MlpLayer::load(sh, cfg.clone(), layer, threads, quantize_i8)?))
         };
         let gdn = match kind {
-            LayerKind::Linear => Some(GdnLayer::load(sh, cfg.clone(), layer, threads)?),
+            LayerKind::Linear => Some(GdnLayer::load(sh, cfg.clone(), layer, threads, quantize_i8)?),
             LayerKind::Full => None,
         };
         let attn = match kind {
-            LayerKind::Full => Some(AttnLayer::load(sh, cfg.clone(), layer, kv_cap, threads)?),
+            LayerKind::Full => Some(AttnLayer::load(sh, cfg.clone(), layer, kv_cap, threads, quantize_i8)?),
             LayerKind::Linear => None,
         };
         Ok(Layer {
@@ -2061,18 +2388,81 @@ impl Layer {
             let _t = prof::start(prof::NORM);
             kernel::rmsnorm(x, &self.norm_post, eps, &mut buf);
         }
-        let _t = prof::start(prof::RESIDUAL);
         match (&self.moe, &self.mlp) {
             (Some(moe), _) => {
                 let (moe_out, _) = moe.forward(&buf);
+                let _t = prof::start(prof::RESIDUAL);
                 for i in 0..h {
                     x[i] += moe_out[i];
                 }
             }
             (None, mlp) => {
                 mlp.as_ref().unwrap().forward(&buf, &mut res);
+                let _t = prof::start(prof::RESIDUAL);
                 for i in 0..h {
                     x[i] += res[i];
+                }
+            }
+        }
+    }
+
+    /// A chunk of prompt tokens through this layer: `xs` holds `n` token-major
+    /// rows of `h` floats and is advanced in place. The mixer and a dense FFN
+    /// read their weights once for the whole chunk; the routed experts read each
+    /// expert they need once too, but only for the experts this chunk actually
+    /// picks — a token's eight of 256 are not the next token's eight.
+    /// Bit-identical to `n` calls of [`Layer::forward`] at consecutive positions.
+    pub fn prefill(&self, xs: &mut [f32], st: &mut LayerState, pos0: usize) {
+        let h = self.cfg.hidden_size;
+        let n = xs.len() / h;
+        let eps = self.cfg.rms_norm_eps as f32;
+        let mut buf = vec![0f32; n * h];
+        let mut res = vec![0f32; n * h];
+        {
+            let _t = prof::start(prof::NORM);
+            for i in 0..n {
+                kernel::rmsnorm(&xs[i * h..(i + 1) * h], &self.norm_in, eps, &mut buf[i * h..(i + 1) * h]);
+            }
+        }
+        match (&self.kind, st) {
+            (LayerKind::Linear, LayerState::Linear(g)) => self.gdn.as_ref().unwrap().prefill(&buf, g, &mut res),
+            (LayerKind::Full, LayerState::Full(a)) => self.attn.as_ref().unwrap().prefill(&buf, pos0, a, &mut res),
+            _ => panic!("layer state mismatch"),
+        }
+        {
+            let _t = prof::start(prof::RESIDUAL);
+            kernel::axpy(xs, &res, 1.0);
+        }
+        {
+            let _t = prof::start(prof::NORM);
+            for i in 0..n {
+                kernel::rmsnorm(&xs[i * h..(i + 1) * h], &self.norm_post, eps, &mut buf[i * h..(i + 1) * h]);
+            }
+        }
+        match (&self.moe, &self.mlp) {
+            (Some(moe), _) => {
+                // Grouped by expert when the chunk holds more than one token;
+                // otherwise, or when a pick cannot be grouped, one token at a
+                // time. `res` is reused as the expert output: every row of it is
+                // written before it is read back.
+                if moe.prefill(&buf, &mut res) {
+                    let _t = prof::start(prof::RESIDUAL);
+                    for j in 0..xs.len() {
+                        xs[j] += res[j];
+                    }
+                } else {
+                    for i in 0..n {
+                        let (moe_out, _) = moe.forward(&buf[i * h..(i + 1) * h]);
+                        let _t = prof::start(prof::RESIDUAL);
+                        kernel::axpy(&mut xs[i * h..(i + 1) * h], &moe_out, 1.0);
+                    }
+                }
+            }
+            (None, mlp) => {
+                mlp.as_ref().unwrap().prefill(&buf, &mut res);
+                let _t = prof::start(prof::RESIDUAL);
+                for i in 0..xs.len() {
+                    xs[i] += res[i];
                 }
             }
         }
@@ -2162,6 +2552,7 @@ impl Model {
                 group,
                 threads,
                 kv_cap,
+                lp.dense_on_device,
             )?);
         }
         let host_ms = t_host.elapsed().as_secs_f64() * 1e3;
@@ -2301,11 +2692,61 @@ impl Model {
         sh.row_f32(&self.embed, id)
     }
 
-    /// One token through the loaded layers, in place on `x`.
+    /// One token through the loaded layers, in place on `x`. This is also the
+    /// unit the profiler divides by, so it counts itself.
     pub fn forward(&self, x: &mut [f32], st: &mut [LayerState], pos: usize) {
+        prof::tick_decode_step();
         for (l, s) in self.layers.iter().zip(st.iter_mut()) {
             l.forward(x, s, pos);
         }
+    }
+
+    /// A chunk of prompt tokens through the loaded layers, in place on `xs`
+    /// (`n` token-major rows of `hidden_size`). Every host dense projection is
+    /// read once for the chunk instead of once per token, which is the whole
+    /// difference between this and `n` calls of [`Model::forward`] - and the
+    /// results are bit-identical to those calls.
+    pub fn prefill(&self, xs: &mut [f32], st: &mut [LayerState], pos0: usize) {
+        for (l, s) in self.layers.iter().zip(st.iter_mut()) {
+            l.prefill(xs, s, pos0);
+        }
+    }
+
+    /// Whether [`Model::prefill`] can take the prompt: its batch kernels are
+    /// host kernels, so a plan that put the dense tier in VRAM has to keep
+    /// walking [`Model::forward`] token by token. Routing a device prompt
+    /// through these kernels instead was measured: 26 prompt tokens in 2166 ms
+    /// against 1750 ms on the VRAM path, because the host buys its one weight
+    /// pass per chunk (379 ms for the mixer projections) while the GPU idles and
+    /// the dot competes with the host expert pool for the same bandwidth. The
+    /// bytes are cheaper on the host, the token is not.
+    pub fn prefill_ready(&self) -> bool {
+        self.gpu.is_none()
+    }
+
+    /// Device-side batched prefill: batch dense GEMV operations on GPU (n rows
+    /// per command buffer submit), while keeping recurrent parts (gdn_rec)
+    /// per-token. This is the device tier's answer to [`Model::prefill`], which
+    /// only works for host tiers.
+    ///
+    /// Currently a placeholder that loops through forward token-by-token (same
+    /// as the non-batched path). Phase 2 will implement actual device batching.
+    pub fn prefill_device(&self, xs: &mut [f32], st: &mut [LayerState], pos0: usize) {
+        let h = self.cfg.hidden_size;
+        let n = xs.len() / h;
+        // For now, fall back to token-by-token forward (no behavior change).
+        // Phase 2 will batch the dense projections on device.
+        for i in 0..n {
+            let mut x = xs[i * h..(i + 1) * h].to_vec();
+            self.forward(&mut x, st, pos0 + i);
+            xs[i * h..(i + 1) * h].copy_from_slice(&x);
+        }
+    }
+
+    /// Whether [`Model::prefill_device`] can take the prompt: requires a GPU
+    /// to be present (device tier). Returns false for host-only tiers.
+    pub fn prefill_device_ready(&self) -> bool {
+        self.gpu.is_some()
     }
 
     /// logits = lm_head @ x. The head is never materialised: for a two-byte
@@ -2314,6 +2755,9 @@ impl Model {
     /// reads for work that is 1 GiB of bytes wide. Anything else keeps the
     /// blocked conversion, one row block at a time so the read still streams.
     pub fn logits(&self, sh: &Shards, x: &[f32], out: &mut [f32]) -> Result<()> {
+        // Named here rather than at each caller so every path that reads the
+        // lm_head — device, ORT, host, `bench`, `serve` — lands in one stage.
+        let _h = prof::start(prof::HEAD);
         let cols = self.cfg.hidden_size;
         #[cfg(feature = "ort")]
         if let Some(d) = &self.ort_head {

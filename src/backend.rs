@@ -92,7 +92,8 @@ impl Backend {
 }
 
 /// The environment the suite already speaks. `FENNEC_BACKEND` is the explicit
-/// knob; the `COLI_*` flags are kept because the suite's launcher sets them.
+/// knob; the per-backend flags switch it on too, under `FENNEC_*` first and the
+/// `COLI_*` names the suite's launcher still sets second.
 pub fn from_env(env: &dyn Fn(&str) -> Option<String>) -> Option<Backend> {
     if let Some(text) = env("FENNEC_BACKEND") {
         if let Some(b) = Backend::parse(&text) {
@@ -100,6 +101,9 @@ pub fn from_env(env: &dyn Fn(&str) -> Option<String>) -> Option<Backend> {
         }
     }
     for (key, backend) in [
+        ("FENNEC_CUDA", Backend::Cuda),
+        ("FENNEC_METAL", Backend::Metal),
+        ("FENNEC_VULKAN", Backend::Vulkan),
         ("COLI_CUDA", Backend::Cuda),
         ("COLI_METAL", Backend::Metal),
         ("COLI_VULKAN", Backend::Vulkan),
@@ -172,14 +176,22 @@ mod tests {
     }
 
     #[test]
-    fn the_coli_flags_still_select_a_backend_and_false_ones_do_not() {
-        assert_eq!(from_env(&env(&[("COLI_CUDA", "1")])), Some(Backend::Cuda));
-        assert_eq!(from_env(&env(&[("COLI_METAL", "1")])), Some(Backend::Metal));
-        assert_eq!(from_env(&env(&[("COLI_VULKAN", "1")])), Some(Backend::Vulkan));
-        for off in ["0", "false", "no", "off", ""] {
-            assert_eq!(from_env(&env(&[("COLI_CUDA", off)])), None, "COLI_CUDA={off:?}");
+    fn the_backend_flags_work_under_either_spelling() {
+        for (cuda, metal, vulkan) in [
+            ("COLI_CUDA", "COLI_METAL", "COLI_VULKAN"),
+            ("FENNEC_CUDA", "FENNEC_METAL", "FENNEC_VULKAN"),
+        ] {
+            assert_eq!(from_env(&env(&[(cuda, "1")])), Some(Backend::Cuda));
+            assert_eq!(from_env(&env(&[(metal, "1")])), Some(Backend::Metal));
+            assert_eq!(from_env(&env(&[(vulkan, "1")])), Some(Backend::Vulkan));
+            for off in ["0", "false", "no", "off", ""] {
+                assert_eq!(from_env(&env(&[(cuda, off)])), None, "{cuda}={off:?}");
+            }
         }
-        // FENNEC_BACKEND wins over a COLI flag that disagrees.
+        // The FENNEC_* spelling is the knob; the alias only fills in for it.
+        let e = env(&[("FENNEC_CUDA", "1"), ("COLI_VULKAN", "1")]);
+        assert_eq!(from_env(&e), Some(Backend::Cuda));
+        // FENNEC_BACKEND wins over a flag that disagrees.
         let e = env(&[("FENNEC_BACKEND", "metal"), ("COLI_CUDA", "1")]);
         assert_eq!(from_env(&e), Some(Backend::Metal));
     }
