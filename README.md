@@ -71,10 +71,10 @@ layers in batches, so a weight block is read once for the chunk instead of once 
 - **Grouped expert union**: host experts grouped by ID across the chunk, one pass per
   unique expert (`MoeLayer::prefill_device_grouped`, `src/model.rs:1228`)
 - **Device expert fallback**: VRAM-resident experts still take the per-token forward
-- **Status**: reached from `tests/edge0_bench.rs`, not from `serve`. The prefill gate at
-  `src/serve.rs:247` batches only on the host-tier `prefill_ready()`, so the device tier
-  stays token-by-token: the batched call re-locks the GPU mutex that `serve` holds across
-  the layer loop, and its scratch arena overlaps the decode MoE arena.
+- **Status**: reached from `tests/edge0_bench.rs`, not from `serve`. The `let batched` gate
+  in `src/serve.rs` batches only on the host-tier `prefill_ready()`, so the device tier stays
+  token-by-token: the batched call re-locks the GPU mutex that `serve` holds across the layer
+  loop, and its scratch arena overlaps the decode MoE arena.
 - **Measured effect**: none on the served path yet. "One pass per unique expert instead of
   one per token" is arithmetic, not a benchmark; the served device TTFT still trails
   Colibri's, as the Performance section records.
