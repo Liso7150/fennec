@@ -231,11 +231,12 @@ impl Server {
         // Prefill takes the prompt in chunks, one pass over the dense trunk per
         // chunk instead of one per token, and stops one token short so the
         // logits path below stays exactly where it was. Generation stays token
-        // by token: a new token is the argument to the next forward. A device
-        // tier uses device-side batched prefill (Phase 1: loops through forward,
-        // Phase 2: actual GPU batching). Running the device prompt through host
-        // kernels measured 2166 ms against 1750 ms on the VRAM path, so the
-        // device tier keeps its own batched path.
+        // by token: a new token is the argument to the next forward. Chunking
+        // the prompt is host-tier only - the gate below says why. Pulling the
+        // prompt off the device and running it through the host kernels measured
+        // 2166 ms against 1750 ms on the VRAM path, so the device tier keeps its
+        // own device path for the prompt even though it runs it one token at a
+        // time.
         let prompt_len = ids.len();
         // Only the host tier batches the prompt. The device tier's batched
         // `prefill_device` deadlocks: it holds the GPU mutex across the layer
