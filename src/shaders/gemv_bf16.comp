@@ -18,6 +18,8 @@ layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
 // The same weight buffer, viewed as 16-byte words. Binding it twice is what
 // buys the wide load without a second copy of the weights in VRAM.
 layout(set = 0, binding = 3) readonly buffer W4 { uvec4 w4[]; };
+// The activation buffer again, viewed as vec4 for four-float loads.
+layout(set = 0, binding = 4) readonly buffer X4 { vec4 x4[]; };
 
 shared float red[256];
 
@@ -42,9 +44,9 @@ void main() {
             uint quads = half_cols >> 2;
             for (uint i = lane; i < quads; i += 64u) {
                 uvec4 u = w4[(base >> 2) + i];
-                uint c = p.x_off + (i << 3);
-                vec4 x0 = vec4(x[c], x[c + 1u], x[c + 2u], x[c + 3u]);
-                vec4 x1 = vec4(x[c + 4u], x[c + 5u], x[c + 6u], x[c + 7u]);
+                uint c4 = (p.x_off >> 2) + (i << 1);
+                vec4 x0 = x4[c4];
+                vec4 x1 = x4[c4 + 1u];
                 acc += bf(u.x, 0u) * x0.x + bf(u.x, 1u) * x0.y
                      + bf(u.y, 0u) * x0.z + bf(u.y, 1u) * x0.w
                      + bf(u.z, 0u) * x1.x + bf(u.z, 1u) * x1.y

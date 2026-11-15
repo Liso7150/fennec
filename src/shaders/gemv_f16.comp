@@ -18,29 +18,15 @@ layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
 // The same weight buffer, viewed as 16-byte words. Binding it twice is what
 // buys the wide load without a second copy of the weights in VRAM.
 layout(set = 0, binding = 3) readonly buffer W4 { uvec4 w4[]; };
+// The activation buffer again, viewed as vec4 so x is loaded four floats per
+// instruction (the CUDA kernel's ld.global.v4.f32) instead of eight scalars.
+layout(set = 0, binding = 4) readonly buffer X4 { vec4 x4[]; };
 
 shared float red[256];
 
-// Rebase an f16 into an f32 with integer ops only. The tempting one-multiply
-// version (shift the field up 13, scale by 2^112) needs a subnormal f32
-// intermediate for subnormal halves, and this driver flushes those to zero:
-// it silently zeroed 61% of the weights in a small-magnitude test. Normalising
-// the mantissa with findMSB keeps every intermediate normal. The normal-weight
-// case (e != 0, the overwhelming majority of a trained head) needs no findMSB
-// at all, so it returns early and only subnormals pay for the normalisation.
-float hf(uint h) {
-    uint s = (h & 0x8000u) << 16;
-    uint e = (h >> 10) & 0x1Fu;
-    uint m = h & 0x3FFu;
-    if (e != 0u) {
-        return uintBitsToFloat(s | ((e == 31u ? 255u : e + 112u) << 23) | (m << 13));
-    }
-    if (m == 0u) {
-        return uintBitsToFloat(s);
-    }
-    uint sh = 10u - uint(findMSB(m));
-    return uintBitsToFloat(s | ((113u - sh) << 23) | (((m << sh) & 0x3FFu) << 13));
-}
+// f16 -> f32 uses the unpackHalf2x16 built-in (hardware cvt.f32.f16), inline in
+// main. The old software conversion flushed subnormals on this driver when done
+// as a single multiply; unpackHalf2x16 is the standard correct convert.
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
@@ -59,23 +45,30 @@ void main() {
             uint quads = half_cols >> 2;
             for (uint i = lane; i < quads; i += 64u) {
                 uvec4 u = w4[(base >> 2) + i];
-                uint c = p.x_off + (i << 3);
-                vec4 x0 = vec4(x[c], x[c + 1u], x[c + 2u], x[c + 3u]);
-                vec4 x1 = vec4(x[c + 4u], x[c + 5u], x[c + 6u], x[c + 7u]);
+                uint c4 = (p.x_off >> 2) + (i << 1);
+                vec4 x0 = x4[c4];
+                vec4 x1 = x4[c4 + 1u];
+                // unpackHalf2x16 is the hardware f16->f32 convert (the same
+                // cvt.f32.f16 the CUDA kernel uses), one instruction per pair
+                // and correct for subnormals — unlike the old software hf()
+                // which spent ~7 integer ops plus findMSB on every weight.
+                vec2 h0 = unpackHalf2x16(u.x);
+                vec2 h1 = unpackHalf2x16(u.y);
+                vec2 h2 = unpackHalf2x16(u.z);
+                vec2 h3 = unpackHalf2x16(u.w);
                 // Explicit terms, not dot(): dot is free to reduce in any order,
                 // and matching gemv_bf16's order keeps the two shaders' error
                 // against the CPU kernel the same size.
-                acc += hf(u.x) * x0.x + hf(u.x >> 16) * x0.y
-                     + hf(u.y) * x0.z + hf(u.y >> 16) * x0.w
-                     + hf(u.z) * x1.x + hf(u.z >> 16) * x1.y
-                     + hf(u.w) * x1.z + hf(u.w >> 16) * x1.w;
+                acc += h0.x * x0.x + h0.y * x0.y + h1.x * x0.z + h1.y * x0.w
+                     + h2.x * x1.x + h2.y * x1.y + h3.x * x1.z + h3.y * x1.w;
             }
         } else {
             // cols % 8 != 0: a row base is not 16-byte aligned, so read scalars.
             for (uint i = lane; i < half_cols; i += 64u) {
                 uint u = w[base + i];
                 uint c = p.x_off + (i << 1);
-                acc += hf(u) * x[c] + hf(u >> 16) * x[c + 1u];
+                vec2 h = unpackHalf2x16(u);
+                acc += h.x * x[c] + h.y * x[c + 1u];
             }
         }
     }

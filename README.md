@@ -80,7 +80,7 @@ Decode throughput on `qwen36-35b` (RTX 4060 Laptop + Core Ultra 7 155H, 8 thread
 |---------|------|-----------|
 | **CUDA** | **43.4 ms** | **23.0 tok/s** |
 | **CPU** | **92.0 ms** | **10.9 tok/s** |
-| **Vulkan** | **71.2 ms** | **14.0 tok/s** |
+| **Vulkan** | **61.7 ms** | **16.2 tok/s** |
 
 Against [Colibri](https://github.com/JustVugg/colibri) on the same host and session:
 
@@ -88,12 +88,13 @@ Against [Colibri](https://github.com/JustVugg/colibri) on the same host and sess
 |------|--------|---------|---|
 | CPU | 92.0 ms | 111.6 ms | **Fennec ~18% faster** |
 | CPU+GPU (CUDA vs Colibri Vulkan) | 43.4 ms | 45.1 ms | **Fennec ~4% faster** |
-| CPU+GPU (Vulkan) | 71.2 ms | 56.1 ms | Colibri faster |
+| CPU+GPU (Vulkan) | 61.7 ms | 56.1 ms | Colibri ~10% faster |
 
 The CPU win comes from a four-accumulator int4 host-expert dot and an int8
-`lm_head` (the same precision trade Colibri ships). On NVIDIA, **CUDA is the
-recommended device tier**: it beats Colibri's best lane, while the Vulkan SPIR-V
-kernels still trail it.
+`lm_head` (the same precision trade Colibri ships). The Vulkan gap narrowed from
+~51% to ~10% with hardware f16 conversion and vec4 activation loads. On NVIDIA,
+**CUDA is the recommended device tier**: it beats Colibri's best lane, while the
+Vulkan SPIR-V kernels still trail it.
 
 > [!NOTE]
 > Performance varies by hardware, model and box load; quote the steady-state

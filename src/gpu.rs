@@ -689,7 +689,7 @@ impl VkGpu {
                 .map(|t| (t.flags, t.heap))
                 .collect();
 
-            let bindings: Vec<DescriptorSetLayoutBinding> = (0..4)
+            let bindings: Vec<DescriptorSetLayoutBinding> = (0..5)
                 .map(|b| DescriptorSetLayoutBinding {
                     binding: b,
                     kind: DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -1227,7 +1227,7 @@ impl VkGpu {
             if (self.api.allocate_sets)(self.device, &dsai, &mut set) != 0 {
                 return Err("descriptor pool exhausted".into());
             }
-            let infos: Vec<DescriptorBufferInfo> = bufs
+            let mut infos: Vec<DescriptorBufferInfo> = bufs
                 .iter()
                 .map(|&b| DescriptorBufferInfo {
                     buffer: self.bufs[b].buffer,
@@ -1235,7 +1235,15 @@ impl VkGpu {
                     range: WHOLE_SIZE,
                 })
                 .collect();
-            let writes: Vec<WriteDescriptorSet> = (0..4)
+            // Binding 4 is the activation buffer (bufs[1]) again, viewed as
+            // vec4 by the half-precision gemv so it loads x four floats at a
+            // time like the CUDA kernel. Every other shader ignores it.
+            infos.push(DescriptorBufferInfo {
+                buffer: self.bufs[bufs[1]].buffer,
+                offset: 0,
+                range: WHOLE_SIZE,
+            });
+            let writes: Vec<WriteDescriptorSet> = (0..5)
                 .map(|i| WriteDescriptorSet {
                     s_type: ST_WRITE_DESCRIPTOR_SET,
                     p_next: std::ptr::null(),
@@ -1249,7 +1257,7 @@ impl VkGpu {
                     texels: std::ptr::null(),
                 })
                 .collect();
-            (self.api.update_sets)(self.device, 4, writes.as_ptr(), 0, std::ptr::null());
+            (self.api.update_sets)(self.device, 5, writes.as_ptr(), 0, std::ptr::null());
             Ok(set)
         }
     }

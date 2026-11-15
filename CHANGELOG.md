@@ -34,10 +34,15 @@ All notable changes to the Fennec inference engine.
 - **MoE device batch skips the redundant fence wait on CUDA** (`read_syncs`):
   the blocking DtoH read already synchronises the context, so the explicit wait
   paid a second WDDM flush per layer. Vulkan's mapped read still waits.
-- **Vulkan f16 gemv: lazy subnormal conversion** (`gemv_f16.comp`). Normal
-  weights (e != 0, the vast majority of a trained head) return early without
-  `findMSB`; only subnormals pay for the normalisation. Same arithmetic, lm_head
-  ~11.6 → 10.2 ms/token.
+- **Vulkan half-precision gemv: hardware convert + wide activation loads**
+  (`gemv_f16.comp`, `gemv_bf16.comp`). f16→f32 now uses `unpackHalf2x16` (the
+  hardware `cvt.f32.f16` the CUDA kernel uses) instead of a software conversion
+  that spent ~7 integer ops plus `findMSB` per weight; the activation is read as
+  `vec4` through a fifth descriptor binding (X viewed as vec4) instead of eight
+  scalars, matching CUDA's `ld.global.v4.f32`. Vulkan serve 73.2 → 61.7 ms/token.
+  A shared-memory activation-staging variant was tried and reverted: it measured
+  slower (lm_head 9.2 → 11.1 ms), confirming the head is weight-bandwidth-bound,
+  not activation-bound — the same plateau the defect register records.
 
 ### Measured
 - Steady-state backend matrix (qwen36-35b, 64 tokens, 3 pairs, 2 discarded
@@ -45,12 +50,12 @@ All notable changes to the Fennec inference engine.
   decode TPOT, lower is better:
   - **CPU: Fennec 92.0 ms/token vs Colibri 111.6 — Fennec wins ~18%.**
   - **CUDA: Fennec 43.4 ms/token vs Colibri Vulkan 45.1 — Fennec wins ~4%.**
-  - Vulkan: Fennec 71.2 ms/token vs Colibri 56.1 (same session) — Fennec still
-    trails ~27%, down from ~51% before the host-expert work. The Vulkan critical
-    path is GPU-shader bound (mixer device + lm_head + fence waits); the same
-    engine on CUDA beats Colibri, so the gap is the Vulkan SPIR-V kernels, a
-    measured plateau recorded in the defect register. On NVIDIA, CUDA is the
-    recommended device tier.
+  - Vulkan: Fennec 61.7 ms/token vs Colibri 56.1 (same session) — Fennec still
+    trails ~10%, down from ~51% before the host-expert and shader work. The
+    Vulkan critical path is GPU-shader bound (mixer device + lm_head + fence
+    waits); the same engine on CUDA beats Colibri, so the residual gap is the
+    Vulkan SPIR-V driver codegen, a measured plateau recorded in the defect
+    register. On NVIDIA, CUDA is the recommended device tier.
   - Before these changes Fennec CPU was 154.5 ms/token (Colibri 102.4 in that
     session); the host-expert and lm_head work closed the CPU gap.
 - AVX-VNNI `vpdpbusd` was tried for the host dot and reverted: this hybrid CPU
