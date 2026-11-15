@@ -1515,7 +1515,6 @@ impl<'a> VkBatch<'a> {
                 rows as u32,     // y_stride
                 x_off as u32,
                 y_off as u32,
-                0,               // row_base (filled by tall-split)
             ],
             groups,
             groups,

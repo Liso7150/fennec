@@ -63,21 +63,28 @@ The routing pipeline:
 
 ### Batched GPU Prefill
 
-`Model::prefill_device` (`src/model.rs:3177`) runs a chunk of prompt tokens through the
+`Model::prefill_device` (`src/model.rs:3247`) runs a chunk of prompt tokens through the
 layers in batches, so a weight block is read once for the chunk instead of once per token:
 
 - **Batched operations** (GPU): RMSNorm, AXPY residual, GDN projections (5× per layer),
   Attention projections (4× per layer) - the five `*_batch.comp` shaders
 - **Grouped expert union**: host experts grouped by ID across the chunk, one pass per
-  unique expert (`MoeLayer::prefill_device_grouped`, `src/model.rs:1228`)
-- **Device expert fallback**: VRAM-resident experts still take the per-token forward
-- **Status**: reached from `tests/edge0_bench.rs`, not from `serve`. The `let batched` gate
-  in `src/serve.rs` batches only on the host-tier `prefill_ready()`, so the device tier stays
-  token-by-token: the batched call re-locks the GPU mutex that `serve` holds across the layer
-  loop, and its scratch arena overlaps the decode MoE arena.
-- **Measured effect**: none on the served path yet. "One pass per unique expert instead of
-  one per token" is arithmetic, not a benchmark; the served device TTFT still trails
-  Colibri's, as the Performance section records.
+  unique expert (`MoeLayer::prefill_device_grouped`, `src/model.rs:1304`)
+- **Device expert fallback**: a token with any VRAM-resident pick leaves the union and
+  takes the per-token forward - the union splits by token, not by pick
+- **Status**: built and numerically checked against the token loop, reached from the
+  tests, and **not served**. The `let batched` gate in `src/serve.rs` batches only on the
+  host-tier `prefill_ready()`; the mutex re-lock and the overlapping scratch arena that
+  used to block this path are fixed. What keeps the device tier out is measurement: a
+  25-token prompt prefilled in 2.014-2.120 s chunked against 1.419-1.540 s as 25 per-token
+  device forwards, +0.57 to +0.64 s in 4 of 4 ABBA rounds with both orders agreeing, on
+  2026-11-15.
+- **Why it lost, and what would fix it**: on a tier with this much of the stack in VRAM
+  almost every prompt token has at least one device expert, so it leaves the union and
+  runs the device chain one at a time anyway. The chunk pays the arena round-trips and the
+  union bookkeeping without amortising the host-expert work that dominates its own prompt
+  profile. The lever is a **pick-level** union (batch host picks across all prompt tokens,
+  or keep the chunk resident on-device); flip the gate after that, not before.
 
 ## Performance
 
@@ -120,9 +127,12 @@ its four visits.
   against the two paired levels above.
 - Time to first token still favours Colibri when a device is attached: 1.42 s
   against 0.67 s on the same 27-token prompt (64-token budget, ctx 32768) in the
-  10:47Z session. The served device tier still prefills token by token — the
-  batched `prefill_device` is offline there because of the mutex and arena
-  conflict recorded in `serve.rs` — so this is the open item, not a closed one.
+  10:47Z session. The served device tier prefills token by token on purpose: the
+  batched `prefill_device` was served and measured **worse** - 2.014-2.120 s
+  against 1.419-1.540 s for the same 25-token prompt, +0.57 to +0.64 s in 4 of 4
+  ABBA rounds with both orders agreeing - so the gate is back on the host tier
+  until the expert union splits by pick rather than by token. This is the open
+  item, not a closed one.
 
 Earlier builds of this engine measured 154.5 ms/token on the CPU lane and 73.2 on
 Vulkan. Both came from their own sessions, so against today's paired levels they
@@ -178,7 +188,7 @@ fennec serve --backend ort --model <model-dir>
 ## Testing
 
 ```bash
-# Run all tests (117 passing)
+# Run all tests (119 passing)
 cargo test --release --offline
 
 # Backend-specific tests
@@ -192,7 +202,7 @@ FENNEC_GOLDEN_MODEL=<model-dir> cargo test --release --offline --test golden
 python tools/smoke_serve.py  # 30 checks against running server
 ```
 
-**Test coverage**: 117 tests total
+**Test coverage**: 119 tests total
 - 79 unit tests (quantizer, kernels, auth, sampler, device discovery, memory)
 - 14 golden tests against transformers 5.22.2 reference
 - 9 device-vs-CPU integration tests
@@ -315,4 +325,4 @@ MIT License - see LICENSE file for details.
 **1.0.0** - the working version in `Cargo.toml`. Nothing at 1.0.0 has been published:
 this repo carries no tags and no releases, and the published Fennec ladder (`v0.1.0` …
 `v0.9.0`, newest 2026-11-11T19:29Z) lives in the nine suite repos. Measured on this tree
-2026-11-15: `cargo test --release --offline` -> 117 passed, 0 failed, 3 ignored.
+2026-11-15: `cargo test --release --offline` -> 119 passed, 0 failed, 3 ignored.

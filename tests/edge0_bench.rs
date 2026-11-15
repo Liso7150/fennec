@@ -33,7 +33,7 @@ pub fn bench_edge0_prefill(
         xs.fill(0.0);
         
         let start = Instant::now();
-        model.prefill_device(&mut xs, &mut state, 0);
+        let _ = model.prefill_device(&mut xs, &mut state, 0);
         ttft_total += start.elapsed();
     }
     

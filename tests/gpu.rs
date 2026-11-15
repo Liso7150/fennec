@@ -22,7 +22,7 @@ use fennec::quant::Q4;
 use fennec::safetensors::Shards;
 use fennec::sched::{LayerPlan, Plan};
 
-const MODEL: &str = r"D:\MEGAsync-sync\colibri-models\Qwen3.6-35B-A3B-bf16";
+const MODEL: &str = r"D:\fennec-models\Qwen3.6-35B-A3B-bf16";
 
 /// The bf16 export by default. `FENNEC_TEST_MODEL` points these tests at the
 /// shipped int4 export instead, whose lm_head is f16 — a different kernel, and
@@ -560,8 +560,8 @@ fn dense_projections_on_the_device_match_the_cpu_stack() {
 
     // A silent fallback to the CPU would pass the numeric comparison and prove
     // nothing, so assert the move happened and the host copies were released.
-    // A device plan therefore has no batched prompt path either (`prefill_ready`
-    // is false), which is measured, not assumed: see `Model::prefill_ready`.
+    // The batch prompt path a device plan has is the device one: `prefill_ready`
+    // stays false because its kernels are host kernels the plan dropped.
     let gdn = dev.layers[0].gdn.as_ref().unwrap();
     let attn = dev.layers[1].attn.as_ref().unwrap();
     assert!(gdn.dev.is_some(), "the delta net did not move to the device");
@@ -1466,4 +1466,183 @@ fn moe_kernel_shapes() {
         us("layer ideal") * layers as f64 / 1000.0
     );
     println!("  (compare with MOE_CPU + MOE_SYNC + MOE_READ on a served decode)");
+}
+
+/// The batch kernels the device prefill runs, diffed against the single-token
+/// kernels decode runs (and the host reference for the same shape). Nothing had
+/// ever dispatched these before: `serve` never reached the device prefill, and
+/// the one caller that did sat behind `#[ignore]`, so the first real run of
+/// `gemv_half_batch` was the stack test below.
+#[test]
+fn the_batch_kernels_are_the_single_ones() {
+    let Some(mut g) = gpu() else { return };
+    let threads = 8;
+
+    // rows x cols, over n tokens. 260 000 rows is 65 000 workgroups, past the
+    // 65 535 the spec guarantees, so the last shape also walks the row_base split.
+    for (rows, cols, n) in [
+        (300usize, 2048usize, 4usize),
+        (8192, 2048, 6),
+        (64, 512, 2),
+        (260_000, 64, 3),
+    ] {
+        let (yb, xs) = (n * cols, lcg(n * cols, 11, 1.0));
+        for f16 in [false, true] {
+            let w = if f16 { f16_bytes(&lcg(rows * cols, 7, 0.05)) } else { bf16_bytes(&lcg(rows * cols, 7, 0.05)) };
+            let mut want = vec![0f32; n * rows];
+            let fmt = if f16 { kernel::Half::F16 } else { kernel::Half::Bf16 };
+            kernel::gemv_half_batch(&w, rows, cols, &xs, &mut want, threads, fmt);
+            let wb = if f16 { g.upload_half(&w, true).unwrap() } else { g.upload(&w).unwrap() };
+            g.reserve(yb + n * rows).unwrap();
+            g.write(0, &xs);
+            g.batch()
+                .unwrap()
+                .gemv_half_batch(wb, rows, cols, n, 0, yb)
+                .unwrap()
+                .run()
+                .unwrap();
+            let got = g.read(yb, n * rows);
+            close(&format!("{} batch {rows}x{cols} over {n} tokens", if f16 { "f16" } else { "bf16" }), &want, &got, 2e-6);
+        }
+    }
+
+    // Batched RMSNorm: one workgroup per token, gains read out of the arena the
+    // way the prefill stages them.
+    let (h, n, eps) = (2048usize, 5usize, 1e-6f32);
+    let xs = lcg(n * h, 17, 1.0);
+    let wt = lcg(h, 19, 0.1);
+    let mut want = vec![0f32; n * h];
+    for t in 0..n {
+        kernel::rmsnorm(&xs[t * h..(t + 1) * h], &wt, eps, &mut want[t * h..(t + 1) * h]);
+    }
+    g.reserve(3 * n * h + h).unwrap();
+    g.write(0, &xs);
+    g.write(3 * n * h, &wt);
+    g.batch().unwrap().rmsnorm_batch(h, n, 0, 3 * n * h, n * h, eps).unwrap().run().unwrap();
+    close("rmsnorm batch", &want, &g.read(n * h, n * h), 2e-6);
+
+    // Batched axpy over the whole chunk, the residual add the layer runs twice.
+    let add = lcg(n * h, 23, 0.5);
+    let mut want = xs.clone();
+    for t in 0..n {
+        kernel::axpy(&mut want[t * h..(t + 1) * h], &add[t * h..(t + 1) * h], 0.75);
+    }
+    g.write(0, &xs);
+    g.write(2 * n * h, &add);
+    g.batch().unwrap().axpy_batch(h, n, 2 * n * h, 0, 0.75, false).unwrap().run().unwrap();
+    close("axpy batch", &want, &g.read(0, n * h), 2e-6);
+}
+/// The served prompt path on the device tier, diffed against the same stack
+/// walked one token at a time - the loop `serve` used before this existed. The
+/// two read each dense projection a different number of times, so this is what
+/// says the batching costs nothing in answers. Each block is also checked on
+/// its own, and the mixer states are compared next to the hidden states: a
+/// chunk that mis-handles the conv window or the KV row can still hand back a
+/// plausible last token and only go wrong on the first decode.
+#[test]
+fn the_batched_device_prefill_is_the_token_loop() {
+    let Some(g) = gpu() else { return };
+    let model = model();
+    if !std::path::Path::new(&model).is_dir() {
+        println!("  no checkpoint at {model}");
+        return;
+    }
+    let sh = Arc::new(Shards::open(&model).expect("shards"));
+    let cfg = Arc::new(TextConfig::from_file(&format!("{model}/config.json")).expect("config"));
+    let (group, threads, h) = (32usize, 8usize, cfg.hidden_size);
+    let all: Vec<usize> = (0..cfg.num_experts).collect();
+    let gpu = Arc::new(Mutex::new(g));
+
+    let toks = [15059usize, 9948, 271, 1024, 311, 4096];
+    // Layer 0 is a gated delta net, layer 3 a full attention block.
+    for layers in [&[0usize][..], &[3][..], &[0, 3][..]] {
+        let plan = Plan {
+            layers: layers
+                .iter()
+                .map(|&l| LayerPlan {
+                    layer: l,
+                    resident: Vec::new(),
+                    pooled: all.clone(),
+                    streamed: Vec::new(),
+                    bytes_expert: 0,
+                    dense_bytes: 0,
+                    dense_on_device: true,
+                })
+                .collect(),
+            device_bytes_used: 0,
+            device_bytes_budget: 0,
+            host_bytes_used: 0,
+            host_bytes_budget: 0,
+            device_hit_rate: 0.0,
+            host_hit_rate: 0.0,
+            disk_rate: 0.0,
+            expert_bytes: 0,
+            dense_bytes_layer: 0,
+            ms_per_token: 0.0,
+            lm_head_ms: 0.0,
+        };
+        let dev = Model::load_plan(&sh, cfg.clone(), &plan, group, threads, 8, 0, Some(gpu.clone()))
+            .expect("device stack");
+        assert!(dev.prefill_device_ready(), "a device plan can batch its prompt on the device");
+        assert!(!dev.prefill_ready(), "a device plan has no batched host prompt path to fall back on");
+
+        let mut emb = vec![0f32; toks.len() * h];
+        for (t, &id) in toks.iter().enumerate() {
+            let x = dev.embed_row(&sh, id).expect("embed");
+            emb[t * h..(t + 1) * h].copy_from_slice(&x);
+        }
+        for n in [1usize, 2, 6] {
+            let want = format!("layers {layers:?} chunk {n}");
+            let mut chunk = emb[..n * h].to_vec();
+            // Batched first: the device holds one mixer state buffer per layer,
+            // and the token loop reuses it, so the chunk's own state has to be
+            // read out before the reference run overwrites it.
+            let mut st_b = dev.states(n);
+            dev.prefill_device(&mut chunk, &mut st_b, 0).expect("device prefill");
+            let kept: Vec<Vec<f32>> = st_b
+                .iter()
+                .map(|s| match s {
+                    LayerState::Linear(p) => [p.conv.as_slice(), p.rec.as_slice()].concat(),
+                    LayerState::Full(a) => [a.k.as_slice(), a.v.as_slice()].concat(),
+                })
+                .collect();
+
+            let mut stepped = vec![0f32; n * h];
+            let mut st_s = dev.states(n);
+            for pos in 0..n {
+                let mut x = emb[pos * h..(pos + 1) * h].to_vec();
+                dev.forward(&mut x, &mut st_s, pos);
+                stepped[pos * h..(pos + 1) * h].copy_from_slice(&x);
+            }
+            // The token loop leaves the delta-net state in VRAM; the chunk keeps
+            // it on the host. Pull the reference back before diffing the two.
+            for (l, s) in dev.layers.iter().zip(st_s.iter_mut()) {
+                if let LayerState::Linear(p) = s {
+                    l.gdn.as_ref().unwrap().sync_state(p).expect("read the device state back");
+                }
+            }
+            for t in 0..n {
+                close(
+                    &format!("{want} token {t} hidden state"),
+                    &stepped[t * h..(t + 1) * h],
+                    &chunk[t * h..(t + 1) * h],
+                    2e-5,
+                );
+            }
+            for (l, (want_, st)) in kept.iter().zip(st_s.iter()).enumerate() {
+                let now: Vec<f32> = match st {
+                    LayerState::Linear(p) => [p.conv.as_slice(), p.rec.as_slice()].concat(),
+                    LayerState::Full(a) => [a.k.as_slice(), a.v.as_slice()].concat(),
+                };
+                close(&format!("{want} layer {l} mixer state"), want_, &now, 2e-5);
+            }
+        }
+    }
+
+    let g = gpu.lock().unwrap();
+    println!(
+        "  {} dispatches in {} submits",
+        g.dispatches(),
+        g.submitted(),
+    );
 }
