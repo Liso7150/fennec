@@ -2,7 +2,21 @@
 
 All notable changes to the Fennec inference engine.
 
-## [Unreleased]
+This repo publishes nothing: `git tag -l` is empty and
+`gh api repos/Liso7150/fennec/releases` returns an empty list, both checked
+2026-11-15. The published Fennec ladder - `v0.1.0` … `v0.9.0`, newest
+2026-11-11T19:29Z - lives in the nine suite repos. `Cargo.toml` here says
+1.0.0, and nothing at 1.0.0 has been published.
+
+The headings below therefore carry the date the work happened, not a tag date.
+This repo's first commit is 2026-11-13 (35 commits through 2026-11-15), so the
+0.5.0-0.8.0 milestones describe engine work that predates this history. They do
+not line up with the suite repos' published tags of the same number either: the
+published `v0.9.0` in `fennec-core` is 2026-11-11, while the 0.9.0 milestone
+here - the ORT integration - is 2026-11-13. The 2.x numbering an earlier
+revision of this file used was retracted; no 2.x was ever published anywhere.
+
+## [Unreleased] — 1.0.0 in preparation
 
 ### Fixed
 - **GPU serve deadlock on the first request.** `Model::prefill_device` held the
@@ -48,6 +62,25 @@ All notable changes to the Fennec inference engine.
 - **MoE device batch skips the redundant fence wait on CUDA** (`read_syncs`):
   the blocking DtoH read already synchronises the context, so the explicit wait
   paid a second WDDM flush per layer. Vulkan's mapped read still waits.
+- **Vulkan int4 gemv: eight lanes per row, eight rows per workgroup**
+  (`gemv_q4.comp`). A row used to own a whole 64-thread workgroup, so its
+  reduction cost six barrier steps and the per-row time was flat in bytes rather
+  than in bandwidth. Eight lanes now split a row (three steps) and a workgroup
+  covers eight rows, so the nibble LUT and its barrier are paid once for eight
+  rows instead of once per row, and the activation is read as `vec4`. The decode
+  MoE measured 1006.5 → 264.0 us per layer (3.81x), 40.26 → 10.56 ms per token
+  over 40 layers. Re-run on 2026-11-15 the same probe reads 1179.1 → 280.6 us per
+  layer (4.20x) and 47.16 → 11.22 ms per token, so the ratio is the claim and the
+  levels are one run each: `tests/gpu.rs moe_kernel_shapes` is an `#[ignore]`d
+  device-timing probe that prints instead of asserting, so it runs under
+  `cargo test --release --offline --test gpu -- --ignored`, not inside the
+  default 117. Eight partials folded by a three-step tree is a different
+  association of the same products, and the same probe checks it: the new kernel
+  stays within 1e-5 relative RMS of the one-row reference over a whole layer and
+  at two quant-group widths (32 and 64) - also only under `--ignored`. Two other
+  shapes were priced and rejected —
+  concatenating the k expert blocks into one dispatch (the kernel is not
+  dispatch-bound) and four rows per 256-thread workgroup (slower than both).
 - **Vulkan half-precision gemv: hardware convert + wide activation loads**
   (`gemv_f16.comp`, `gemv_bf16.comp`). f16→f32 now uses `unpackHalf2x16` (the
   hardware `cvt.f32.f16` the CUDA kernel uses) instead of a software conversion
@@ -59,24 +92,55 @@ All notable changes to the Fennec inference engine.
   not activation-bound — the same plateau the defect register records.
 
 ### Measured
-- Steady-state backend matrix (qwen36-35b, 64 tokens, 3 pairs, 2 discarded
-  full-length warm-ups, RTX 4060 Laptop + Core Ultra 7 155H). Same-session
-  decode TPOT, lower is better:
-  - **CPU: Fennec 92.0 ms/token vs Colibri 111.6 — Fennec wins ~18%.**
-  - **CUDA: Fennec 43.4 ms/token vs Colibri Vulkan 45.1 — Fennec wins ~4%.**
-  - Vulkan: Fennec 61.7 ms/token vs Colibri 56.1 (same session) — Fennec still
-    trails ~10%, down from ~51% before the host-expert and shader work. The
-    Vulkan critical path is GPU-shader bound (mixer device + lm_head + fence
-    waits); the same engine on CUDA beats Colibri, so the residual gap is the
-    Vulkan SPIR-V driver codegen, a measured plateau recorded in the defect
-    register. On NVIDIA, CUDA is the recommended device tier.
-  - Before these changes Fennec CPU was 154.5 ms/token (Colibri 102.4 in that
-    session); the host-expert and lm_head work closed the CPU gap.
+- Paired ABBA against Colibri (qwen36-35b, 64-token greedy budget, 32768-token
+  context, 8 threads, two discarded full-length warm-ups, one request per visit,
+  cold server launch per visit, RTX 4060 Laptop + Core Ultra 7 155H, 21-22 GB
+  free at session start), session `2026-11-15T09:28Z`:
+  - CPU: Fennec 115.6 vs Colibri 137.4 ms/token — **Fennec faster in 4 of 4
+    rounds** (per-round deltas -23.3 / -21.8 / -14.9 / -13.4 ms, both orders
+    agree).
+  - Vulkan: Fennec 68.7 vs Colibri 66.2 ms/token — Colibri faster in 4 of 4
+    rounds (+7.7 / +4.7 / +4.7 / +2.5 ms, both orders agree).
+  - CUDA: Fennec 56.5 ms/token, block-ordered. Colibri has no CUDA tier on this
+    box (its `qwen36.exe` carries no `coli_cuda.dll`), so that cell is recorded
+    unavailable with the evidence rather than as a comparator.
+- Vulkan re-run after the `gemv_q4.comp` swap, session `2026-11-15T10:47Z`:
+  Fennec 57.3 vs Colibri 57.5 ms/token, Fennec faster in 3 of 4 rounds, median
+  delta -0.24 ms/token. **The two orders disagree** (+3.2 in `ab`, -1.5 in `ba`),
+  so no winner may be named from it; what it does say is that the +4.7 ms/token
+  deficit is gone and the lane is at parity. Both engines read ~12 ms/token
+  faster than in the 09:28Z session, so the levels of the two sessions are not
+  comparable — only the per-round deltas are.
+- **Two headline claims are retracted.** An earlier revision of this section
+  read "CPU: Fennec 92.0 vs Colibri 111.6 — Fennec wins ~18%" and "CUDA 43.4 vs
+  Colibri Vulkan 45.1 — Fennec wins ~4%". No archived matrix session produces
+  that pair: each number came from a different session, and one CPU cell had been
+  merged into a table built from another.
+- Earlier revisions of this section led with the block-ordered matrix of session
+  `2026-11-15T08:23Z` (CPU 114.3 vs 97.7, Vulkan 66.0 vs 60.3). It is superseded
+  by the paired sessions above: paired ABBA replaced block ordering because the
+  same unchanged Fennec binary read 85.1 ms/token in one block session and 121.3
+  in another, so a block-ordered CPU "loss" was never a comparison of engines.
+- The matrix driver now refuses to start when another engine or another copy of
+  itself is live, and records free RAM per cell. Two concurrent drivers on
+  2026-11-15 put the CPU lane at 191 ms/token against 92-114 on a quiet box.
 - AVX-VNNI `vpdpbusd` was tried for the host dot and reverted: this hybrid CPU
   reports `avxvnni` in CPUID but traps the 256-bit instruction (SIGILL), so the
   maddubs path stays. Colibri's `IDOT_KERNEL` is also `avx2` on this box.
+- CPU `gemv_i8` work decomposition, from the ignored probe
+  `tests/dense_i8.rs gemv_i8_throughput_at_the_real_projection_shapes` (synthetic
+  weights, 8 workers left unpinned over 6 performance cores, run with
+  `cargo test --release --offline --test dense_i8 -- --ignored`): one dispatch of
+  each real projection shape reads 84.9-105.9 GiB/s (gdn in_qkv 98.2, in_z 84.9,
+  out_proj 96.9, attn q_proj 105.9, o_proj 80.4; k_proj 47.5) and the lm_head
+  49.1. The same 24 MiB as one call against split in two reads 0.330 ms against
+  0.308 ms, so dispatch granularity is not what costs the lane. All 40 layers'
+  projections in token order read 33.59 ms over 1.18 GiB = 35.2 GiB/s, against the
+  served profiler's 38.57 ms at 33 GiB/s: the shortfall is the interleaving of 40
+  different matrices inside one token, not the kernel and not the call count, so
+  only the model loop can move it.
 
-## [1.0.0] - 2026-11-14
+## 1.0.0 milestone - work of 2026-11-14 (unpublished)
 
 ### Added
 - Edge0-145B model support: GGUF reader, latent MoE detection, hybrid attention config
@@ -106,7 +170,7 @@ All notable changes to the Fennec inference engine.
 - Plugin doctest and eliminated warnings
 - All 115 tests passing
 
-## [2.5.0] - 2026-11-13
+## 1.0.0 milestone - work of 2026-11-13 (unpublished; this section was headed `2.5.0`, a version that was never published)
 
 ### Added
 - Three-tier Rust MoE engine: device (VRAM) / host (RAM) / cold (NVMe)
