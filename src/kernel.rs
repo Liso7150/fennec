@@ -751,9 +751,12 @@ fn row_dot_i8(row: &[i8], xu: &[u8], wsum: i32, scale: f32, vec: bool) -> f32 {
 
 #[inline]
 fn scalar_i8(row: &[i8], xu: &[u8]) -> i32 {
+    // Sum the raw offset-binary products, exactly like the AVX2 maddubs path;
+    // row_dot_i8 undoes the +64 activation bias once via `acc - 64 * wsum`.
+    // Subtracting 64 here as well would correct the offset twice.
     let mut s = 0i32;
     for c in 0..row.len() {
-        s += (xu[c] as i32 - 64) * row[c] as i32;
+        s += xu[c] as i32 * row[c] as i32;
     }
     s
 }
@@ -1314,12 +1317,30 @@ mod tests {
                     let mut want = vec![0f32; rows];
                     gemv_half(&w, rows, cols, &x, &mut got, threads, fmt);
                     gemv(&exact, rows, cols, &x, &mut want, threads);
+                    // Both kernels accumulate in the same SIMD order on the AVX2
+                    // path (f16c too for F16), so the bits match exactly there.
+                    // The scalar fallback (ARM, or x86 without those features)
+                    // sums in a different order and differs by f32 rounding.
+                    #[cfg(target_arch = "x86_64")]
+                    let simd = std::is_x86_feature_detected!("avx2")
+                        && (fmt == Half::Bf16 || std::is_x86_feature_detected!("f16c"));
+                    #[cfg(not(target_arch = "x86_64"))]
+                    let simd = false;
                     for r in 0..rows {
-                        assert_eq!(
-                            got[r].to_bits(), want[r].to_bits(),
-                            "{fmt:?} cols {cols} threads {threads} row {r}: {} vs {}",
-                            got[r], want[r]
-                        );
+                        if simd {
+                            assert_eq!(
+                                got[r].to_bits(), want[r].to_bits(),
+                                "{fmt:?} cols {cols} threads {threads} row {r}: {} vs {}",
+                                got[r], want[r]
+                            );
+                        } else {
+                            let rel = (got[r] - want[r]).abs() / want[r].abs().max(1e-6);
+                            assert!(
+                                rel < 1e-5,
+                                "{fmt:?} cols {cols} threads {threads} row {r}: {} vs {} (rel {rel:.2e})",
+                                got[r], want[r]
+                            );
+                        }
                     }
                 }
             }

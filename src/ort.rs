@@ -444,8 +444,13 @@ mod tests {
 
     #[test]
     fn the_provider_follows_the_device() {
-        assert_eq!(OrtEp::for_device(&dev(0x1002, "AMD", "Radeon", false)), OrtEp::DirectML);
-        assert_eq!(OrtEp::for_device(&dev(0x8086, "Intel", "Arc", false)), OrtEp::DirectML);
+        // DirectML is a Windows API: a non-Apple GPU gets it only on Windows and
+        // falls back to the CPU EP elsewhere. The AI Boost (OpenVINO) and Apple
+        // (CoreML) picks are platform-independent — they precede the Windows
+        // branch in for_device.
+        let gpu_ep = if cfg!(windows) { OrtEp::DirectML } else { OrtEp::Cpu };
+        assert_eq!(OrtEp::for_device(&dev(0x1002, "AMD", "Radeon", false)), gpu_ep);
+        assert_eq!(OrtEp::for_device(&dev(0x8086, "Intel", "Arc", false)), gpu_ep);
         assert_eq!(OrtEp::for_device(&dev(0x8086, "Intel", "Intel(R) AI Boost", false)), OrtEp::OpenVINO);
         assert_eq!(OrtEp::for_device(&dev(0x106B, "Apple", "M3", true)), OrtEp::CoreML);
         assert_eq!(OrtEp::for_device(&dev(0, "Apple", "M3", true)), OrtEp::CoreML);
