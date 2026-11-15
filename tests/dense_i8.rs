@@ -136,3 +136,163 @@ fn the_int8_dense_trunk_keeps_the_next_token_and_stays_in_band() {
         "int8 moved the last logits past the measured band"
     );
 }
+
+/// The CPU lane's `FENNEC_PROFILE` breakdown says the mixer projections read
+/// 1.28 GB of int8 in 38.6 ms — 33 GB/s — while the *same kernel* on the
+/// lm_head reads 508 MB in 9.7 ms, 52 GB/s. One of those two numbers is not a
+/// property of `gemv_i8`, so this probe separates the two remaining causes
+/// without loading the 35B checkpoint: dispatch granularity (a GDN layer calls
+/// the kernel three times, so each worker gets ~1.5 MB and then waits at a
+/// barrier) against interleaving (40 different matrices in a token versus one
+/// continuous stream). Same bytes, one call vs three, is the deciding row; if
+/// it is a tie, the shortfall is the interleaving and only the model loop can
+/// fix it. `#86` reverted a projection fuse at -14.4%, which is why this
+/// measures the shape before anything touches `GdnLayer::step`.
+#[test]
+#[ignore = "throughput probe: needs a quiet box and ~1.5 GB of synthetic weights"]
+fn gemv_i8_throughput_at_the_real_projection_shapes() {
+    const H: usize = 2048;
+    const CD: usize = 8192;
+    const VD: usize = 4096;
+    // The pool is a `OnceLock`, so one process measures one pool size: the
+    // sweep is one run per width. 6 is the width that gets the pool pinned
+    // one worker per performance core; 8 is what the CPU lane runs by
+    // default and stays unpinned on this box.
+    let workers: usize = env::var("PROBE_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    kernel::set_threads(workers);
+
+    // Deterministic pseudo-weights with the magnitudes a trained row has: the
+    // kernel's cost is bytes, so the values only have to keep `wsum` honest.
+    fn mat(rows: usize, cols: usize) -> (Vec<i8>, Vec<i32>, Vec<f32>) {
+        let mut st = 0x9E3779B97F4A7C15u64 ^ (rows * 2654435761) as u64;
+        let mut w = Vec::with_capacity(rows * cols);
+        for _ in 0..rows * cols {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            w.push(((st >> 33) as u8) as i8);
+        }
+        let wsum = (0..rows)
+            .map(|r| w[r * cols..(r + 1) * cols].iter().map(|&v| v as i32).sum())
+            .collect();
+        let scale = vec![0.008f32; rows];
+        (w, wsum, scale)
+    }
+
+    let run = |m: &(Vec<i8>, Vec<i32>, Vec<f32>), rows: usize, cols: usize, x: &[f32], out: &mut [f32]| {
+        kernel::gemv_i8(&m.0, &m.1, &m.2, rows, cols, x, out, workers);
+    };
+
+    // ~50 ms of one shape, so a Windows timer tick is not the measurement.
+    let timed = |m: &(Vec<i8>, Vec<i32>, Vec<f32>), rows: usize, cols: usize, x: &[f32], out: &mut [f32]| -> f64 {
+        let reps = (2_500_000_000usize / (rows * cols)).clamp(4, 400);
+        run(m, rows, cols, x, out);
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            run(m, rows, cols, x, out);
+        }
+        t0.elapsed().as_secs_f64() * 1e3 / reps as f64
+    };
+
+    const GIB: f64 = (1u64 << 30) as f64;
+    const MIB: f64 = (1u64 << 20) as f64;
+    let gib = |bytes: f64, ms: f64| bytes / GIB / (ms / 1e3);
+    let x: Vec<f32> = (0..H).map(|i| ((i as f32 * 0.37).sin()) * 0.8).collect();
+    let xv: Vec<f32> = (0..VD).map(|i| ((i as f32 * 0.21).sin()) * 0.8).collect();
+
+    // The real shapes, alone.
+    let shapes: [(&str, usize, usize); 6] = [
+        ("gdn in_qkv", CD, H),
+        ("gdn in_z", VD, H),
+        ("gdn out_proj", H, VD),
+        ("attn q_proj", CD, H),
+        ("attn k_proj", 512, H),
+        ("attn o_proj", H, VD),
+    ];
+    println!("  gemv_i8 alone, one dispatch of each shape, {workers} workers:");
+    for (name, rows, cols) in shapes {
+        let m = mat(rows, cols);
+        let mut out = vec![0f32; rows];
+        let ms = timed(&m, rows, cols, if cols == H { &x } else { &xv }, &mut out);
+        println!(
+            "    {name:<14} {rows:>6}x{cols:<6} {ms:7.3} ms  {:5.1} GiB/s",
+            gib((rows * cols) as f64, ms)
+        );
+    }
+
+    // lm_head, for the rate the profiler credits at 52 GB/s.
+    let head = mat(248320, H);
+    let mut hout = vec![0f32; 248320];
+    let hms = timed(&head, 248320, H, &x, &mut hout);
+    println!(
+        "    {:<14} {:>6}x{:<6} {hms:7.3} ms  {:5.1} GiB/s",
+        "lm_head",
+        248320,
+        H,
+        gib(248320.0 * H as f64, hms)
+    );
+
+    // Same bytes, one dispatch vs two: the fuse question in isolation.
+    let big = mat(CD + VD, H);
+    let a = mat(CD, H);
+    let b = mat(VD, H);
+    let mut o12 = vec![0f32; CD + VD];
+    let mut oa = vec![0f32; CD];
+    let mut ob = vec![0f32; VD];
+    run(&big, CD + VD, H, &x, &mut o12);
+    let t0 = std::time::Instant::now();
+    for _ in 0..200 {
+        run(&big, CD + VD, H, &x, &mut o12);
+    }
+    let one = t0.elapsed().as_secs_f64() * 1e3 / 200.0;
+    run(&a, CD, H, &x, &mut oa);
+    let t0 = std::time::Instant::now();
+    for _ in 0..200 {
+        run(&a, CD, H, &x, &mut oa);
+        run(&b, VD, H, &x, &mut ob);
+    }
+    let two = t0.elapsed().as_secs_f64() * 1e3 / 200.0;
+    let bytes = (CD + VD) as f64 * H as f64;
+    println!(
+        "  same {:.1} MiB, one call vs two: {one:.3} ms ({:.1} GiB/s) | {two:.3} ms ({:.1} GiB/s)",
+        bytes / MIB,
+        gib(bytes, one),
+        gib(bytes, two)
+    );
+
+    // The whole token's worth of projections, in layer order, with every
+    // layer's own matrices: this is what the engine actually does.
+    let gdn: Vec<_> = (0..30).map(|_| (mat(CD, H), mat(VD, H), mat(H, VD))).collect();
+    let attn: Vec<_> = (0..10).map(|_| (mat(CD, H), mat(512, H), mat(H, VD))).collect();
+    let tok_bytes = 30.0 * ((CD + VD) as f64 * H as f64 + (H * VD) as f64)
+        + 10.0 * ((CD + 512) as f64 * H as f64 + (H * VD) as f64);
+    let mut q = vec![0f32; CD];
+    let mut z = vec![0f32; VD];
+    let mut sm = vec![0f32; H];
+    let mut k = vec![0f32; 512];
+    let mut seq_ms = 0f64;
+    for _ in 0..8 {
+        let t0 = std::time::Instant::now();
+        for (in_qkv, in_z, out_proj) in &gdn {
+            run(in_qkv, CD, H, &x, &mut q);
+            run(in_z, VD, H, &x, &mut z);
+            run(out_proj, H, VD, &xv, &mut sm);
+        }
+        for (qo, ko, oo) in &attn {
+            run(qo, CD, H, &x, &mut q);
+            run(ko, 512, H, &x, &mut k);
+            run(oo, H, VD, &xv, &mut sm);
+        }
+        seq_ms += t0.elapsed().as_secs_f64() * 1e3;
+    }
+    seq_ms /= 8.0;
+    println!(
+        "  all 40 layers' projections in order: {seq_ms:.2} ms/token over {:.2} GiB = {:.1} GiB/s (profiler: 38.57 ms at 33 GiB/s)",
+        tok_bytes / GIB,
+        gib(tok_bytes, seq_ms)
+    );
+    assert!(seq_ms > 0.0 && one > 0.0 && hms > 0.0, "the probe measured nothing");
+}
