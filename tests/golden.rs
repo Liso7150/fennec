@@ -294,7 +294,19 @@ fn router_picks_the_same_experts_in_the_same_order() {
     for r in 0..n {
         kernel::gemv(&weight, e, h, &row32(&x.data, r, h), &mut got[r * e..(r + 1) * e], 1);
     }
-    check("router logits", &fx("router.logits").data, &got, 1e-6);
+    // `kernel::dot` reduces in 8 AVX2 lanes + a tree on x86 but serially on the
+    // scalar fallback. The transformers reference accumulates in its own order,
+    // so at this 2048-term dot the two paths land a hair apart: AVX2 reproduces
+    // the logits to 1e-6, the scalar loop (ARM, or x86 without AVX2) to ~1.02e-6
+    // - unbiased, rms(got) tracks rms(ref), so it is f32 reduction order, not a
+    // kernel error. Relax only on the path that sums serially, and the band is
+    // still five orders below the nearest wrong result (a mis-routed row is ~1.4);
+    // the top-k id/order assertions below are the real point of this test.
+    #[cfg(target_arch = "x86_64")]
+    let logits_band = if std::is_x86_feature_detected!("avx2") { 1e-6 } else { 1e-5 };
+    #[cfg(not(target_arch = "x86_64"))]
+    let logits_band = 1e-5f64;
+    check("router logits", &fx("router.logits").data, &got, logits_band);
 
     let (wid, iid) = (fx("router.weights"), fx("router.indices"));
     let k = c.num_experts_per_tok;
