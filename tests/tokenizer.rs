@@ -12,7 +12,7 @@ use fennec::tokenizer::{chat_prompt, Tokenizer};
 use serde_json::Value;
 use unicode_normalization::UnicodeNormalization;
 
-const MODEL: &str = r"D:\MEGAsync-sync\colibri-models\Qwen3.6-35B-A3B-bf16";
+const MODEL: &str = r"D:\fennec-models\Qwen3.6-35B-A3B-bf16";
 
 fn fixture() -> Value {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join("tokenizer.json");

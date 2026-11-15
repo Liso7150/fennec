@@ -86,12 +86,12 @@ impl Opts {
     fn dir(&self) -> String {
         self.str("model")
             .or_else(|| self.pos.first().cloned())
-            .or_else(|| env_name(&["FENNEC_MODEL", "COLI_MODEL"]))
+            .or_else(|| env_name("FENNEC_MODEL"))
             .unwrap_or_else(|| DEFAULT_MODEL.to_string())
     }
 }
 
-const DEFAULT_MODEL: &str = "D:/MEGAsync-sync/colibri-models/Qwen3.6-35B-A3B-bf16";
+const DEFAULT_MODEL: &str = "D:/fennec-models/Qwen3.6-35B-A3B-bf16";
 
 /// Eight token ids from the golden fixtures - the same sequence the
 /// transformers reference stepped through, so a decode here and a golden test
@@ -348,7 +348,7 @@ fn host_gb(opts: &Opts) -> f64 {
     if opts.kv.contains_key("host") {
         return opts.num("host", 18.0);
     }
-    env_name(&["FENNEC_VK_TIER_HOST_GB", "COLI_VK_TIER_HOST_GB"])
+    env_name("FENNEC_VK_TIER_HOST_GB")
         .and_then(|v| v.parse().ok())
         .unwrap_or(18.0)
 }
@@ -362,9 +362,9 @@ fn gpu_wanted(opts: &Opts) -> bool {
     !opts.has("cpu")
         && (opts.has("auto-tier")
             || opts.has("gpu")
-            || env_on(&["FENNEC_VULKAN", "COLI_VULKAN"])
-            || env_on(&["FENNEC_CUDA", "COLI_CUDA"])
-            || env_on(&["FENNEC_METAL", "COLI_METAL"]))
+            || env_on("FENNEC_VULKAN")
+            || env_on("FENNEC_CUDA")
+            || env_on("FENNEC_METAL"))
 }
 
 fn open_gpu(opts: &Opts) -> Result<Option<Arc<Mutex<Gpu>>>, String> {
@@ -1309,16 +1309,14 @@ struct Engine {
     ngen: usize,
 }
 
-/// The first of these environment names that is set. Every Fennec knob is
-/// spelled `FENNEC_*`; the `COLI_*` twin stays readable so launchers written
-/// against Colibri keep working until they move.
-fn env_name(names: &[&str]) -> Option<String> {
-    names.iter().find_map(|name| std::env::var(*name).ok())
+/// The value of a Fennec knob. Every one of them is spelled `FENNEC_*`.
+fn env_name(name: &str) -> Option<String> {
+    std::env::var(name).ok()
 }
 
 /// The same lookup for the flags that switch the device tier on.
-fn env_on(names: &[&str]) -> bool {
-    env_name(names).is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+fn env_on(name: &str) -> bool {
+    env_name(name).is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
 fn load_engine(opts: &Opts, threads: usize) -> Result<Engine, String> {
@@ -1335,12 +1333,12 @@ fn load_engine(opts: &Opts, threads: usize) -> Result<Engine, String> {
 
     let want_gpu = gpu_wanted(opts);
 
-    // `serve --host` is the bind address, exactly as coli takes it, so the RAM
+    // `serve --host` is the bind address, exactly as `coli serve` takes it, so the RAM
     // pool budget cannot also live under that name: resolve it here and hand
     // `setup` a numeric `host` it can read back.
     let pool = opts.str("host-gb").and_then(|v| v.parse::<f64>().ok())
         .or_else(|| {
-            env_name(&["FENNEC_VK_TIER_HOST_GB", "COLI_VK_TIER_HOST_GB"])
+            env_name("FENNEC_VK_TIER_HOST_GB")
                 .and_then(|v| v.parse().ok())
         })
         .unwrap_or(18.0);
@@ -1395,11 +1393,11 @@ fn load_engine(opts: &Opts, threads: usize) -> Result<Engine, String> {
     }
     let id = Path::new(&dir).file_name().map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "fennec".into());
-    // coli's serve took --api-key, so launchers that still pass it keep working.
+    // `coli serve` took --api-key, so launchers written against it keep working.
     // The env is the preferred channel: argv is world-readable in the process
-    // list, and FENNEC_API_KEY is the spelling; COLI_API_KEY is its alias.
+    // list, and `FENNEC_API_KEY` is the spelling.
     let key = opts.str("api-key")
-        .or_else(|| env_name(&["FENNEC_API_KEY", "COLI_API_KEY"]))
+        .or_else(|| env_name("FENNEC_API_KEY"))
         .unwrap_or_else(|| "local".into());
     Ok(Engine { model: Arc::new(Mutex::new(m)), sh, cfg, tok, id, key, ctx, ngen })
 }

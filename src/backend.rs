@@ -92,8 +92,8 @@ impl Backend {
 }
 
 /// The environment the suite already speaks. `FENNEC_BACKEND` is the explicit
-/// knob; the per-backend flags switch it on too, under `FENNEC_*` first and the
-/// `COLI_*` names the suite's launcher still sets second.
+/// knob; the per-backend flags `FENNEC_CUDA` / `FENNEC_METAL` / `FENNEC_VULKAN`
+/// switch it on too.
 pub fn from_env(env: &dyn Fn(&str) -> Option<String>) -> Option<Backend> {
     if let Some(text) = env("FENNEC_BACKEND") {
         if let Some(b) = Backend::parse(&text) {
@@ -104,9 +104,6 @@ pub fn from_env(env: &dyn Fn(&str) -> Option<String>) -> Option<Backend> {
         ("FENNEC_CUDA", Backend::Cuda),
         ("FENNEC_METAL", Backend::Metal),
         ("FENNEC_VULKAN", Backend::Vulkan),
-        ("COLI_CUDA", Backend::Cuda),
-        ("COLI_METAL", Backend::Metal),
-        ("COLI_VULKAN", Backend::Vulkan),
     ] {
         if env(key).is_some_and(|v| flag(&v)) {
             return Some(backend);
@@ -176,23 +173,22 @@ mod tests {
     }
 
     #[test]
-    fn the_backend_flags_work_under_either_spelling() {
-        for (cuda, metal, vulkan) in [
-            ("COLI_CUDA", "COLI_METAL", "COLI_VULKAN"),
-            ("FENNEC_CUDA", "FENNEC_METAL", "FENNEC_VULKAN"),
+    fn the_backend_flags_switch_the_device_tier_on() {
+        for (flag, want) in [
+            ("FENNEC_CUDA", Backend::Cuda),
+            ("FENNEC_METAL", Backend::Metal),
+            ("FENNEC_VULKAN", Backend::Vulkan),
         ] {
-            assert_eq!(from_env(&env(&[(cuda, "1")])), Some(Backend::Cuda));
-            assert_eq!(from_env(&env(&[(metal, "1")])), Some(Backend::Metal));
-            assert_eq!(from_env(&env(&[(vulkan, "1")])), Some(Backend::Vulkan));
+            assert_eq!(from_env(&env(&[(flag, "1")])), Some(want));
             for off in ["0", "false", "no", "off", ""] {
-                assert_eq!(from_env(&env(&[(cuda, off)])), None, "{cuda}={off:?}");
+                assert_eq!(from_env(&env(&[(flag, off)])), None, "{flag}={off:?}");
             }
         }
-        // The FENNEC_* spelling is the knob; the alias only fills in for it.
-        let e = env(&[("FENNEC_CUDA", "1"), ("COLI_VULKAN", "1")]);
+        // The first flag in the list wins, so the order is the precedence.
+        let e = env(&[("FENNEC_CUDA", "1"), ("FENNEC_VULKAN", "1")]);
         assert_eq!(from_env(&e), Some(Backend::Cuda));
         // FENNEC_BACKEND wins over a flag that disagrees.
-        let e = env(&[("FENNEC_BACKEND", "metal"), ("COLI_CUDA", "1")]);
+        let e = env(&[("FENNEC_BACKEND", "metal"), ("FENNEC_CUDA", "1")]);
         assert_eq!(from_env(&e), Some(Backend::Metal));
     }
 

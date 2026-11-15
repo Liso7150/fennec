@@ -31,7 +31,7 @@ jobs:
       - name: Golden correctness (int4 container)
         shell: powershell
         env:
-          FENNEC_GOLDEN_MODEL: D:/MEGAsync-sync/colibri-models/qwen36-35b
+          FENNEC_GOLDEN_MODEL: D:/fennec-models/qwen36-35b
         run: |
           cd D:/Fennec
           cargo test --release --offline --test golden

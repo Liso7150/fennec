@@ -9,7 +9,7 @@ variants against Colibri under the same protocol.
 import json, os, statistics, subprocess, sys, time, urllib.request
 
 EXE = sys.argv[1] if len(sys.argv) > 1 else r"D:\Fennec\target\release\fennec.exe"
-MODEL = sys.argv[2] if len(sys.argv) > 2 else "D:/MEGAsync-sync/colibri-models/qwen36-35b"
+MODEL = sys.argv[2] if len(sys.argv) > 2 else "D:/fennec-models/qwen36-35b"
 BACKEND = sys.argv[3] if len(sys.argv) > 3 else "cuda"
 THREADS = sys.argv[4] if len(sys.argv) > 4 else "8"
 N = int(sys.argv[5]) if len(sys.argv) > 5 else 3

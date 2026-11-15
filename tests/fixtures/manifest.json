@@ -1,6 +1,6 @@
 {
  "seed": 20261112,
- "model": "D:\\MEGAsync-sync\\colibri-models\\Qwen3.6-35B-A3B-bf16",
+ "model": "D:\\fennec-models\\Qwen3.6-35B-A3B-bf16",
  "seconds": 66.46,
  "hidden_size": 2048,
  "fixtures": {

@@ -20,7 +20,7 @@ use fennec::pool::Stream;
 use fennec::quant::Q4;
 use fennec::safetensors::Shards;
 
-const MODEL: &str = r"D:\MEGAsync-sync\colibri-models\Qwen3.6-35B-A3B-bf16";
+const MODEL: &str = r"D:\fennec-models\Qwen3.6-35B-A3B-bf16";
 
 fn fxpath(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

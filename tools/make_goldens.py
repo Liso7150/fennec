@@ -22,7 +22,7 @@ import torch
 torch.set_grad_enabled(False)
 torch.set_num_threads(os.cpu_count() or 8)
 
-D: str = r"D:\MEGAsync-sync\colibri-models\Qwen3.6-35B-A3B-bf16"
+D: str = r"D:\fennec-models\Qwen3.6-35B-A3B-bf16"
 OUT: str = r"D:\Fennec\tests\fixtures"
 os.makedirs(OUT, exist_ok=True)
 
