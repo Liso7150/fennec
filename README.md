@@ -14,7 +14,7 @@ Fennec replaces multiple inference engines with one codebase: raw Vulkan through
 - **Plugin architecture**: Extensible system for backends, models, tokenizers, and servers
 - **OpenAI-compatible API**: `/v1/chat/completions`, `/v1/models`, streaming SSE
 - **Zero-copy cold start**: Memory-mapped expert pool with borrowed nibbles
-- **Cross-platform**: Windows, Linux, macOS (compile-verified)
+- **Cross-platform**: Windows, Linux, macOS (full suite runs in CI on all three)
 - **Offline build**: No toolkit required, SPIR-V shaders checked in
 
 ## Quick Start
@@ -142,7 +142,7 @@ fennec serve --backend ort --model <model-dir>
 ## Testing
 
 ```bash
-# Run all tests (115 passing)
+# Run all tests (117 passing)
 cargo test --release --offline
 
 # Backend-specific tests
@@ -156,14 +156,20 @@ FENNEC_GOLDEN_MODEL=<model-dir> cargo test --release --offline --test golden
 python tools/smoke_serve.py  # 30 checks against running server
 ```
 
-**Test coverage**: 115 tests total
-- 64 unit tests (quantizer, auth, sampler, device discovery, int8 kernel)
+**Test coverage**: 117 tests total
+- 79 unit tests (quantizer, kernels, auth, sampler, device discovery, memory)
 - 14 golden tests against transformers 5.22.2 reference
 - 9 device-vs-CPU integration tests
 - 6 tokenizer tests
-- 5 dense-lane tests (batched prefill, int8 trunk quality)
-- 2 binary tests
-- 15 additional integration tests
+- 5 dense-lane tests (4 batched-prefill/dense-checkpoint, 1 int8 trunk quality)
+- 2 binary tests (CLI option parsing)
+- 1 Edge0 benchmark-harness test, 1 doctest
+
+CI runs the whole suite on Windows, macOS (ARM64) and Ubuntu x86_64. The golden
+bands follow the kernel that produced them: `kernel::dot` reduces in 8 AVX2 lanes
++ a tree on x86 and serially elsewhere, so the two accumulate f32 in different
+orders and the tight bit-level assertions branch on that feature guard rather
+than assuming x86.
 
 > [!WARNING]
 > Setting `FENNEC_GOLDEN_MODEL` widens tolerance bands to 3e-2 / 2.5e-1. A forward-slash directory spelling also widens bands due to string matching. Don't read a widened run as a tight pass.
@@ -269,4 +275,4 @@ MIT License - see LICENSE file for details.
 
 ## Version
 
-**1.0.0** — Comprehensive testing complete, 115 tests passing, all features stable.
+**1.0.0** — Comprehensive testing complete, 117 tests passing, all features stable.

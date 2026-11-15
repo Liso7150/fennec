@@ -11,14 +11,28 @@ All notable changes to the Fennec inference engine.
   request. The batched device-prefill scratch also overlapped the decode MoE
   arena. The device tier now prefills the prompt token by token through the
   proven `forward` path; decode throughput is unchanged. Verified: Vulkan serve
-  returns correct output, all 115 tests pass.
+  returns correct output, all tests pass.
+- **int8 dense trunk was wrong on every non-AVX2 build** (`kernel.rs`
+  `scalar_i8`). The activation offset-binary bias was removed twice — once inside
+  the scalar dot and again by `row_dot_i8`'s `acc - 64 * wsum` correction — so an
+  ARM (macOS) or AVX2-less x86 build decoded a `-64 * wsum * scale` error on the
+  whole trunk. The AVX2 `maddubs` path was correct, which hid it on Windows and
+  Linux x86; only the new macOS CI leg exposed it. The scalar fallback now sums
+  the raw products like the SIMD path.
+- **macOS/Ubuntu CI legs green.** Beyond the scalar int8 bug, two assertions
+  encoded an x86-only truth: `ort::tests::the_provider_follows_the_device`
+  expected DirectML on every OS although `for_device` returns it only under
+  `cfg!(windows)`, and the router-logits golden band (1e-6) plus the half-gemv
+  bit-exact test both assume AVX2's lane-and-tree reduction, which the serial
+  scalar fallback misses by f32 rounding (~1.02e-6). Both now branch on the same
+  feature guard the kernels dispatch on. Windows, macOS and Ubuntu all pass.
 
 ### Added
 - Host-pool budget is capped to available system RAM (`mem::available_bytes`,
   Windows `GlobalMemoryStatusEx` / Linux `MemAvailable`) less headroom, so a busy
   box streams cold experts on purpose instead of faulting a too-large "RAM" pool
   every token. Prevents the thrashing seen when several engine instances exhaust
-  physical memory.
+  physical memory. Its two `mem::tests` cases take the suite from 115 to 117.
 
 ### Changed
 - **Host-expert int4 dot: four independent FMA accumulators** (`quant.rs`
