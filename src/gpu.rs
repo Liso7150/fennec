@@ -478,9 +478,12 @@ pub enum Op {
     RmsNormBatch = 11,
     SiluMulBatch = 12,
     AxpyBatch = 13,
+    /// The one-row-per-workgroup int4 gemv that `GemvQ4` replaced. Only
+    /// `tests/gpu.rs moe_kernel_shapes` records it, to keep the A/B measurable.
+    GemvQ4OneRow = 14,
 }
 
-const SPV: [&[u8]; 14] = [
+const SPV: [&[u8]; 15] = [
     include_bytes!("shaders/gemv_bf16.spv"),
     include_bytes!("shaders/gemv_q4.spv"),
     include_bytes!("shaders/rmsnorm.spv"),
@@ -495,6 +498,7 @@ const SPV: [&[u8]; 14] = [
     include_bytes!("shaders/rmsnorm_batch.spv"),
     include_bytes!("shaders/silu_mul_batch.spv"),
     include_bytes!("shaders/axpy_batch.spv"),
+    include_bytes!("shaders/gemv_q4_1row.spv"),
 ];
 
 pub struct VkGpu {
@@ -1235,11 +1239,10 @@ impl VkGpu {
                     range: WHOLE_SIZE,
                 })
                 .collect();
-            // Binding 4 is the activation buffer (bufs[1]) again, viewed as
-            // vec4 by the half-precision gemv so it loads x four floats at a
-            // time like the CUDA kernel. Every other shader ignores it.
+            // Binding 4 is the activation arena again, viewed as vec4 by the
+            // gemv kernels that want a wide load. Every other shader ignores it.
             infos.push(DescriptorBufferInfo {
-                buffer: self.bufs[bufs[1]].buffer,
+                buffer: self.bufs[self.scratch].buffer,
                 offset: 0,
                 range: WHOLE_SIZE,
             });
@@ -1351,14 +1354,22 @@ impl<'a> VkBatch<'a> {
         Ok(self)
     }
 
+    /// y = W x for an FQ4 matrix. The kernel takes eight rows per workgroup and
+    /// `row_base` counts workgroups, so the group count and the tall-split bound
+    /// both shrink by eight. Binding 4 is the arena as vec4.
+    fn q4_groups(rows: usize) -> u32 {
+        (rows as u32 + 7) / 8
+    }
+
     pub fn gemv_q4(&mut self, w: usize, sc: usize, rows: usize, cols: usize, group: usize, x_off: usize, y_off: usize) -> Result<&mut VkBatch<'a>> {
         let s = self.gpu.scratch;
+        let groups = Self::q4_groups(rows);
         self.gpu.record(
             Op::GemvQ4,
             [w, sc, s, s],
             &[rows as u32, cols as u32, group as u32, x_off as u32, y_off as u32],
-            rows as u32,
-            rows as u32,
+            groups,
+            groups,
             true,
         )?;
         self.ops += 1;
@@ -1370,8 +1381,25 @@ impl<'a> VkBatch<'a> {
     /// can run them concurrently. A `barrier` separates the phases.
     pub fn gemv_q4_nb(&mut self, w: usize, sc: usize, rows: usize, cols: usize, group: usize, x_off: usize, y_off: usize) -> Result<&mut VkBatch<'a>> {
         let s = self.gpu.scratch;
+        let groups = Self::q4_groups(rows);
         self.gpu.record_nb(
             Op::GemvQ4,
+            [w, sc, s, s],
+            &[rows as u32, cols as u32, group as u32, x_off as u32, y_off as u32],
+            groups,
+            groups,
+            true,
+        )?;
+        self.ops += 1;
+        Ok(self)
+    }
+
+    /// The kernel `gemv_q4` replaced: one row per workgroup, six barrier steps
+    /// per row. Kept only so the probe can re-run the measurement that retired it.
+    pub fn gemv_q4_1row_nb(&mut self, w: usize, sc: usize, rows: usize, cols: usize, group: usize, x_off: usize, y_off: usize) -> Result<&mut VkBatch<'a>> {
+        let s = self.gpu.scratch;
+        self.gpu.record_nb(
+            Op::GemvQ4OneRow,
             [w, sc, s, s],
             &[rows as u32, cols as u32, group as u32, x_off as u32, y_off as u32],
             rows as u32,

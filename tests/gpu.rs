@@ -717,3 +717,753 @@ fn the_device_works_after_the_handle_moves_to_another_thread() {
 
     close("back on the opening thread", &want, &gemv_once(&mut g, wb, &x, rows, cols), 2e-6);
 }
+
+/// The GDN mixer stage, kernel by kernel, because `MIXER_DEV` cannot be split
+/// in place.
+///
+/// `Gdn::step_fused` (src/model.rs) records the whole layer — four input
+/// projections, a barrier, the conv, the delta recursion, out_proj — into ONE
+/// command buffer with ONE submit. A timer around any of those `bt.` calls
+/// measures the CPU that recorded the kernel, never the device that ran it, so
+/// the profiled stage stays one number however it is instrumented. This probe
+/// rebuilds the same shapes on synthetic buffers of the same byte counts and
+/// times them apart, which is the precondition the defect register sets before
+/// another mixer rewrite is proposed, after the fusion and int4-trunk variants
+/// that regressed (#86, #127, #142, #147).
+///
+/// Printed, not asserted: a shape probe on one laptop is evidence for the next
+/// decision, not a regression gate. Run it on the tier being tuned:
+///
+/// ```text
+/// FENNEC_BACKEND=vulkan cargo test --release --offline --test gpu -- \
+///     --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "device timing probe, prints instead of asserting"]
+fn mixer_kernel_shapes() {
+    let Some(mut g) = gpu() else { return };
+    const ITERS: usize = 300;
+
+    // qwen36-35b's GDN layer, read off its config.json: hidden 2048, 16 key
+    // heads x 128, 32 value heads x 128, conv window 4. Same arithmetic as
+    // TextConfig::key_dim / value_dim / conv_dim, spelled out so the probe does
+    // not need a checkpoint on disk.
+    let (h, nk, nv, dk, dv) = (2048usize, 16usize, 32usize, 128usize, 128usize);
+    let (kd, vd) = (nk * dk, nv * dv);
+    let (cd, kdim) = (2 * kd + vd, 4usize);
+    let (hist, rep) = (kdim - 1, nv / nk);
+    // The arena layout step_fused uses: DENSE_OFF = 1 << 19 and DENSE_FLOATS =
+    // 1 << 15 are private to src/model.rs, and normed is that function's
+    // rounding of the input block's end up to a 16-byte boundary.
+    let dense_off = 1usize << 19;
+    let ib = dense_off + h;
+    let normed = (ib + cd + vd + 2 * nv + 3) & !3;
+
+    /// f16 weights of one projection, zeroed. Values do not matter: these gemvs
+    /// are weight-bandwidth-bound, and zeroes keep f16 subnormals — whose
+    /// conversion cost is a separate question — out of the run.
+    fn half_weights(g: &mut Gpu, rows: usize, cols: usize) -> usize {
+        let id = g.alloc_half(rows * cols * 2, true).unwrap();
+        g.write_buf(id, 0, &vec![0u8; rows * cols * 2]).unwrap();
+        id
+    }
+
+    /// A zeroed f32 buffer, for the conv weights and the recurrent state.
+    fn floats(g: &mut Gpu, n: usize) -> usize {
+        let id = g.alloc_half(n * 4, false).unwrap();
+        g.write_buf(id, 0, &vec![0u8; n * 4]).unwrap();
+        id
+    }
+
+    /// Mean microseconds per call, after a warm-up long enough to settle the
+    /// driver's command-buffer pool and the clock source.
+    fn timed(g: &mut Gpu, f: impl Fn(&mut Gpu)) -> f64 {
+        for _ in 0..50 {
+            f(g);
+        }
+        let t = std::time::Instant::now();
+        for _ in 0..ITERS {
+            f(g);
+        }
+        t.elapsed().as_secs_f64() * 1e6 / ITERS as f64
+    }
+
+    fn one(g: &mut Gpu, parts: &mut Vec<(String, usize, f64)>, label: &str,
+           bytes: usize, f: impl Fn(&mut Gpu)) {
+        let us = timed(g, f);
+        parts.push((label.to_string(), bytes, us));
+    }
+
+    g.reserve(dense_off + (1 << 15)).unwrap();
+    let qkv = half_weights(&mut g, cd, h);
+    let z = half_weights(&mut g, vd, h);
+    let bproj = half_weights(&mut g, nv, h);
+    let a = half_weights(&mut g, nv, h);
+    let out = half_weights(&mut g, h, vd);
+    let conv_w = floats(&mut g, cd * kdim);
+    let conv_state = floats(&mut g, hist * cd);
+    let params = floats(&mut g, 2 * nv + dv);
+    let rec_state = floats(&mut g, nv * dk * dv);
+    g.write(dense_off, &lcg(h, 7, 1.0));
+
+    // The floor every other line carries: one command buffer, nothing recorded
+    // into it, submitted and waited on.
+    let floor = timed(&mut g, move |g| {
+        g.batch().unwrap().run().unwrap();
+    });
+
+    let mut parts: Vec<(String, usize, f64)> = Vec::new();
+    one(&mut g, &mut parts, "gemv qkv", cd * h * 2, move |g| {
+        g.batch().unwrap().gemv_half_indep(qkv, cd, h, dense_off, ib).unwrap().run().unwrap();
+    });
+    one(&mut g, &mut parts, "gemv z", vd * h * 2, move |g| {
+        g.batch().unwrap().gemv_half_indep(z, vd, h, dense_off, ib + cd).unwrap().run().unwrap();
+    });
+    one(&mut g, &mut parts, "gemv b", nv * h * 2, move |g| {
+        g.batch().unwrap().gemv_half_indep(bproj, nv, h, dense_off, ib + cd + vd)
+            .unwrap().run().unwrap();
+    });
+    one(&mut g, &mut parts, "gemv a", nv * h * 2, move |g| {
+        g.batch().unwrap().gemv_half_indep(a, nv, h, dense_off, ib + cd + vd + nv)
+            .unwrap().run().unwrap();
+    });
+    one(&mut g, &mut parts, "gdn_conv", cd * kdim * 4 + hist * cd * 4, move |g| {
+        g.batch().unwrap().gdn_conv(conv_w, conv_state, ib, cd, kdim, hist)
+            .unwrap().run().unwrap();
+    });
+    one(&mut g, &mut parts, "gdn_rec", nv * dk * dv * 4, move |g| {
+        g.batch().unwrap()
+            .gdn_rec(params, rec_state, ib, normed, kd, nv, dk, dv, rep, 1e-6)
+            .unwrap().run().unwrap();
+    });
+    one(&mut g, &mut parts, "gemv out", h * vd * 2, move |g| {
+        g.batch().unwrap().gemv_half(out, h, vd, normed, dense_off).unwrap().run().unwrap();
+    });
+
+    let (dev, backend_label) = (g.name().to_string(), g.backend().label().to_string());
+    // The layer as decode runs it, and two variations that say which of the
+    // stage's costs are real: dropping the barrier tests whether the four input
+    // kernels were ever actually serialized, and skipping the submit leaves the
+    // recording alone, which is what an in-place timer would have reported.
+    let mut layer = move |barrier: bool, submit: bool| -> f64 {
+        timed(&mut g, move |g| {
+            let mut bt = g.batch().unwrap();
+            bt.gemv_half_indep(qkv, cd, h, dense_off, ib).unwrap();
+            bt.gemv_half_indep(z, vd, h, dense_off, ib + cd).unwrap();
+            bt.gemv_half_indep(bproj, nv, h, dense_off, ib + cd + vd).unwrap();
+            bt.gemv_half_indep(a, nv, h, dense_off, ib + cd + vd + nv).unwrap();
+            if barrier {
+                bt.barrier().unwrap();
+            }
+            bt.gdn_conv(conv_w, conv_state, ib, cd, kdim, hist).unwrap();
+            bt.gdn_rec(params, rec_state, ib, normed, kd, nv, dk, dv, rep, 1e-6).unwrap();
+            bt.gemv_half(out, h, vd, normed, dense_off).unwrap();
+            if submit {
+                bt.run().unwrap();
+            }
+        })
+    };
+    let fused = layer(true, true);
+    let fused_nb = layer(false, true);
+    let recorded = layer(true, false);
+
+    let sum: f64 = parts.iter().map(|(_, _, us)| *us).sum();
+    let linear_layers = 30; // 40 layers, the fourth of every four is full attention
+    println!("\n  mixer shapes on {dev} ({backend_label})");
+    println!("  h={h} kd={kd} vd={vd} cd={cd} nv={nv} nk={nk} dk={dk} dv={dv} conv={kdim}");
+    println!("  submit+wait floor : {floor:.1} us");
+    println!("  record-only layer : {recorded:.1} us");
+    for (label, bytes, us) in &parts {
+        let busy = (us - floor).max(0.0);
+        let gbs = if busy > 0.0 { *bytes as f64 / (busy * 1e-6) / 1e9 } else { 0.0 };
+        println!("  {label:<9}: {us:6.1} us  busy {busy:6.1} us  {gbs:5.0} GB/s");
+    }
+    println!("  (the conv and rec figures count state traffic, not weights)");
+    println!("  sum of parts      : {sum:.1} us, plus the floor {:.1}", sum + floor);
+    println!("  fused, one submit : {fused:.1} us   barrier-free {fused_nb:.1} us");
+    println!(
+        "  overlap saving    : {:.1} us ({:.0}% of the parts)",
+        sum + floor - fused,
+        100.0 * (sum + floor - fused) / (sum + floor)
+    );
+    println!(
+        "  per token over {linear_layers} GDN layers: fused {:.2} ms, parts {:.2} ms",
+        fused * linear_layers as f64 / 1000.0,
+        (sum + floor) * linear_layers as f64 / 1000.0
+    );
+    println!("  (compare with prof::MIXER_DEV on a served decode: if the two differ\n   by more than the floor, the stage is not one layer's cost.)");
+}
+/// The MoE stage's kernel shapes, priced against the bandwidth they should get.
+///
+/// Decode records one `gemv_q4` per picked expert per phase, eight dispatches for
+/// each of the two matrix products, in one submit. Two ideas have been priced
+/// here, and they went opposite ways:
+///
+/// * **Collapsing the dispatches lost.** Concatenating the k experts' weight
+///   blocks and issuing one gemv is slower than the eight dispatches, at every
+///   dispatch count in the sweep - the cost is per output row, not per dispatch.
+/// * **Re-decomposing the work inside one dispatch won.** Giving a row eight
+///   lanes instead of sixty-four cuts the reduction tree from six barrier steps
+///   to three and covers eight rows per workgroup, which is 3.46x on the layer as
+///   decode records it (908.7 -> 262.7 us). That kernel is what `gemv_q4` is
+///   now; the one-row shape it replaced stays compiled in as
+///   `gemv_q4_1row_nb` so this loop can still re-run the comparison that retired
+///   it, and nothing in the engine records it.
+///
+/// Two things had to be sorted out before any of that meant anything:
+///
+/// * **Timing has to interleave.** The first version of this probe ran each
+///   variant to completion, one after another, and the fused variant came out
+///   *slower* than the eight dispatches. On a laptop card that is drift, not a
+///   result: the clock falls as the GPU heats, so a later variant loses. Every
+///   number here comes from one round-robin loop instead, in which each variant
+///   is exposed to the same thermal state as the one it is compared with.
+/// * **These shapes are small.** One expert's gate_up is 1.18 MB of int4, which
+///   at the card's bandwidth is ~5 us. A dispatch that costs tens of us is not
+///   bandwidth-bound, so the sweep over the dispatch count is what separates a
+///   per-dispatch ramp from per-byte traffic, and an f16 gemv over the same
+///   rows is what says how much of the cost is the int4 unpacking itself.
+///
+/// `gate_up` shares one activation across the k picks, so it *can* collapse into
+/// one dispatch - but only with a phase-block arena, because a fused gemv writes
+/// `y[y_off + r]` contiguously while the current slot layout strides `4i + h`
+/// between experts. `down` cannot collapse with this kernel at all: each pick has
+/// its own hidden, and one gemv has one `x`. The `down collapsed` figure is
+/// therefore a labelled proxy (same bytes, one dispatch, wrong activations for
+/// k-1 of the rows). The gate_up, silu, down and reduce re-layouts are checked
+/// for bit-exactness, and the two int4 kernels against each other at two group
+/// widths: a lane striding eight words changes scale group every step only when
+/// the group is 64 columns, so a single width cannot see a desync.
+#[test]
+#[ignore = "device timing probe, prints instead of asserting"]
+fn moe_kernel_shapes() {
+    let Some(mut g) = gpu() else { return };
+    const ITERS: usize = 60;
+
+    macro_rules! vk {
+        ($bt:expr) => {
+            match &mut $bt {
+                fennec::gpu::Batch::Vk(v) => v,
+                _ => panic!("the barrier-free expert calls are Vulkan-only; run with FENNEC_BACKEND=vulkan"),
+            }
+        };
+    }
+
+    // qwen36-35b's routed expert, read off its config.json: hidden 2048,
+    // moe_intermediate 512, top-8 of 256, and the shipped int4 checkpoint groups
+    // scales every 64 columns.
+    let (h, i, k, group) = (2048usize, 512usize, 8usize, 64usize);
+    let (gu, dn) = (2 * i, h);
+    let (gu_bytes, gu_scale) = (gu * h / 2, gu * h / group * 4);
+    let (dn_bytes, dn_scale) = (dn * i / 2, dn * i / group * 4);
+    // Two arenas side by side: the one decode uses today, and the phase-block one
+    // a collapse would move to.
+    let s0 = (h + 15) & !15;
+    let stride = 4 * i + h;
+    let n0 = s0 + k * stride;
+    let (gate_b, up_b, hh_b, out_b) = (n0, n0 + k * i, n0 + 2 * k * i, n0 + 3 * k * i);
+    let w_off = n0 + k * (3 * i + h);
+    let acc = (w_off + 16 + 15) & !15;
+    g.reserve(acc + h + 16).unwrap();
+    g.write(0, &lcg(h, 11, 0.05));
+    let wts: Vec<f32> = (0..k).map(|j| 0.1 + 0.01 * j as f32).collect();
+    g.write(w_off, &wts);
+
+    // Every phase block of every expert gets its own random bytes and its own
+    // random per-group scales. A constant fill makes a wrong column stride or a
+    // wrong group index agree with the reference by accident, which is the exact
+    // class of bug the two re-decompositions below are most likely to carry.
+    fn seed(mat: usize, rows: usize, cols: usize, j: usize, phase: usize) -> u64 {
+        let mut s = 0x9e37_79b9_7f4a_7c15u64;
+        for k in [mat, rows, cols, j, phase] {
+            s = s.wrapping_mul((k as u64) + 0x1000_0000_0000_01b3).rotate_left(27);
+        }
+        s | 1
+    }
+    fn rbytes(n: usize, s: u64) -> Vec<u8> {
+        let mut x = s;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 33) as u8
+            })
+            .collect()
+    }
+    /// Positive scales spread over a decade: a scale read from the neighbouring
+    /// group changes the row by ~30%, not by a rounding unit.
+    fn fbytes(n: usize, s: u64) -> Vec<u8> {
+        let mut x = s;
+        let mut out = Vec::with_capacity(n * 4);
+        for _ in 0..n {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let v = 0.25 + 1.5 * ((x >> 40) as f32) / ((1u64 << 24) as f32);
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+    /// One expert's int4 matrix as `blocks` phase blocks of `rows x cols`, laid
+    /// out end to end: gate_up ships two (gate then up), down ships one.
+    fn q4m(g: &mut Gpu, mat: usize, blocks: usize, rows: usize, cols: usize, group: usize, j: usize) -> [usize; 2] {
+        let (rb, rs) = (rows * cols / 2, rows * cols / group * 4);
+        let (w, sc) = (g.alloc_half(rb * blocks, false).unwrap(), g.alloc_half(rs * blocks, false).unwrap());
+        for p in 0..blocks {
+            let s = seed(mat, rows, cols, j, p);
+            g.write_buf(w, p * rb, &rbytes(rb, s)).unwrap();
+            g.write_buf(sc, p * rs, &fbytes(rs / 4, s ^ 0x8000_0000_0000_0001)).unwrap();
+        }
+        [w, sc]
+    }
+    /// The collapsed gate_up buffer: all k experts' gate rows, then all their up
+    /// rows - the row order the phase-block arena writes in, byte-identical to
+    /// `q4m(.., 2, i, h, ..)` wherever the two layouts name the same block.
+    fn q4_halves(g: &mut Gpu, i: usize, h: usize, group: usize, k: usize) -> [usize; 2] {
+        let (rb, rs) = (i * h / 2, i * h / group * 4);
+        let (w, sc) = (g.alloc_half(2 * rb * k, false).unwrap(), g.alloc_half(2 * rs * k, false).unwrap());
+        for j in 0..k {
+            for p in 0..2 {
+                let s = seed(0, i, h, j, p);
+                g.write_buf(w, (p * k + j) * rb, &rbytes(rb, s)).unwrap();
+                g.write_buf(sc, (p * k + j) * rs, &fbytes(rs / 4, s ^ 0x8000_0000_0000_0001)).unwrap();
+            }
+        }
+        [w, sc]
+    }
+    /// A plain concatenation of k blocks, for the down proxy.
+    fn q4_cat(g: &mut Gpu, rows: usize, cols: usize, group: usize, k: usize) -> [usize; 2] {
+        let (rb, rs) = (rows * cols / 2, rows * cols / group * 4);
+        let (w, sc) = (g.alloc_half(rb * k, false).unwrap(), g.alloc_half(rs * k, false).unwrap());
+        for j in 0..k {
+            let s = seed(1, rows, cols, j, 0);
+            g.write_buf(w, j * rb, &rbytes(rb, s)).unwrap();
+            g.write_buf(sc, j * rs, &fbytes(rs / 4, s ^ 0x8000_0000_0000_0001)).unwrap();
+        }
+        [w, sc]
+    }
+    /// Zeroed f16 weights over the same rows: no unpacking and one scale per row,
+    /// so this is the shape's cost with the int4 decoding taken out of it.
+    fn halfw(g: &mut Gpu, rows: usize, cols: usize) -> usize {
+        let id = g.alloc_half(rows * cols * 2, true).unwrap();
+        g.write_buf(id, 0, &vec![0u8; rows * cols * 2]).unwrap();
+        id
+    }
+    let sep: Vec<[usize; 2]> = (0..k).map(|j| q4m(&mut g, 0, 2, i, h, group, j)).collect();
+    let sep_dn: Vec<[usize; 2]> = (0..k).map(|j| q4m(&mut g, 1, 1, dn, i, group, j)).collect();
+    let fgu = q4_halves(&mut g, i, h, group, k);
+    let fdn = q4_cat(&mut g, dn, i, group, k);
+    let hgu = halfw(&mut g, k * gu, h);
+    let hdn = halfw(&mut g, k * dn, i);
+
+    // One round-robin loop, so that the variants being compared share a thermal
+    // state. A variant run after another one has warmed the card reads slower
+    // for reasons that have nothing to do with its shape.
+    type V = Vec<(String, Box<dyn FnMut(&mut Gpu)>)>;
+    fn rr(g: &mut Gpu, vs: &mut V) -> Vec<(String, f64)> {
+        for _ in 0..30 {
+            for (_, f) in vs.iter_mut() {
+                f(g);
+            }
+        }
+        let mut acc = vec![0f64; vs.len()];
+        for _ in 0..ITERS {
+            for (x, (_, f)) in vs.iter_mut().enumerate() {
+                let t = std::time::Instant::now();
+                f(g);
+                acc[x] += t.elapsed().as_secs_f64() * 1e6;
+            }
+        }
+        vs.iter().enumerate().map(|(x, (l, _))| (l.clone(), acc[x] / ITERS as f64)).collect()
+    }
+    let mut vs: V = Vec::new();
+    fn add(vs: &mut V, label: &str, f: impl FnMut(&mut Gpu) + 'static) {
+        vs.push((label.to_string(), Box::new(f)));
+    }
+
+    add(&mut vs, "floor", |g: &mut Gpu| {
+        g.batch().unwrap().run().unwrap();
+    });
+    // The dispatch sweep: m expert gate_ups in one submit, so the only thing
+    // changing between the lines is the number of dispatches recorded.
+    let (sepc, dnc) = (sep.clone(), sep_dn.clone());
+    for m in [1usize, 2, 4, 8] {
+        let sep = sepc.clone();
+        let tag = format!("gu x{m}");
+        add(&mut vs, &tag, move |g: &mut Gpu| {
+            let mut bt = g.batch().unwrap();
+            for j in 0..m {
+                let b = sep[j % k];
+                vk!(bt).gemv_q4_nb(b[0], b[1], gu, h, group, 0, s0 + (j % k) * stride).unwrap();
+            }
+            bt.run().unwrap();
+        });
+        let sep_dn = dnc.clone();
+        let tag = format!("dn x{m}");
+        add(&mut vs, &tag, move |g: &mut Gpu| {
+            let mut bt = g.batch().unwrap();
+            for j in 0..m {
+                let b = sep_dn[j % k];
+                let s = s0 + (j % k) * stride;
+                vk!(bt).gemv_q4_nb(b[0], b[1], dn, i, group, s + 2 * i, s + 4 * i).unwrap();
+            }
+            bt.run().unwrap();
+        });
+    }
+    // Eight gate_ups in eight command-buffer round trips: what a barrier after
+    // every expert used to cost.
+    let sep = sepc.clone();
+    add(&mut vs, "gu x8 submits", move |g: &mut Gpu| {
+        for j in 0..k {
+            let b = sep[j];
+            let mut bt = g.batch().unwrap();
+            vk!(bt).gemv_q4(b[0], b[1], gu, h, group, 0, s0 + j * stride).unwrap();
+            bt.run().unwrap();
+        }
+    });
+    // The collapses.
+    add(&mut vs, "gu fused", move |g: &mut Gpu| {
+        let mut bt = g.batch().unwrap();
+        vk!(bt).gemv_q4_nb(fgu[0], fgu[1], k * gu, h, group, 0, gate_b).unwrap();
+        bt.run().unwrap();
+    });
+    add(&mut vs, "dn fused", move |g: &mut Gpu| {
+        let mut bt = g.batch().unwrap();
+        vk!(bt).gemv_q4_nb(fdn[0], fdn[1], k * dn, i, group, hh_b, out_b).unwrap();
+        bt.run().unwrap();
+    });
+    add(&mut vs, "silu x8", move |g: &mut Gpu| {
+        let mut bt = g.batch().unwrap();
+        for j in 0..k {
+            let s = s0 + j * stride;
+            vk!(bt).silu_mul_nb(i, s, s + i, s + 2 * i).unwrap();
+        }
+        bt.run().unwrap();
+    });
+    add(&mut vs, "silu fused", move |g: &mut Gpu| {
+        let mut bt = g.batch().unwrap();
+        vk!(bt).silu_mul_nb(k * i, gate_b, up_b, hh_b).unwrap();
+        bt.run().unwrap();
+    });
+    add(&mut vs, "reduce old", move |g: &mut Gpu| {
+        let mut bt = g.batch().unwrap();
+        vk!(bt).moe_reduce(k, h, stride, s0, 4 * i, acc, w_off).unwrap();
+        bt.run().unwrap();
+    });
+    add(&mut vs, "reduce new", move |g: &mut Gpu| {
+        let mut bt = g.batch().unwrap();
+        vk!(bt).moe_reduce(k, h, h, out_b, 0, acc, w_off).unwrap();
+        bt.run().unwrap();
+    });
+    // The same rows in f16: 4x the bytes of the int4 pass, and none of its
+    // unpacking. int4 at f16's efficiency would be this figure / 4.
+    add(&mut vs, "f16 gu 8", move |g: &mut Gpu| {
+        g.batch().unwrap().gemv_half(hgu, k * gu, h, 0, out_b).unwrap().run().unwrap();
+    });
+    add(&mut vs, "f16 dn 8", move |g: &mut Gpu| {
+        g.batch().unwrap().gemv_half(hdn, k * dn, i, hh_b, out_b).unwrap().run().unwrap();
+    });
+    // The retired shape: one row per workgroup, sixty-four lanes deep, six barrier
+    // steps per row. This is the kernel the eight-lane one replaced, kept in the
+    // tree only so the 3.46x that justified the swap stays re-measurable here.
+    for m in [1usize, 2, 4, 8] {
+        let sep = sepc.clone();
+        let tag = format!("gu 1r x{m}");
+        add(&mut vs, &tag, move |g: &mut Gpu| {
+            let mut bt = g.batch().unwrap();
+            for j in 0..m {
+                let b = sep[j % k];
+                vk!(bt).gemv_q4_1row_nb(b[0], b[1], gu, h, group, 0, s0 + (j % k) * stride).unwrap();
+            }
+            bt.run().unwrap();
+        });
+        let sep_dn = dnc.clone();
+        let tag = format!("dn 1r x{m}");
+        add(&mut vs, &tag, move |g: &mut Gpu| {
+            let mut bt = g.batch().unwrap();
+            for j in 0..m {
+                let b = sep_dn[j % k];
+                let s = s0 + (j % k) * stride;
+                vk!(bt).gemv_q4_1row_nb(b[0], b[1], dn, i, group, s + 2 * i, s + 4 * i).unwrap();
+            }
+            bt.run().unwrap();
+        });
+    }
+    add(&mut vs, "gu 1r fused", move |g: &mut Gpu| {
+        let mut bt = g.batch().unwrap();
+        vk!(bt).gemv_q4_1row_nb(fgu[0], fgu[1], k * gu, h, group, 0, gate_b).unwrap();
+        bt.run().unwrap();
+    });
+    add(&mut vs, "dn 1r fused", move |g: &mut Gpu| {
+        let mut bt = g.batch().unwrap();
+        vk!(bt).gemv_q4_1row_nb(fdn[0], fdn[1], k * dn, i, group, hh_b, out_b).unwrap();
+        bt.run().unwrap();
+    });
+    // The layer, several ways. Modes 0..3 are one kernel: 0 is what decode does,
+    // 3 says what the three in-layer barriers cost, and 1 and 2 are the collapse
+    // candidates (`ideal` uses the down proxy). Adding 4 to a mode runs it through
+    // the retired one-row kernel, so every shape is priced against the same arena
+    // and the same submit.
+    fn q4v(
+        mut bt: &mut fennec::gpu::Batch,
+        kern: u8,
+        w: usize,
+        sc: usize,
+        rows: usize,
+        cols: usize,
+        group: usize,
+        x_off: usize,
+        y_off: usize,
+    ) {
+        match kern {
+            0 => vk!(bt).gemv_q4_nb(w, sc, rows, cols, group, x_off, y_off).unwrap(),
+            _ => vk!(bt).gemv_q4_1row_nb(w, sc, rows, cols, group, x_off, y_off).unwrap(),
+        };
+    }
+    let layer: std::rc::Rc<dyn Fn(u8, &mut Gpu)> = std::rc::Rc::new(move |mode: u8, g: &mut Gpu| {
+        let (m, kern) = (mode & 3, (mode >> 2) & 3);
+        let mut bt = g.batch().unwrap();
+        if m == 0 || m == 3 {
+            for j in 0..k {
+                let b = sepc[j];
+                q4v(&mut bt, kern, b[0], b[1], gu, h, group, 0, s0 + j * stride);
+            }
+            if m == 0 {
+                vk!(bt).barrier().unwrap();
+            }
+            for j in 0..k {
+                let s = s0 + j * stride;
+                vk!(bt).silu_mul_nb(i, s, s + i, s + 2 * i).unwrap();
+            }
+            if m == 0 {
+                vk!(bt).barrier().unwrap();
+            }
+            for j in 0..k {
+                let b = dnc[j];
+                let s = s0 + j * stride;
+                q4v(&mut bt, kern, b[0], b[1], dn, i, group, s + 2 * i, s + 4 * i);
+            }
+            if m == 0 {
+                vk!(bt).barrier().unwrap();
+            }
+            vk!(bt).moe_reduce(k, h, stride, s0, 4 * i, acc, w_off).unwrap();
+        } else {
+            q4v(&mut bt, kern, fgu[0], fgu[1], k * gu, h, group, 0, gate_b);
+            vk!(bt).barrier().unwrap();
+            vk!(bt).silu_mul_nb(k * i, gate_b, up_b, hh_b).unwrap();
+            vk!(bt).barrier().unwrap();
+            if m == 1 {
+                for j in 0..k {
+                    let b = dnc[j];
+                    q4v(&mut bt, kern, b[0], b[1], dn, i, group, hh_b + j * i, out_b + j * h);
+                }
+            } else {
+                q4v(&mut bt, kern, fdn[0], fdn[1], k * dn, i, group, hh_b, out_b);
+            }
+            vk!(bt).barrier().unwrap();
+            vk!(bt).moe_reduce(k, h, h, out_b, 0, acc, w_off).unwrap();
+        }
+        bt.run().unwrap();
+    });
+    for (tag, mode) in [
+        ("layer now", 0u8),
+        ("layer nobar", 3),
+        ("layer merged", 1),
+        ("layer ideal", 2),
+        ("layer 1r", 4),
+    ] {
+        let layer = layer.clone();
+        add(&mut vs, tag, move |g: &mut Gpu| layer(mode, g));
+    }
+
+    let out = rr(&mut g, &mut vs);
+    let us = |label: &str| -> f64 {
+        out.iter().find(|(l, _)| l == label).map(|(_, x)| *x).unwrap_or(f64::NAN)
+    };
+    let floor = us("floor");
+    let gbs = |bytes: usize, t: f64| -> f64 {
+        // The floor is itself a submit-and-wait, so it carries tens of us of
+        // noise; a variant that measures under it has no busy time to divide by
+        // and the quotient is meaningless rather than large.
+        let busy = t - floor;
+        if busy < 1.0 {
+            f64::NAN
+        } else {
+            bytes as f64 / (busy * 1e-6) / 1e9
+        }
+    };
+
+    // Exactness of the re-layout, after the timing: the merged path has to
+    // reproduce today's numbers row for row, expert for expert, in the arena the
+    // collapse would move to. Old slot j keeps its phases at 0, i, 2i, 4i; the
+    // new arena puts expert j's gate at gate_b + j*i, its up at up_b + j*i, its
+    // hidden at hh_b + j*i and its output at out_b + j*h.
+    layer(0, &mut g);
+    let (mut old, mut old_dn) = (vec![0f32; k * stride], Vec::new());
+    g.read_into(s0, &mut old);
+    for j in 0..k {
+        let mut v = vec![0f32; h];
+        g.read_into(s0 + j * stride + 4 * i, &mut v);
+        old_dn.push(v);
+    }
+    let mut acc_old = vec![0f32; h];
+    g.read_into(acc, &mut acc_old);
+    layer(1, &mut g);
+    let mut neu = vec![0f32; 3 * k * i];
+    g.read_into(gate_b, &mut neu);
+    let mut acc_new = vec![0f32; h];
+    g.read_into(acc, &mut acc_new);
+    for j in 0..k {
+        let s = j * stride;
+        let (gj, uj, hj) = (j * i, k * i + j * i, 2 * k * i + j * i);
+        assert_eq!(&old[s..s + i], &neu[gj..gj + i], "expert {j} gate rows moved");
+        assert_eq!(&old[s + i..s + gu], &neu[uj..uj + i], "expert {j} up rows moved");
+        assert_eq!(&old[s + 2 * i..s + 3 * i], &neu[hj..hj + i], "expert {j} hidden moved");
+        let mut dn_new = vec![0f32; h];
+        g.read_into(out_b + j * h, &mut dn_new);
+        assert_eq!(&old_dn[j], &dn_new, "expert {j} down output moved");
+    }
+    assert_eq!(acc_old, acc_new, "the phase-block reduce must weight the same k outputs");
+    // The shipped kernel and the one it replaced fold the same row differently, so
+    // they are compared to tolerance - the same 1e-5 the device tier uses
+    // everywhere else in this file - not bit for bit.
+    layer(4, &mut g);
+    let mut one_row_acc = vec![0f32; h];
+    g.read_into(acc, &mut one_row_acc);
+    let drift = rel(&acc_old, &one_row_acc);
+    assert!(drift < 1e-5, "the one-row int4 kernel drifted {drift:e} from the shipped gemv_q4");
+    // Row for row, at two group widths. A lane that strides eight words per step
+    // meets a new scale group every step only when the group is 64 columns wide;
+    // at any other width its group index desyncs, and one width cannot show it.
+    let chk = acc + h + 16;
+    g.reserve(chk + gu).unwrap();
+    for grp in [32usize, group] {
+        let b = q4m(&mut g, 2, 1, gu, h, grp, 3);
+        let run = |g: &mut Gpu, kern: u8| {
+            let mut bt = g.batch().unwrap();
+            q4v(&mut bt, kern, b[0], b[1], gu, h, grp, 0, chk);
+            bt.run().unwrap();
+        };
+        run(&mut g, 1);
+        let mut want = vec![0f32; gu];
+        g.read_into(chk, &mut want);
+        run(&mut g, 0);
+        let mut got = vec![0f32; gu];
+        g.read_into(chk, &mut got);
+        let d = rel(&want, &got);
+        assert!(d < 1e-5, "gemv_q4 at group {grp} drifted {d:e} from the one-row reference over {gu} rows");
+    }
+
+    let (dev, be) = (g.name().to_string(), g.backend().label().to_string());
+    println!("\n  moe shapes on {dev} ({be})");
+    println!(
+        "  h={h} i={i} k={k} group={group}: gate_up {gu_bytes} B + {gu_scale} B scales per expert, down {dn_bytes} B + {dn_scale} B"
+    );
+    println!("  floor: one submit, nothing recorded: {floor:.1} us");
+    println!("  --- gate_up: {k} x ({gu} rows x {h} cols)");
+    for m in [1usize, 2, 4, 8] {
+        let t = us(&format!("gu x{m}"));
+        let marginal = if m == 1 { t - floor } else { (t - us("gu x1")) / (m - 1) as f64 };
+        println!(
+            "    {m:>1} dispatch{} {:7.1} us  {:5.0} GB/s  marginal {marginal:6.1} us/dispatch",
+            if m == 1 { "" } else { "es" },
+            t,
+            gbs(m * (gu_bytes + gu_scale), t)
+        );
+    }
+    println!(
+        "    1 dispatch   {:7.1} us  {:5.0} GB/s   ({} rows, exact)",
+        us("gu fused"),
+        gbs(k * (gu_bytes + gu_scale), us("gu fused")),
+        k * gu
+    );
+    println!(
+        "    8 submits    {:7.1} us  {:5.0} GB/s",
+        us("gu x8 submits"),
+        gbs(k * (gu_bytes + gu_scale), us("gu x8 submits"))
+    );
+    println!(
+        "    f16 same rows {:6.1} us  {:5.0} GB/s   ({} MB, no unpacking: int4 at this rate is {:.1} us)",
+        us("f16 gu 8"),
+        gbs(k * gu * h * 2, us("f16 gu 8")),
+        k * gu * h * 2 / 1_000_000,
+        us("f16 gu 8") / 4.0
+    );
+    println!("  --- down: {k} x ({dn} rows x {i} cols)");
+    for m in [1usize, 2, 4, 8] {
+        let t = us(&format!("dn x{m}"));
+        let marginal = if m == 1 { t - floor } else { (t - us("dn x1")) / (m - 1) as f64 };
+        println!(
+            "    {m:>1} dispatch{} {:7.1} us  {:5.0} GB/s  marginal {marginal:6.1} us/dispatch",
+            if m == 1 { "" } else { "es" },
+            t,
+            gbs(m * (dn_bytes + dn_scale), t)
+        );
+    }
+    println!(
+        "    1 dispatch   {:7.1} us  {:5.0} GB/s   (PROXY: one shared x)",
+        us("dn fused"),
+        gbs(k * (dn_bytes + dn_scale), us("dn fused"))
+    );
+    println!(
+        "    f16 same rows {:6.1} us  {:5.0} GB/s   ({} MB, no unpacking: int4 at this rate is {:.1} us)",
+        us("f16 dn 8"),
+        gbs(k * dn * i * 2, us("f16 dn 8")),
+        k * dn * i * 2 / 1_000_000,
+        us("f16 dn 8") / 4.0
+    );
+    println!(
+        "  --- silu {:.1} -> {:.1} us, reduce {:.1} -> {:.1} us (both exact)",
+        us("silu x8"), us("silu fused"), us("reduce old"), us("reduce new")
+    );
+    println!("  --- retired shape: one row per workgroup, sixty-four lanes, six tree steps");
+    for m in [1usize, 2, 4, 8] {
+        let (a, b) = (us(&format!("gu 1r x{m}")), us(&format!("gu x{m}")));
+        let (c, d) = (us(&format!("dn 1r x{m}")), us(&format!("dn x{m}")));
+        println!(
+            "    {m} dispatch{}  gate_up {a:7.1} -> {b:7.1} us ({:4.2}x)  {:5.0} GB/s   down {c:7.1} -> {d:7.1} us ({:4.2}x) {:5.0} GB/s",
+            if m == 1 { "" } else { "es" },
+            a / b,
+            gbs(m * (gu_bytes + gu_scale), b),
+            c / d,
+            gbs(m * (dn_bytes + dn_scale), d)
+        );
+    }
+    println!(
+        "    fused       gate_up {:7.1} -> {:7.1} us   down (proxy) {:7.1} -> {:7.1} us",
+        us("gu 1r fused"), us("gu fused"), us("dn 1r fused"), us("dn fused")
+    );
+    let layers = 40;
+    println!("  --- layer, as decode has it  : {:7.1} us", us("layer now"));
+    println!(
+        "      without its 3 barriers : {:7.1} us   {:.1} us of barriers",
+        us("layer nobar"),
+        us("layer now") - us("layer nobar")
+    );
+    println!(
+        "      gate_up + silu merged  : {:7.1} us   {:+7.1} us/layer (exact)",
+        us("layer merged"),
+        us("layer merged") - us("layer now")
+    );
+    println!(
+        "      everything merged      : {:7.1} us   {:+7.1} us/layer (down proxy)"
+        , us("layer ideal"), us("layer ideal") - us("layer now")
+    );
+    println!(
+        "      one row per workgroup  : {:7.1} us   the kernel gemv_q4 replaced, {:4.2}x slower",
+        us("layer 1r"),
+        us("layer 1r") / us("layer now")
+    );
+    println!(
+        "    per token, {layers} layers: {:.2} ms with one row per workgroup -> {:.2} ms as shipped",
+        us("layer 1r") * layers as f64 / 1000.0,
+        us("layer now") * layers as f64 / 1000.0
+    );
+    println!(
+        "      the collapses, on top  : {:.2} (merged) -> {:.2} ms (down proxy)",
+        us("layer merged") * layers as f64 / 1000.0,
+        us("layer ideal") * layers as f64 / 1000.0
+    );
+    println!("  (compare with MOE_CPU + MOE_SYNC + MOE_READ on a served decode)");
+}

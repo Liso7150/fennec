@@ -1,7 +1,25 @@
 #version 450
-// y = W x for FQ4: one uint holds eight nibbles, low nibble = even column,
-// value stored +8, one f32 scale per `group` columns of one row. Requires
-// group % 8 == 0 so a uint never straddles two scales.
+// y = W x for FQ4: one uint holds eight nibbles, low nibble = even column, value
+// stored +8, one f32 scale per `group` columns of one row, group % 8 == 0.
+//
+// The reduction is what this shape pays for. The kernel this replaced gave a
+// row a whole 64-thread workgroup, so every row cost six barrier steps and the
+// per-row time was flat in bytes rather than in bandwidth; eight lanes now split
+// a row - three steps - and a workgroup covers eight rows, so the LUT barrier and
+// the tree are paid once for eight rows instead of once for one. Each lane walks
+// eight uints for a 512-column row and thirty-two for a 2048-column one, which is
+// also where the load latency gets something to hide behind. Measured on the
+// decode MoE (tests/gpu.rs moe_kernel_shapes): 908.7 -> 262.7 us per layer,
+// 3.46x, on the 40-layer token 36.4 -> 10.5 ms.
+//
+// Eight partials folded by a three-step tree is a different association than one
+// thread walking a row, so the sums differ in the last bits, not in values; the
+// device tier's tests hold both kernels to the CPU reference at 1e-5.
+//
+// A lane's word index advances by eight per iteration, so the group it belongs to
+// is (index / words-per-group), which is not a step of one unless the group is 64
+// columns wide. FQ4 groups are powers of two, so a shift covers them; the division
+// stays as the arm for a group that isn't.
 layout(local_size_x = 64) in;
 layout(push_constant) uniform P {
     uint rows;
@@ -15,31 +33,69 @@ layout(set = 0, binding = 0) readonly buffer W { uint w[]; };
 layout(set = 0, binding = 1) readonly buffer S { float s[]; };
 layout(set = 0, binding = 2) readonly buffer X { float x[]; };
 layout(set = 0, binding = 3) writeonly buffer Y { float y[]; };
+// The activation arena again, viewed as vec4.
+layout(set = 0, binding = 4) readonly buffer X4 { vec4 x4[]; };
 
 shared float red[64];
+shared float lut[16];
 
 void main() {
-    uint r = p.row_base + gl_WorkGroupID.x;
-    if (r >= p.rows) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint lane = tid & 7u;
+    uint rowi = tid >> 3;
+    if (tid < 16u) lut[tid] = float(int(tid) - 8);
+    barrier();
+    // row_base counts workgroups, not rows: the host splits a tall matrix into
+    // dispatches of at most 65535 workgroups.
+    uint r = (p.row_base + gl_WorkGroupID.x) * 8u + rowi;
     uint words = p.cols >> 3;
     uint ng = p.cols / p.group;
-    uint base = r * words;
     float acc = 0.0;
-    for (uint i = gl_LocalInvocationID.x; i < words; i += 64u) {
-        uint u = w[base + i];
-        float sc = s[r * ng + (i << 3) / p.group];
-        float part = 0.0;
-        uint c = p.x_off + (i << 3);
-        for (uint k = 0u; k < 8u; k++) {
-            part += (float((u >> (4u * k)) & 0xFu) - 8.0) * x[c + k];
+    if (r < p.rows) {
+        uint base = r * words;
+        uint srow = r * ng;
+        uint gs = p.group >> 3;
+        bool pow2 = (gs & (gs - 1u)) == 0u;
+        uint lg = pow2 ? findMSB(gs) : 0u;
+        if ((p.x_off & 3u) == 0u) {
+            for (uint i = lane; i < words; i += 8u) {
+                uint u = w[base + i];
+                float sc = s[srow + (pow2 ? (i >> lg) : i / gs)];
+                uint c4 = (p.x_off >> 2) + (i << 1);
+                vec4 x0 = x4[c4];
+                vec4 x1 = x4[c4 + 1u];
+                float part = lut[u & 15u] * x0.x
+                           + lut[(u >> 4u) & 15u] * x0.y
+                           + lut[(u >> 8u) & 15u] * x0.z
+                           + lut[(u >> 12u) & 15u] * x0.w
+                           + lut[(u >> 16u) & 15u] * x1.x
+                           + lut[(u >> 20u) & 15u] * x1.y
+                           + lut[(u >> 24u) & 15u] * x1.z
+                           + lut[(u >> 28u) & 15u] * x1.w;
+                acc += part * sc;
+            }
+        } else {
+            for (uint i = lane; i < words; i += 8u) {
+                uint u = w[base + i];
+                float sc = s[srow + (pow2 ? (i >> lg) : i / gs)];
+                uint c = p.x_off + (i << 3);
+                float part = lut[u & 15u] * x[c]
+                           + lut[(u >> 4u) & 15u] * x[c + 1u]
+                           + lut[(u >> 8u) & 15u] * x[c + 2u]
+                           + lut[(u >> 12u) & 15u] * x[c + 3u]
+                           + lut[(u >> 16u) & 15u] * x[c + 4u]
+                           + lut[(u >> 20u) & 15u] * x[c + 5u]
+                           + lut[(u >> 24u) & 15u] * x[c + 6u]
+                           + lut[(u >> 28u) & 15u] * x[c + 7u];
+                acc += part * sc;
+            }
         }
-        acc += part * sc;
     }
-    red[gl_LocalInvocationID.x] = acc;
+    red[tid] = acc;
     barrier();
-    for (uint s = 32u; s > 0u; s >>= 1) {
-        if (gl_LocalInvocationID.x < s) red[gl_LocalInvocationID.x] += red[gl_LocalInvocationID.x + s];
+    for (uint s = 4u; s > 0u; s >>= 1) {
+        if (lane < s) red[tid] += red[tid + s];
         barrier();
     }
-    if (gl_LocalInvocationID.x == 0u) y[p.y_off + r] = red[0];
+    if (lane == 0u && r < p.rows) y[p.y_off + r] = red[tid];
 }
