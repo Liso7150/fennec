@@ -1,0 +1,85 @@
+#version 450
+// Batched y[token] = W x[token] for bf16 weights. Same shape as gemv_bf16 but
+// loops over n_tokens per workgroup so the weight row is loaded once from VRAM
+// and applied to every token's input vector. This is the prefill amortisation
+// Colibri gets from its batch-union moe(): the dense projections read their
+// weights once for the whole prompt chunk, not once per token.
+//
+// Layout: 256 threads, 4 rows per workgroup (64 threads per row). Each row
+// group reduces cols/2 bf16 pairs for EACH token in sequence.
+layout(local_size_x = 256) in;
+layout(push_constant) uniform P {
+    uint rows;
+    uint cols;
+    uint n_tokens;
+    uint x_stride;      // == cols (floats between consecutive token rows in X)
+    uint y_stride;      // == rows (floats between consecutive token rows in Y)
+    uint x_off;         // base offset of X buffer (token 0 starts here)
+    uint y_off;         // base offset of Y buffer
+    uint row_base;      // for tall-split dispatches
+} p;
+layout(set = 0, binding = 0) readonly buffer W { uint w[]; };
+layout(set = 0, binding = 1) readonly buffer X { float x[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+layout(set = 0, binding = 3) readonly buffer W4 { uvec4 w4[]; };
+
+shared float red[256];
+
+float bf(uint u, uint hi) {
+    return uintBitsToFloat(((u >> (16u * hi)) & 0xFFFFu) << 16);
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint lane = tid & 63u;
+    uint slot = tid >> 6;
+    uint r = (p.row_base + gl_WorkGroupID.x) * 4u + slot;
+    uint half_cols = p.cols >> 1;
+
+    if (r >= p.rows) {
+        // Park unused lanes: they must still reach the barriers.
+        for (uint t = 0; t < p.n_tokens; t++) {
+            red[tid] = 0.0;
+            barrier();
+            for (uint s = 32u; s > 0u; s >>= 1) {
+                if (lane < s) red[tid] += red[tid + s];
+                barrier();
+            }
+        }
+        return;
+    }
+
+    uint w_base = r * half_cols;
+    bool aligned = (half_cols & 3u) == 0u;
+    uint quads = aligned ? (half_cols >> 2) : 0u;
+
+    for (uint t = 0; t < p.n_tokens; t++) {
+        float acc = 0.0;
+        uint x_base = p.x_off + t * p.x_stride;
+        if (aligned) {
+            for (uint i = lane; i < quads; i += 64u) {
+                uvec4 u = w4[(w_base >> 2) + i];
+                uint c = x_base + (i << 3);
+                vec4 x0 = vec4(x[c], x[c + 1u], x[c + 2u], x[c + 3u]);
+                vec4 x1 = vec4(x[c + 4u], x[c + 5u], x[c + 6u], x[c + 7u]);
+                acc += bf(u.x, 0u) * x0.x + bf(u.x, 1u) * x0.y
+                     + bf(u.y, 0u) * x0.z + bf(u.y, 1u) * x0.w
+                     + bf(u.z, 0u) * x1.x + bf(u.z, 1u) * x1.y
+                     + bf(u.w, 0u) * x1.z + bf(u.w, 1u) * x1.w;
+            }
+        } else {
+            for (uint i = lane; i < half_cols; i += 64u) {
+                uint u = w[w_base + i];
+                uint c = x_base + (i << 1);
+                acc += bf(u, 0u) * x[c] + bf(u, 1u) * x[c + 1u];
+            }
+        }
+        red[tid] = acc;
+        barrier();
+        for (uint s = 32u; s > 0u; s >>= 1) {
+            if (lane < s) red[tid] += red[tid + s];
+            barrier();
+        }
+        if (lane == 0u) y[p.y_off + t * p.y_stride + r] = red[tid];
+    }
+}

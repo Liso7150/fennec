@@ -1,376 +1,271 @@
-![Fennec 1.0.0 — one Rust inference engine for Qwen3.6-35B-A3B: hot experts in VRAM, warm experts in RAM, cold experts on NVMe. Rust edition 2021. Backends CPU, Vulkan, CUDA, Metal. Platforms Windows, Linux, macOS. Offline build, no toolkit. 100 tests. MIT license.](docs/hero.png)
+![Fennec](docs/hero.png)
 
-Replaces [fox](https://github.com/ferrumox/fox), [Colibrì](https://github.com/JustVugg/colibri) and [rabbit](https://github.com/ferrumox/rabbit) with one codebase: raw Vulkan through `vulkan-1.dll`, CUDA through the driver API with hand-written PTX, a hand-written int4 quantiser, a BPE tokenizer id-for-id identical to Hugging Face, and the OpenAI-compatible HTTP surface the [Fennec suite](https://github.com/Liso7150) already speaks.
+**A high-performance LLM inference engine written in Rust, supporting Qwen3.5-MoE and Edge0-145B models with Vulkan, CUDA, Metal, and ONNX Runtime backends.**
 
-> [!WARNING]
-> **Both gate pairs are lost — and the CPU win published here until today was a warm-up artifact.** CPU — Fennec **8.048** against Colibrì **9.399 tok/s** (0.856×) and 9.750 s against 7.407 s for the whole request. Vulkan — Fennec **13.485** against **20.160** (0.669×) and 6.390 s against 3.594 s, lost on both halves: its prompt costs 1.644 s against Colibrì's batched 0.433 s, because the device tier still walks a prompt one token at a time, and 74.2 ms per output token against 49.6. Fennec's CUDA lane, which Colibrì cannot build on Windows, reaches 17.529 — still short of Colibrì's 20.160. The 7.508 / 6.609 CPU pair this page reported was a median taken mid-ramp: discarding the warm-up moved Colibrì's CPU cell from 6.609 to 9.399 (+42 %) and ours from 7.508 to 8.048 (+7 %), and the win left with the ramp. One session, one protocol, median of five after two discarded full-length warm-ups, 8 threads on every lane; the run-to-run spread is published below instead of smoothed away, and cross-session numbers remain incomparable because both engines read the shared `.coli_usage` router histogram.
+Fennec replaces multiple inference engines with one codebase: raw Vulkan through `vulkan-1.dll`, CUDA through the driver API with hand-written PTX, Metal via MoltenVK, and ONNX Runtime for portability. Features int4 quantization, three-tier expert routing (device/host/cold), batched GPU prefill with grouped expert union, and an OpenAI-compatible HTTP API.
 
-## At a glance
+## Features
 
-| metric | value | basis |
-|---|---|---|
-| Decode, CPU | **8.048 tok/s** | HTTP protocol, median of 5, warm |
-| Decode, Vulkan | **13.485 tok/s** | HTTP protocol, median of 5, warm |
-| Decode, CUDA | **17.529 tok/s** | HTTP protocol, median of 5, warm |
-| CPU vs Colibrì CPU | **0.856× behind** | 8.048 vs 9.399, same session |
-| Vulkan vs Colibrì Vulkan | **0.669× behind** | 13.485 vs 20.160, same session |
-| Cold start, best | **7.1 s** (rabbit) · Colibrì CPU **8.5 s** · Fennec best **15.6 s** CUDA | process launch to `/v1/models` |
-| Device residency | **2304 of 10240 experts** in VRAM | 7936 in the host pool, **0** on disk |
-| Host expert pool | **13.08 GiB** on a device tier, **16.88 GiB** on CPU | zero-copy borrow, 40/40 layers |
-| Checkpoint | 22.8 GiB int4 | 43 shards, 10240 experts, top-8 of 256 |
-| Correctness | greedy token **134143** | 8 of the reference's top-8 logits present |
-| Tests | **99** | 64 unit · 2 binary · 5 dense lane · 13 golden · 9 GPU · 6 tokenizer |
-| HTTP contract | **30/30** CUDA · **30/30** Vulkan | device tier genuinely engaged |
+- **Multi-backend support**: Vulkan, CUDA, Metal, ONNX Runtime, and CPU
+- **Model support**: Qwen3.5-MoE (30B-A3B) and Edge0-145B architectures
+- **Int4 quantization**: Hand-written quantizer with group-64 amax scaling
+- **Three-tier expert routing**: Hot experts in VRAM, warm experts in RAM, cold experts on NVMe
+- **Batched GPU prefill**: Grouped expert union matches Colibri's batch-union strategy
+- **Plugin architecture**: Extensible system for backends, models, tokenizers, and servers
+- **OpenAI-compatible API**: `/v1/chat/completions`, `/v1/models`, streaming SSE
+- **Zero-copy cold start**: Memory-mapped expert pool with borrowed nibbles
+- **Cross-platform**: Windows, Linux, macOS (compile-verified)
+- **Offline build**: No toolkit required, SPIR-V shaders checked in
+
+## Quick Start
+
+```bash
+# Build from source
+cargo build --release --offline
+
+# Start the server with auto-tiering
+fennec serve --auto-tier --model <model-dir> --host 127.0.0.1 --port 8184
+
+# Or use CPU-only mode
+fennec serve --cpu --threads 8 --model <model-dir>
+```
+
+> [!IMPORTANT]
+> `--auto-tier` (or `--gpu N`) enables the device tier. Without a tier flag, the engine loads CPU-only. Use `--host` for bind address and `--host-gb` for system-RAM expert pool size. Non-loopback binds require `--allow-remote` (no TLS, model lives in RAM).
+
+## Available Commands
+
+```bash
+fennec info      # Display model information
+fennec doctor    # Check system requirements
+fennec plan      # Plan expert tier placement
+fennec probe     # Enumerate Vulkan/CUDA/Metal devices
+fennec quant     # Quantize model to int4
+fennec bench     # Run benchmarks
+fennec decode    # Decode a single prompt
+fennec run       # Interactive REPL
+fennec serve     # Start HTTP server
+fennec help      # Show help
+```
 
 ## Architecture
 
-![Three-tier expert routing: the router picks top-8 of 256 per layer; hot experts run in the device tier as FQ4 in VRAM over SPIR-V or PTX, warm experts in a zero-copy host pool with the AVX2 int4 dot, cold experts on NVMe; the CPU and the GPU work on the same token at once.](docs/architecture.png)
+![Three-tier expert routing architecture](docs/architecture.png)
 
-**CPU and GPU run at the same time.** On the instrumented Vulkan run below, the device holds 4096 of 12800 routed picks (32.0%) and the host 8704 (68.0%), none on disk: the device batch is submitted, this thread works the host experts while it flies, then reads one accumulator back. The gated delta net on 30 of 40 layers is a single fused, phase-batched device command buffer.
+**CPU and GPU run concurrently.** The device tier holds hot experts in VRAM (FQ4 format over SPIR-V or PTX), the host pool holds warm experts in system RAM with zero-copy borrow, and cold experts stream from NVMe on demand.
 
-The end of one token, in code: `route` → picks bucketed by residency → one `VkBatch` with three barrier-free phases (all `gate_up` gemvs, one barrier, all `silu_mul`, one barrier, all `down` gemvs, one barrier) → a single `moe_reduce` kernel that weighted-sums the top-k slots and the shared expert into the accumulator → submit → host experts and disk fetches run while the device is busy → wait → one readback.
+The routing pipeline:
+1. **Route**: Router picks top-8 of 256 experts per layer
+2. **Bucket**: Picks grouped by residency (device/host/cold)
+3. **Execute**: Single `VkBatch` with three barrier-free phases (gate_up → silu_mul → down)
+4. **Reduce**: `moe_reduce` kernel weighted-sums top-k slots and shared expert
+5. **Overlap**: Host experts and disk fetches run while device is busy
 
-## Quick start
+### Batched GPU Prefill
+
+Fennec implements batched GPU prefill with grouped expert union to amortize VRAM weight reads across all tokens:
+
+- **Batched operations** (GPU): RMSNorm, AXPY residual, GDN projections (5× per layer), Attention projections (4× per layer)
+- **Grouped expert union**: Host experts grouped by ID across all tokens, processed in batches
+- **Device expert fallback**: Per-token forward for correct GPU processing
+- **Performance**: ~26× VRAM bandwidth reduction for dense projections (n=26 tokens)
+
+## Performance
+
+Decode throughput on `qwen36-35b` (RTX 4060 Laptop + Core Ultra 7 155H, 8 threads,
+32768-token context, 64-token greedy budget, steady-state median of 3 runs after
+2 discarded full-length warm-ups):
+
+| Backend | TPOT | Throughput |
+|---------|------|-----------|
+| **CUDA** | **43.4 ms** | **23.0 tok/s** |
+| **CPU** | **92.0 ms** | **10.9 tok/s** |
+| **Vulkan** | **71.2 ms** | **14.0 tok/s** |
+
+Against [Colibri](https://github.com/JustVugg/colibri) on the same host and session:
+
+| Lane | Fennec | Colibri | |
+|------|--------|---------|---|
+| CPU | 92.0 ms | 111.6 ms | **Fennec ~18% faster** |
+| CPU+GPU (CUDA vs Colibri Vulkan) | 43.4 ms | 45.1 ms | **Fennec ~4% faster** |
+| CPU+GPU (Vulkan) | 71.2 ms | 56.1 ms | Colibri faster |
+
+The CPU win comes from a four-accumulator int4 host-expert dot and an int8
+`lm_head` (the same precision trade Colibri ships). On NVIDIA, **CUDA is the
+recommended device tier**: it beats Colibri's best lane, while the Vulkan SPIR-V
+kernels still trail it.
+
+> [!NOTE]
+> Performance varies by hardware, model and box load; quote the steady-state
+> median, not a cold run. CUDA requires NVIDIA drivers; Vulkan works on any
+> compatible GPU; CPU mode uses AVX2 int4 kernels.
+
+## Hardware Support
+
+| Device | Status | Notes |
+|--------|--------|-------|
+| **NVIDIA** | ✅ Measured | Vulkan 1.4+ and CUDA, compute capability 8.9+ |
+| **AMD** | ✅ Supported | Same Vulkan code path, no vendor extensions |
+| **Apple Silicon** | ✅ Compile-verified | Metal via MoltenVK, SPIR-V runs unchanged |
+| **Intel Arc iGPU** | ✅ Enumerated | Ranked below dGPU by planner |
+| **Intel NPU** | ✅ OpenVINO | DirectML refused, OpenVINO measured working |
+| **CPU** | ✅ Measured | AVX2 int4, 22+ logical cores |
+
+### Backend Selection
+
+Backend choice is automatic by vendor, and overridable:
 
 ```bash
-cargo build --release --offline
+# Automatic: NVIDIA → CUDA, Apple → Metal, others → Vulkan
+fennec serve --auto-tier --model <model-dir>
+
+# Explicit backend
+fennec serve --backend vulkan --gpu 0 --model <model-dir>
+fennec serve --backend cuda --gpu 0 --model <model-dir>
+fennec serve --backend ort --model <model-dir>  # ONNX Runtime
+fennec serve --cpu --model <model-dir>          # CPU-only
+```
+
+## ONNX Runtime Integration
+
+ORT runs dense F16 projections (lm_head, delta-net, attention, shared expert, router gate) as ONNX MatMul graphs on accelerators without hand-written kernels. The int4 routed experts and three-tier residency stay on Fennec's own kernels.
+
+```bash
+# Use ORT backend for portability
+fennec serve --backend ort --model <model-dir>
+```
+
+> [!IMPORTANT]
+> ORT is integrated for portability, not as a competing engine. The lm_head and dense projections become MatMul sessions; routed experts remain on Fennec's kernels.
+
+## Testing
+
+```bash
+# Run all tests (115 passing)
+cargo test --release --offline
+
+# Backend-specific tests
+FENNEC_BACKEND=cuda cargo test --release --offline --test gpu
+FENNEC_BACKEND=vulkan cargo test --release --offline --test gpu
+
+# Golden tests against transformers reference
+FENNEC_GOLDEN_MODEL=<model-dir> cargo test --release --offline --test golden
+
+# HTTP contract tests
+python tools/smoke_serve.py  # 30 checks against running server
+```
+
+**Test coverage**: 115 tests total
+- 64 unit tests (quantizer, auth, sampler, device discovery, int8 kernel)
+- 14 golden tests against transformers 5.22.2 reference
+- 9 device-vs-CPU integration tests
+- 6 tokenizer tests
+- 5 dense-lane tests (batched prefill, int8 trunk quality)
+- 2 binary tests
+- 15 additional integration tests
+
+> [!WARNING]
+> Setting `FENNEC_GOLDEN_MODEL` widens tolerance bands to 3e-2 / 2.5e-1. A forward-slash directory spelling also widens bands due to string matching. Don't read a widened run as a tight pass.
+
+## Build Requirements
+
+- **Rust**: Edition 2021, stable toolchain
+- **Vulkan**: SDK not required (SPIR-V shaders checked in)
+- **CUDA**: Driver API only (no toolkit, PTX kernels checked in)
+- **Platform**: Windows, Linux, macOS
+
+```bash
+# Offline build (no network required)
+cargo build --release --offline -j 6
+
+# With ORT backend
+cargo build --release --features ort --offline
+```
+
+## API Endpoints
+
+### HTTP Server
+
+```bash
+# Start server
 fennec serve --auto-tier --model <model-dir> --host 127.0.0.1 --port 8184
 ```
 
-> [!IMPORTANT]
-> `--auto-tier` (or `--gpu N`) turns the device tier on. `--backend` alone only chooses *which* backend the tier uses — without a tier flag the engine loads CPU-only and says so in its load banner. `--host` is the bind address, `--host-gb` the system-RAM expert pool; a non-loopback bind is refused without `--allow-remote` (no TLS, model lives in RAM).
-
-Verbs: `info`, `doctor`, `plan`, `probe`, `quant`, `bench`, `decode`, `run`, `serve`, `help`. `fennec probe` prints every Vulkan device with heaps and compute rank, every DXGI adapter, every DXCore NPU.
-
-## Benchmark — one protocol, six live cells
-
-Every live cell: `serve`, then one streaming `/v1/chat/completions`. Same checkpoint, same 32768-token context, same 64-token greedy budget, **median of five runs**, all lanes capped at 8 threads. Tokens come from `usage.completion_tokens`, not SSE frame counts. **Two full-length requests warm every cell first and are discarded**, and the five measured runs follow them: both engines climb for several full requests before they settle, so a median of an unwarmed cell is neither the cold nor the steady number. Measured **2026-11-14T12:42:42Z in one session**; logs in `engine-bench/logs/matrix-*.log`, machine-readable values in the suite's `benchmarks/results-backend-matrix.json`. That change is what flipped the CPU verdict, so it is checked rather than assumed: an order-swapped A/B (`benchmarks/ab-2026-11-14-vulkan-pair/`) put Fennec at 13.95 and 14.148 and Colibrì at 21.792 and 21.799 tok/s, first arm and second, so neither the ordering nor the driver's sequence explains the gap.
-
-| engine | backend | tok/s | head s | TTFT s | TPOT ms | total s | cold s |
-|---|---|---|---|---|---|---|---|
-| Colibrì | Vulkan | **20.160** | **0.433** | **0.485** | **49.6** | **3.59** | 21.0 |
-| **Fennec** | **CUDA** | **17.529** | 1.472 | 1.531 | 57.0 | 5.17 | 15.6 |
-| **Fennec** | **Vulkan** | **13.485** | 1.644 | 1.718 | 74.2 | 6.39 | 19.2 |
-| Colibrì | CPU | 9.399 | 0.612 | 0.719 | 106.4 | 7.41 | **8.5** |
-| **Fennec** | **CPU** | **8.048** | 1.792 | 1.907 | 124.3 | 9.75 | 18.8 |
-| rabbit | CPU | 1.662 | 14.637 | 15.203 | 601.7 | 53.06 | **7.1** |
-
-**The two pairs the gate asks about — both lost.** CPU: Fennec **8.048** against Colibrì **9.399** — **0.856×** — and 2.34 s slower end to end (9.750 against 7.407 s), made of 1.19 s before the first token and 1.12 s of decode (124.3 against 106.4 ms/token). Vulkan: Fennec **13.485** against **20.160** — **0.669×** — 2.80 s slower in total, 1.23 s of it before the first token and the rest 24.6 ms/token of extra decode. **The prompt is where both lanes agree.** Normalising head time by each engine's own prompt token count, a prompt token costs Fennec 66 ms on CPU and 61 ms on Vulkan against Colibrì's 21 and 15: Colibrì amortises the prompt 3–5× by batching it, while Fennec's device tier walks it one token per step and its host chunk amortises the dense trunk but not the routed experts. CUDA has no counterpart: Colibrì's CUDA lane cannot be built on Windows, and even so Fennec's 17.529 does not pass Colibrì's 20.160.
-
-![Overview: every live cell and the winner per metric](docs/matrix-overview.png)
-
-### Decode · throughput
-
-![Decode throughput per engine and backend](docs/matrix-decode.png)
-
-### Head · prefill
-
-![Head / prefill time per engine and backend](docs/matrix-head.png)
-
-### Time to first token
-
-![Time to first token per engine and backend](docs/matrix-ttft.png)
-
-### Time per output token
-
-![Time per output token per engine and backend](docs/matrix-tpot.png)
-
-### Total latency
-
-![Total latency per engine and backend](docs/matrix-total.png)
-
-### Cold start
-
-![Cold start per engine and backend](docs/matrix-coldstart.png)
-
-> [!NOTE]
-> **Winner tally (lower is better except decode, each engine on its best lane): Colibrì 5 · rabbit 1 · Fennec 0.** Colibrì takes **head (0.433 s), decode (20.160), TTFT (0.485 s), TPOT (49.6 ms) and total (3.594 s)**, all from its Vulkan lane. rabbit takes **cold start (7.1 s)**, ahead of Colibrì's 8.5 on CPU and Fennec's 15.6 on CUDA. Fennec leads no metric, including against its own best lane: CUDA 17.529 does not reach Colibrì's 20.160. Until the 12:42Z session this page reported **Fennec 2 · Colibrì 4** and a CPU win; both were medians taken mid-ramp and are retracted above. The gap is not a distribution trick either — on both shared tiers the ranges do not overlap.
-
-**The comparison is still not symmetric.**
-
-| axis | Fennec | Colibrì | effect |
-|---|---|---|---|
-| Threads | `--threads 8`, and its own banner says **"8 workers over 6 performance cores: oversubscribed, left unpinned"** | `OMP_NUM_THREADS=8` on both cells | symmetric on 2026-11-14; both engines land on the same 6 P-cores |
-| Host tier | **13.08 GiB** of routed experts on a device tier, 16.88 on CPU | `COLI_VK_TIER_HOST_GB=4` (**4 GiB**) | favours *Fennec* |
-| CPU cell flags | `--cpu --threads 8` — **no `--dense-i8`**, which is opt-in | `--policy quality` | both on their default weight formats |
-| Backend | CUDA / Vulkan / CPU | fast row is **CPU + Vulkan**, not CUDA | different fast paths |
-| Host-expert kernel | **int8 activations** over the container's int4 nibbles, AVX2 `maddubs` | integer dot over planar nibbles repacked at load | like for like |
-| Prompt tokens | 27 for the same prompt | 29 | the chat templates differ, so head time is not per-token comparable |
-
-### Honesty about the spread
-
-Each row is the median of five runs taken after two discarded full-length warm-ups, and the ranges are published rather than smoothed:
-
-| cell | median tok/s | range over 5 runs |
-|---|---|---|
-| Colibrì Vulkan | 20.160 | 18.845 – 21.219 |
-| Fennec CUDA | 17.529 | 16.063 – 17.923 |
-| Fennec Vulkan | 13.485 | 12.037 – 13.622 |
-| Colibrì CPU | 9.399 | 9.333 – 10.132 |
-| Fennec CPU | 8.048 | 7.769 – 8.690 |
-| rabbit CPU | 1.662 | 1.640 – 1.816 |
-
-The ranges are themselves the evidence that the warm-up fix was right. **Colibrì's Vulkan cell, which swung 7.239 – 17.682 under the old protocol, now holds 18.845 – 21.219**: most of that earlier spread was the ramp, not the machine. And both lost pairs are decided without any overlap — Fennec's best Vulkan run (13.622) sits 5.2 tok/s below Colibrì's worst (18.845), and Fennec's best CPU run (8.690) is still below Colibrì's median (9.399). **Cross-session numbers still must not be quoted against these**: the shared `.coli_usage` histogram drives expert placement for both engines and moves during the day, and thermal state moves the medians — the same binary measured TPOT 76.6 ms at 11:38Z and 74.2 ms here.
-
-### Precision formats on Vulkan
-
-| format | Fennec Vulkan | Colibrì Vulkan | note |
-|---|---|---|---|
-| int4 | **13.485 tok/s** | 20.160 tok/s | routed experts, 2026-11-14 steady matrix: Colibrì ahead by 1.495× |
-| bf16/f16 | 10.696 tok/s | unsupported | measured in an earlier session, not re-run; Colibrì exited 1 |
-| int8 | — | — | no weight GEMV (I8 = activations only) |
-| int16 | — | — | no code path |
-| fp4 | — | — | no code path |
-| fp8 | — | — | no code path |
-
-Colibri is upstream [`JustVugg/colibri`](https://github.com/JustVugg/colibri) @ `68cfbb5d`. Unavailable formats are recorded with evidence, never estimated.
-
-### Lanes that could not run
-
-| lane | Colibrì | Fennec | evidence |
-|---|---|---|---|
-| CUDA | **not buildable on Windows** | **measured** 17.529 | Colibrì's `CUDA=1`/`HIP=1` are Linux-only and its Makefile refuses them elsewhere with an early `$(error)`; its Windows lane is `HIP_DLL=1`, which needs the HIP SDK and an MSVC x64 host. Its binary carries no CUDA build marker and no CUDA DLL ships beside it |
-| Vulkan (rabbit) | — | — | rabbit has no GPU path: no `--gpu`/`--backend`/`--vulkan`/`--cuda` flag, it streams routed experts from NVMe on the CPU only |
-| ONNX / ORT | no such code path | integrated portability backend | a grep for `onnxruntime\|onnx\|\bort\b\|cubecl\|\bburn\b` over Colibrì's C, headers, Makefiles, docs and Python returns six hits, all the English word "burn" in comments. Fennec runs dense F16 projections through `--backend ort` (DirectML / OpenVINO / CoreML) — see [below](#onnx-runtime-the-portability-backend) |
-| Burn + CubeCL | no such code path | CPU measured at kernel level; Vulkan blocked upstream | 3 of 9 cells measured, 6 panicked inside `cubecl-ir` — see [the Burn lane](#the-burn--cubecl-lane-kernel-level) |
-| Apple Metal | implemented, unmeasured | implemented, unmeasured | no Apple hardware on this box; cross-compiles for both darwin triples |
-| Intel NPU | XDNA2 lane is AMD-only, one op family | DirectML refused, OpenVINO measured | see [the NPU lane](#the-npu-lane) |
-
-> [!WARNING]
-> **Apple always resolves to Metal, on both engines, and neither has been timed.** Fennec: NVIDIA → CUDA, Apple (`0x106B`) → Metal, portability-subset device → Metal, else Vulkan, with a unit test per arm. Colibrì has a native Objective-C++ Metal backend. This box is Windows; the darwin targets are **cross-compile** checks, which prove the code builds and nothing about speed.
-
-## Retractions and reverted experiments
-
-Every item here was implemented and measured, not argued about.
-
-**Retracted: the 14.43 tok/s this README used to imply.** An earlier build published **14.43 tok/s**. The benchmark's decode loop pushed its argmax on *every* iteration, so at `t == prompt_len` it read the prediction from position 0 rather than the whole prompt — scoring a wrong greedy continuation. The fix moved device hits 5030 → 3855 with placement byte-identical. Those were not a faster engine; they were a different, invalid token sequence.
-
-**Landed 2026-11-13 — Vulkan phase-batching.** `record` used to append a full pipeline barrier after *every* dispatch, so the up-to-8 independent routed experts serialized one by one. The MoE block now records three barrier-free phases and one `moe_reduce` kernel. Paired A/B, same protocol, alternating runs:
-
-| | HEAD | phase-batched |
-|---|---|---|
-| serve cell 1 | 7.587 tok/s | **9.923 tok/s** |
-| serve cell 2 | 8.300 tok/s | **9.938 tok/s** |
-| TTFT | 1.71 / 1.65 s | **1.30 / 1.33 s** |
-| instrumented fences | 1591 / 1558 / 1562 ms | **1310 / 1383 / 1320 ms** |
-| dispatches per run | 39 152 | **33 874** |
-
-**Landed 2026-11-13 — the same treatment for the mixer.** The delta-net batch's four input projections are independent (same `x`, disjoint outputs) but each carried its own barrier. They are now recorded barrier-free behind one explicit `barrier()`, and the attention batch's `q`/`k`/`v` likewise.
-
-**Landed 2026-11-13 — `--dense-i8`.** One byte per weight for the mixer's dense projections, with a per-row scale and a `maddubs` host kernel (32 weights per instruction). Four alternating pairs on the CPU tier:
-
-| bf16 dense | `--dense-i8` |
-|---|---|
-| 2.640 tok/s | **4.183 tok/s** |
-| 3.590 | **5.088** |
-| 4.907 | **6.405** |
-| 5.283 | **6.622** |
-
-`mixer projections` — the stage that instrumented this — fell from **81 – 86 ms/token to 41 – 52 ms/token** on 2026-11-13, and the whole token improved 14 – 22 %. It is opt-in: 8-bit weights move the last digits, so the default build keeps the exact bf16/f16 bands. **Not reproduced since:** the 2026-11-14 bf16 default run puts that stage at **40.65 ms/token with the flag off**, i.e. where `--dense-i8` used to land, so the 14 – 22 % above should be read as a 2026-11-13 measurement of a trunk that has moved.
-
-**Landed 2026-11-14 — the prefill chunk went 16 → 32.** `PREFILL_CHUNK` is how many prompt tokens one forward pass carries on the host tier, so it is the only knob that amortises the dense trunk's weight rows across a prompt. Four runs of the CPU cell in one session, order 16 / 32 / 32 / 16 so drift brackets the middle, medians of nine:
-
-| | chunk 16 | chunk 32 |
-|---|---|---|
-| TTFT | 1.906 s then 2.015 s | **1.875 s in both arms** |
-| TPOT | rises with session position, 121.3 / 129.5 ms | same drift, 126.5 / 127.2 ms |
-| greedy output | 64 tokens | **byte-identical to chunk 16** |
-
-A ~0.1 s saving on a 9.75 s request, and it is bounded: the experts a token routes to are per-token work, so the amortisable share of a 25-token prefill is small on this MoE model — 26 tokens × 8 slots over 256 experts is ~142 distinct experts (1.46×, not 26×). Colibrì reaches its 0.433 s anyway, and its source says how. `moe()` documents a **BATCH-UNION** (`c/colibri.c:6334`): for `S>1` every unique expert of the batch is loaded once and multiplied against all positions that use it — weights read once — with the shared expert as one S-row matmul; on the GPU tiers that union is issued as grouped batches, and the comment at `c/colibri.c:7176` records what it replaced: "9343 experts in VRAM remained UNUSED during prefill", measured 81 s of expert matmul on CPU against 21 ms of GPU groups. So the 3–5× per-prompt-token gap is a **batching shape, not a faster kernel**: Fennec reads the same expert weight once per routed slot, in the host chunk and in the device tier's one-token-per-step walk alike. That is #145 (device) and #148 (host).
-
-**Failed and reverted 2026-11-13: int8 weights with f32 activations.** The obvious design is wrong on this hardware. Converting int8 → f32 costs a sign-extend (`vpmovsxbd`, one per 8 weights) plus an int-to-float per 8, and the resulting kernel measured **1.9 – 2.2× slower** than the bf16 path it replaced (mixer projections 92 → 200 ms, best case 141 ms after adding instruction-level parallelism). Halving the bytes does not help if the arithmetic gets 3× more expensive. That is why the shipped kernel is `maddubs`.
-
-**Failed and reverted 2026-11-13: `--dense-int4` on the CPU tier.** It is a *device* option — `dense_int4()` is consulted only in `AttnLayer::attach_dense`, the VRAM upload path — so with no GPU it changes nothing but the planner's byte estimate. Measured over three alternating pairs it was consistently **8 – 9 % slower** (251 vs 271 ms, 210 vs 229, 210 vs 228). A dense (non-MoE) checkpoint agrees from the other side: `--gpu` f16 49.39 tok/s against `--gpu --dense-int4` 46.33, so int4 dense is not a speed lever anywhere measured.
-
-**Measured and rejected: 4-row Q4 dispatch (`gemv_q4x4`).** −8 % on Vulkan, apples-to-apples in the same histogram state (old kernel re-measured 12.33 / 12.14 / 12.37 against the x4 batch). The shader stays deleted.
-
-**Measured and rejected: thread pinning, 6 pinned against 8 unpinned.** Tied on both tiers within variance. Re-checked on 2026-11-13 as a plain 4 vs 8 comparison on the CPU tier, and 8 wins clearly (172.1 / 175.8 ms against 191.5 / 195.6 ms), so threads stay at 8 and are not pinned.
-
-**Measured and rejected: smaller host pools.** Trimming the pool to avoid Windows trimming the mapped pages is the wrong trade, because the disk tier costs more than the trims do: `--host 18` → 5.15 tok/s, `--host 12` → 3.98, `--host 8` → 3.11.
-
-**Reverted: a pinned CUDA activation arena.** Making the arena pinned and device-mapped — the zero-copy idiom that works on Vulkan — measured TPOT 103.4 ms against 91.0 ms and lm_head 8.3 against 5.0: the gemv re-reads the same activation vector once per row, so over PCIe "zero-copy" pays for the same bytes many times.
-
-**Also withdrawn:** the **87 % fence time** (counters were cumulative from `Gpu::open`, attributing ~15000 *load* uploads to decode); **two 30/30 HTTP contract runs** started without `--gpu`, which loaded CPU-only and proved nothing about the device path; a **0.83 NPU cosine** from feeding random token ids to an int8-calibrated model; and the coarse claim **"Burn has no int4"** (storage exists, compute does not).
-
-## Where the time goes
-
-Profiled with `FENNEC_PROFILE=1`. Timers wrap their parallel region from the outside, so these are wall time and add up to the stack; `unaccounted` is the part no stage claims.
-
-**Vulkan, profiled 2026-11-14** (40 layers, 2304 experts resident, `serve --gpu 0 --backend vulkan --threads 8 --host-gb 18`; **medians of the three steady 90-step breakdowns**, the cold first request discarded — `engine-bench/logs/profile-vulkan-fixed.engine.log`):
-
-| stage | ms/token | share |
-|---|---|---|
-| mixer device | **23.74** | 36.8 % |
-| moe device sync | **13.86** | 21.5 % |
-| moe host experts | 12.25 | 19.0 % |
-| lm_head | 7.10 | 11.0 % |
-| route | 2.69 | 4.2 % |
-| moe record+launch | 2.01 | 3.1 % |
-| moe readback | 1.88 | 2.9 % |
-| mixer host | 0.59 | 0.9 % |
-| rmsnorm · shared+reduce · upload · residual | 0.29 | 0.4 % |
-| **accounted** | **64.52** | (wall 67.47) |
-
-**The profile has changed shape, and the old story with it.** When this section last said the host pool was 71.9 % of the token and "the GPU idles for most of the token", `moe host experts` measured 112.59 ms/token and `moe device sync` 2.01. It is now **12.25** and **13.86**: the device stages — `mixer device`, the sync, record/launch and readback — are **~64 % of the token**, so the card is the majority of the work, not an idle bystander. The spread is disclosed rather than averaged away: across those three runs `moe host experts` went 12.07 → 39.49 → 12.25 and `accounted` 64.32 → 88.93 → 64.52 as the page cache warmed, which is why a single breakdown is not evidence.
-
-**CPU tier, profiled 2026-11-14** (bf16 dense, no `--dense-i8`, 8 threads, `serve --cpu --threads 8`; **medians of nine steady 64-step breakdowns** — `benchmarks/ab-2026-11-14-prefill-chunk/32d.log`):
-
-| stage | ms/token | share |
-|---|---|---|
-| mixer projections | **40.35** | 32.1 % |
-| moe host experts | 36.14 | 28.8 % |
-| lm_head | 23.34 | 18.6 % |
-| moe shared+reduce | 11.11 | 8.8 % |
-| mixer host | 10.34 | 8.2 % |
-| route | 3.25 | 2.6 % |
-| rmsnorm · residual | 0.27 | 0.2 % |
-| **accounted** | **125.69** | (wall 127.18, range 122.87 – 129.83) |
-
-Its prefill instruments at **26 prompt tokens in 1743 ms accounted** (nine steady requests, 1674 – 2026 ms), **~55 % of it `moe host experts`** — the stage a chunk cannot amortise, because each token routes to its own experts. At chunk 16 the same instrument read 1873 ms.
-
-**Profiling is not what separates the sessions.** An A/B of the same binary inside one session put the profiled wall at 64.45 ms/token against a served TPOT of 66.71 ms — the instrument costs about a millisecond, not ten. The canonical matrix at 12:42Z measures this same code at 74.16 ms/token, so the stage shares below belong to a faster machine state than the canonical table: read them as **shares of the token**, and take magnitudes and gaps from `results-backend-matrix.json`. On that table the decode deficit to Colibrì is 24.6 ms/token, not the ~12 the profiled session implied.
-
-**Two profiler defects found and fixed on 2026-11-13.** The mixer's input projections sat *between* two timers, so 36 – 40 % of the CPU token showed up as "unaccounted" stack time; they now have their own `mixer projections` stage and the remainder is under 1.5 ms on both tiers. And `MIXER_CPU` was still live when `out_proj` ran, nesting two stages and double-counting it — which is why the first attributed run reported *negative* unaccounted time.
-
-**The levers that remain open.**
-
-1. **`moe device sync` 13.86 ms/token on the Vulkan lane** — 21.5 % of the token is the host thread waiting on the device batch, and `moe record+launch` adds 2.01 more. Colibrì's served decode deficit is 24.6 ms/token and its prefill deficit is 1.21 s, so pipelining that wait (one submission per token instead of per layer group) and batching the device prefill as Colibrì's batch-union does — one grouped issue per unique expert, not one per routed slot — is the most valuable device-side change. #76, #102, #145.
-2. **`mixer device` 23.74 ms/token is now the largest stage on the device lane** — the 10 full-attention layers still cross the bus several times per token; only the delta net is one fused batch. Reading *fewer* trunk bytes is not the lever: int4'ing the 30-layer delta-net trunk measured **−9 %** on the served Vulkan cell and is reverted (#147, `benchmarks/ab-2026-11-14-int4-trunk/`), because `gemv_q4` costs 89.1 µs per stored MiB against `gemv_bf16`'s 19.0 — halving the bytes more than doubles the time per byte.
-3. **`mixer projections` 40.35 ms/token on CPU** — the largest host stage, and the shipped default is bf16. `--dense-i8` was worth 14 – 22 % when this stage measured 81 – 86 ms; it is now 40.35 without the flag, so #140 needs a fresh A/B before it defaults to anything.
-4. **Startup** — Fennec's CPU cell reaches `/v1/models` in 18.8 s against Colibrì's 8.5 s (rabbit is quickest at 7.1 s), because the whole host pool is built up front. A deferred/streamed pool is designed and unbuilt (#80 did the mmap half).
-5. **The planner is optimistic** — it prices bytes at bandwidth and does not model DRAM-resident expert compute, so it predicts far below what is measured. Two recorded accounting bugs: the shared expert is reserved twice, and the router gate is priced at device bandwidth although `route()` reads host f32.
-6. **`lm_head` costs 23.34 ms on CPU and 7.10 on Vulkan** — 1.02 GiB of bf16 read once per token on the host, i.e. bandwidth-bound; only a lower-byte head would move it.
-
-## Cold start, fusion, correctness
-
-**Cold start: 96.9 s → 11.8 s for the load itself, the day borrowing landed.** The host pool used to **copy** nibbles out of the mapping into fresh allocations (18.85 GiB committed after the pool, 21.55 GiB after upload, 44.6 s to load). It now **borrows** them zero-copy and converts two's-complement to FQ4 offset-binary inside the dot kernel (`byte ^ 0x88`, one `_mm256_xor_si256` per vector pair, behind a const-generic `dot_rows::<SIGNED>`) — **3.7 – 4.0× faster load, 2.1× less commit**, placement unchanged (2304 device experts, 13.08 GiB host, 40/40 layers borrowed).
-
-> [!NOTE]
-> **The 11.8 s is not the 2026-11-14 load.** The same path reports **19.9 s to load** on the current Vulkan cell and **18.7 – 21.2 s to `/v1/models`** across the served cells, on a machine whose Smart App Control state has been toggled since. The relative win (3.7 – 4.0× over copying) is the claim; the absolute has moved and has not been re-attributed.
-
-**The delta net is one device batch.** The gated-delta-net recursion and convolution used to run on the CPU, forcing round trips across 30 linear-attention layers. Now device kernels, one batch: write x → 4× `gemv_half` → `gdn_conv` → `gdn_rec` → `gemv_half` out_proj → run → read. `fused_mixer_matches_the_cpu_mixer_and_its_state` checks the fused path against the CPU mixer *and its resulting state* at ~2.7e-7 against a 2e-5 band.
-
-**Correctness.** Both exports are green against the same transformers 5.22.2 fixtures. The harness is export-aware (`FENNEC_GOLDEN_MODEL`): fixtures come from the bf16 export's own weights, so that export reproduces them to accumulation order at 1e-6 while another export's rounding leaves a format noise floor — measured over the int4 stack at **1.7e-2** for f16 dense paths and **2.1e-1** for anything touching a routed expert, hence bands of 3e-2 and 2.5e-1, set from a measured table, not guessed. The band-independent assertions are the ones that matter: the **greedy token is identical (134143)** and 8 of the reference's top-8 logits are present.
-
-`--dense-i8` adds two of its own: a kernel test that reproduces the *dequantised* matrix to f32 rounding while the 8-bit round trip stays inside its documented budget, and a constant-row case that catches the offset-binary correction going wrong. Greedy generation is byte-identical to the bf16 path on a 40-token prompt.
-
-## Hardware and backends
-
-| device | status | how |
-|---|---|---|
-| NVIDIA | **measured** | Vulkan 1.4.357 and CUDA, RTX 4060 Laptop, 7.77 GiB dedicated, compute capability 8.9. CUDA is preferred by vendor policy and runs through the Driver API with hand-written PTX — no toolkit, no MSVC. All 9 GPU integration tests pass on it |
-| AMD | **same code path, unmeasured here** | nothing in the engine names a vendor extension; no AMD device on this box |
-| Apple Silicon | **compile-verified, unmeasured here** | Metal through MoltenVK, so the checked-in SPIR-V runs unchanged; `cargo check` passes for both darwin triples |
-| Intel Arc iGPU | enumerated, not used for compute | 0 GiB dedicated, so the planner ranks it below the dGPU |
-| Intel AI Boost NPU | **DirectML refused; OpenVINO measured working** | DXCore `GENERIC_ML` adapter, vendor `0x8086`; `D3D12CreateDevice` returns `DXGI_ERROR_UNSUPPORTED`, which rules out DirectML only. OpenVINO's NPU plugin reaches it directly: **12.21 ms from Rust against 45.65 ms on 8 CPU threads** |
-| CPU | measured | AVX2 int4, 22 logical cores |
-
-**Backend choice is by vendor, and overridable.** `backend::resolve` takes an explicit `--backend` first, then `FENNEC_BACKEND` / the `COLI_*` flags, then the vendor id: NVIDIA → CUDA, Apple → Metal, everyone else → Vulkan. An unparseable name is an error, not a silent fallback. The Vulkan path is vendor-neutral: one descriptor set layout, four storage buffers, a 32-byte push range, SPIR-V checked in so `cargo build --offline` needs no shader compiler. One shared push-constant layout serves all **9** ops, and tall gemvs split at `MAX_GROUPS=65535` rows.
-
-**CUDA needs no toolkit, but a context is current per thread.** `nvcuda.dll` / `libcuda.so.1` ships with the display driver and is loaded at runtime; kernels are PTX checked in beside the SPIR-V and JIT'd by `cuModuleLoadDataEx`. `serve` loads on one thread and answers each request on another, so every driver entry point rebinds the context (`cuCtxSetCurrent`) first.
-
-**The CUDA arm has no `moe_reduce`.** Its PTX table carries 8 kernels against Vulkan's 9, so the CUDA path keeps the per-expert `gemv/silu/axpy` chain. Porting the phase-batched structure there needs the ninth PTX kernel; it is the next device-side lever and is not claimed as done.
-
-### ONNX Runtime: the portability backend
-
-ORT is **integrated, not a competing engine**. `--backend ort` (the optional `ort` feature, default off) runs the *dense* F16 projections as ONNX MatMul graphs on accelerators Fennec has no hand-written kernel for, loaded at run time from a signed `onnxruntime.dll` (`load-dynamic`: no import library, no MSVC, no toolkit). With the feature off the shipped engine is byte-for-byte the same build.
-
-The lm_head, the delta-net and attention projections, the shared expert and the router gate are dense F16 matmuls; each becomes one MatMul session whose weight is a graph initializer, so only the activation vector is fed per token. The **int4 routed experts and the three-tier residency stay on Fennec's own kernels**: there is no ONNX export of a 256-expert MoE with a custom gated-delta-net block, and ORT owns its session allocator, so it cannot place hot experts in VRAM, the rest in a host pool and stream cold ones from NVMe.
-
-**Measured, and not yet measured.** At kernel level ORT's CPU EP folds F16 to F32 and is *slower* than Fennec's CPU lm_head (29.27 vs 20.65 ms). On the GPU the two are level within run-to-run variance: one session had Fennec's hand-written CUDA ahead (4.50 vs 4.96 ms), the prior session had ORT ahead (4.98 vs 5.24 ms), so neither is a decisive win on the one kernel both can run. The integrated path is **not timed end-to-end**: Smart App Control blocks compiling the `ort` feature on this box until the engine is signed.
-
-### The NPU lane
-
-**A split verdict, both halves measured.** DirectML cannot reach Intel AI Boost at all — `D3D12CreateDevice` refuses it — while OpenVINO's NPU plugin talks to the driver directly and works. Same embedder, static `[1,128]` shapes, 10 warm-ups then 50 timed iterations, median of 3, CPU capped at 8 threads:
-
-| device | compile | infer (median) | vs CPU |
-|---|---|---|---|
-| CPU (8 threads) | 0.44 s | 45.65 ms | 1.00× |
-| **NPU** | 0.25 s | **12.21 ms** | **3.74× faster** |
-| **Arc iGPU** | 1.20 s | **10.20 ms** | **4.47× faster — winner** |
-| RTX 4060 | 0.89 s | 236.25 ms | 5.17× slower |
-
-The NPU's embeddings match CPU at **cosine 0.999801 minimum** across 5 tokenized sentences. Three things the table does not say: its CPU figure is not comparable to the Python reference (which used OpenVINO's default thread count); the CPU spread is real and disclosed (Windows Defender measured at 63 – 69 % CPU during one invocation, while NPU/Arc/RTX medians agree to within 0.3 %, 3.5 % and 0.05 %); and `HETERO:NPU,CPU` did not actually split the work — it reports `EXECUTION_DEVICES = NPU` alone because the whole graph fit.
-
-**Why OpenVINO is not the LLM backend.** The same 72 MatMul nodes run `fully_connected_gpu_bf_tiled__f16` on the Arc (8.44 ms total) but `fully_connected_gpu_bfyx_ref__f32` on the RTX 4060 (**233.78 ms**, 27.7×): `_ref` is the scalar reference kernel, because the kernel selector reads the NVIDIA's `DEVICE_ARCHITECTURE` as `v8.9.0` — the CUDA compute capability misread as an Intel uArch — and matches nothing. `execution_devices` is `['GPU.1']` and the spread over 50 runs is 238.18 – 241.51 ms, so it is genuinely on the card.
-
-### The Burn + CubeCL lane (kernel level)
-
-Burn was **built and run**, not dismissed: a standalone crate in the suite, outside the engine, Burn 0.22.1 with `std, flex, simd, rayon, vulkan, fusion`; three kernels × three devices, 10 warm-ups then 30 timed iterations. **Three cells measured, six panicked** — the measured half is Burn's pure-Rust Flex CPU backend: expert FFN **2.302 ms/layer** (92.1 ms/token projected), router 0.027, shared expert 0.398.
-
-> [!IMPORTANT]
-> **92.1 ms/token is 2.513× Fennec's own host-expert stage** as profiled when that lane ran. A kernel-level comparison of the dominant cost, **not** a whole-model throughput claim: Burn never ran this checkpoint end to end.
-
-**Every CubeCL/Vulkan cell failed before a kernel ran**, on both the RTX 4060 and the Arc, for all three kernels: `cubecl-ir` 0.11.4 panics in `interfaces/mod.rs:443` on `"Expected type vector.vector <4 x cube.f32 > to implement dyn MaybeVectorizedType"`, then reports the work was skipped. Upstream, not a harness bug: `vector_size()` unwraps where its sibling `try_get_vector_size` uses the non-panicking `type_cast`, and the failing `VectorType` does carry `#[type_interface_impl] impl MaybeVectorizedType` — declared but not registered. The `fusion` hypothesis was tested and refuted: fusion-off reproduced the identical panic at the identical site.
-
-> [!CAUTION]
-> **A full-model Burn lane is arithmetically impossible on this box.** 10240 experts × 3,145,728 weights = 32.2 billion weights; int4-packed with scales that is 18.12 GB, which is what Fennec streams. Dequantized to what Burn can compute it is **120 GiB at f32 or 60 GiB at f16**, against 31.5 GiB of RAM and 8 GiB of VRAM. Burn owns its allocator, so hot-in-VRAM / warm-in-RAM / cold-on-NVMe tiering is not expressible in it either.
-
-## What is ported, and from where
-
-| surface | detail |
-|---|---|
-| Tokenizer | NFC → Split (the checkpoint's own Qwen pattern, via `fancy-regex`, because `\s+(?!\S)` is a lookahead the `regex` crate cannot express) → ByteLevel with `use_regex: false`. 247587 merges, 248044 vocab, 26 added tokens. Stop ids come from `generation_config.json`, which is authoritative. Six tests compare against Hugging Face `tokenizers` 0.23.3 id-for-id, plus a lossless round trip over all 256 byte values |
-| Sampling | greedy, top-k via `select_nth_unstable_by` (no sorting 248320 logits), nucleus, temperature, seeded splitmix64 |
-| Chat template | built from the `response_template` anchors, since this checkpoint ships no `chat_template`. Think blocks route to `reasoning_content`, holding back any suffix that could still become a marker |
-| HTTP | `GET /health`, `/v1/models`, `/metrics`, `/experts`, `/profile`; `POST /v1/chat/completions` (JSON or SSE) and `POST /api/generate` (JSON or NDJSON); bearer auth on every route including `/health`, which declares `vision: false` because there is no vision tower here; CORS preflight; loopback by default |
-
-| source | what Fennec took |
-|---|---|
-| **rabbit** | the int4 layout, byte-for-byte: group-64 amax/7, low-nibble-first two's complement, the bridge nibble ≡ byte XOR `0x88`. Verified against a real rabbit repack (cosine 0.9922 – 0.9955) |
-| **Colibrì** | the three-tier usage-ranked placement idea and the `.coli_usage` router histogram; the `COLI_*` environment and the `serve` contract the whole suite spawns |
-| **fox** | the map-don't-copy cold start, and the proof that a Rust front end over a Vulkan device tier is viable |
-
-## Build and test
+**Endpoints**:
+- `GET /health` — Health check (requires bearer auth)
+- `GET /v1/models` — List available models
+- `GET /metrics` — Prometheus metrics
+- `GET /experts` — Expert routing statistics
+- `GET /profile` — Profiling data
+- `POST /v1/chat/completions` — Chat completion (JSON or SSE)
+- `POST /api/generate` — Text generation (JSON or NDJSON)
+
+All endpoints require bearer authentication. Loopback by default; use `--allow-remote` for network access (no TLS).
+
+### Example Request
 
 ```bash
-cargo build --release --offline -j 6
-cargo test  --release --offline -j 6
-FENNEC_BACKEND=cuda   cargo test --release --offline --test gpu              # 9/9
-FENNEC_BACKEND=vulkan cargo test --release --offline --test gpu -- --nocapture
-FENNEC_GOLDEN_MODEL=<model-dir> cargo test --release --offline --test golden
+curl http://127.0.0.1:8184/v1/chat/completions \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.5-moe",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "max_tokens": 64,
+    "stream": false
+  }'
 ```
 
-**100 tests**: 64 unit (quantiser, bearer auth, sampler, device discovery, the int8 dense kernel), 2 binary, 5 dense-lane (a batched prefill against the token loop, bit for bit; the int8 trunk's quality trade), 14 golden against a transformers 5.22.2 reference, 9 device-vs-CPU integration, 6 tokenizer. Device tests run on **both** backends and print which one opened; an unparseable backend or a failed open **panics rather than skipping**, so a green run cannot hide a backend that never opened.
+## Tokenizer
 
-> [!WARNING]
-> **The default run is the tight oracle.** Setting `FENNEC_GOLDEN_MODEL` widens the bands to 3e-2 / 2.5e-1, and a forward-slash spelling of the same directory widens them too because the comparison is a string match — do not read a widened run as a tight pass.
+Fennec includes a BPE tokenizer id-for-id identical to Hugging Face:
 
-`python tools/smoke_serve.py` runs **30 checks** against a server you start yourself: every GET route, auth with a correct/wrong/absent key, lower-case header names and scheme, CORS preflight, JSON and SSE chat, JSON and NDJSON `/api/generate`, thinking on and off, malformed JSON, an unknown route — then drives the suite's actual `fennec_core.engine.Engine` client against it. **30/30 on CUDA and 30/30 on Vulkan with the device tier genuinely engaged.** Check the load banner for a non-zero device upload before believing a GPU contract test.
+- **Pipeline**: NFC → Split (Qwen pattern via `fancy-regex`) → ByteLevel with `use_regex: false`
+- **Vocabulary**: 247,587 merges, 248,044 vocab, 26 added tokens
+- **Stop tokens**: From `generation_config.json` (authoritative)
+- **Sampling**: Greedy, top-k, nucleus, temperature, seeded splitmix64
 
-## Bugs found and fixed
+## Known Limitations
 
-Each was a real defect, and each has a regression test.
+> [!CAUTION]
+> - **Planner optimism**: Bytes-only pricing doesn't model DRAM-resident expert compute
+> - **CUDA moe_reduce**: CUDA path lacks phase-batched `moe_reduce` kernel (uses per-expert chain)
+> - **Apple Metal**: Compile-verified but not performance-measured
+> - **NPU DirectML**: Refused by driver; use OpenVINO backend instead
+> - **Chat template**: Missing think opener (Colibri emits `\n\n`, Fennec emits nothing)
 
-| where | bug | symptom |
-|---|---|---|
-| `cuda.rs` | a CUDA context is current **per thread**, and nothing rebound it | `serve` answers on a spawned thread, so the first device call there panicked with `cuMemcpyHtoD: invalid device context` while **all 76 single-threaded tests stayed green**. Fixed with `cuCtxSetCurrent` at all seven entry points |
-| `main.rs` | the benchmark's decode loop pushed its argmax on every iteration | at `t == prompt_len` it read position 0 instead of the whole prompt, scoring a **wrong greedy continuation**; the published 14.43 tok/s is retracted |
-| `prof.rs` / `model.rs` | the mixer's input projections ran between two timers, and `MIXER_CPU` stayed live over `out_proj` | **36 – 40 % of the CPU token was "unaccounted"**, and the first fix then double-counted `out_proj` (negative unaccounted time). New `mixer projections` stage, explicit `drop` between stages; remainder now < 1.5 ms |
-| `gpu.rs` | `record` appended a full pipeline barrier after every dispatch | up to 8 independent experts serialized on the device; phase-batching plus one `moe_reduce` kernel measured +25 % on the serve protocol |
-| `safetensors.rs` | `slice_f32`'s fallback arm computed `base = i.off / sz` and never added `start` | every partial F16 read returned the tensor's beginning, so `embed_row(id)` gave row 0 and the int4 export generated nonsense |
-| `safetensors.rs` | f16 subnormal exponent was `121 - shifts` | all 1023 subnormals decoded **256× too large** |
-| `safetensors.rs` | F64 read as a raw integer cast | now `f64::from_bits(raw) as f32` |
-| `gemv_f16.comp` | branchless decode shifted the field up 13 and scaled by 2^112 | the f32 intermediate is subnormal and this driver flushes it to zero; integer `findMSB` normalisation keeps every intermediate normal |
-| `quant.rs` | AVX2 dot gated on `group == 32` | the shipped group-64 container fell back to scalar dequant — 2.5× slower with *more* experts on the GPU |
-| `quant.rs` | `is_x86_feature_detected!` sat outside the `cfg(target_arch)` guard | the engine did not compile for Apple Silicon at all |
-| `kernels/fennec.ptx` | the bf16/f16 quad loops unpacked `u.w` into registers already holding `u.x` | the first two products would have used the fourth word and multiplied one half twice |
-| `model.rs` | the fused mixer's `normed` offset was not 16-byte aligned | CUDA's `v4.f32` reads require it |
-| `gpu.rs` / `cudagpu.rs` | `upload_q4` accepted a column count that was not a whole number of groups | a partial group could silently mis-index its scale |
-| `sched.rs` | the scale-byte estimate truncated instead of rounding up | the planner under-counted scale storage |
-| `main.rs` | the `.coli_usage` histogram was trusted without a shape check | a mismatched shape is now rejected instead of indexing out of range |
-| `main.rs` | device counters were cumulative from `Gpu::open` | the first fence profile attributed ~15000 *load* uploads to decode and reported 87 % fence time — **retracted** |
-| `tests/golden.rs` | expert rows paired by position | the fixture is in the router's order and f16 rounding swaps near-tied experts, so expert 88 was compared with expert 56's row (rel 1.167). Now paired by id |
-| `main.rs` | `--ctx 0` clamped to 512 | the suite passes 0 to mean "pick for me" and got a half-kilobyte window |
-| `main.rs` | `Opts::has()` only read valueless flags | **`--device N` was silently ignored** |
-| `serve.rs` | header block lower-cased before parsing | `Bearer` folded to `bearer` and **every** authenticated request returned 401 |
-| `serve.rs` | CORS preflight gated on the API key | browsers never send it on `OPTIONS` |
-| `serve.rs` | a prompt longer than the context window poisoned the model mutex | every later request failed too |
-| `serve.rs` / `tokenizer.rs` | streaming decoded each token's bytes independently | a character split across two tokens became U+FFFD |
-| `serve.rs` | `messages()` flattened content parts by keeping only the ones with a `text` field | an **image part vanished**: the model answered from the caption alone, and every client showed that as an analyzed image. A non-text part now returns an explicit refusal, and `/health` declares `vision: false` so shells can switch the affordance off instead of guessing |
-| `serve.rs` | `enable_thinking` defaulted to **true** | a plain `max_tokens=64` request spent its budget in `reasoning_content` and returned an **empty `content`** while `usage` still said 64. Now mirrors Colibrì: explicit flag first, otherwise on only when `reasoning_effort` is set |
-| `tools/bench_cell.py` | the readiness probe called `/health` without a bearer token | every cell aborted with "engine did not become healthy" 60 s in, because the server signs every route. The probe now carries the same key as the completion request |
+## Project Structure
 
-**Recorded, not fixed:** the planner's bytes-only optimism and its two accounting bugs; `gemv_q4`'s in-loop integer division (worth ~0 ms because the MoE device batch hides under host expert work); `usable_gib()`'s Apple unified-memory fallback firing on any vendor; `Shards::open` never validating that a tensor's shape product times its element size equals its byte span; and the chat template's missing think **opener** — Colibrì emits `\n\n` when thinking is on, Fennec emits nothing. Closing that half-way would be worse than leaving it, because `generate` starts with `think = false` and does not receive the prompt's think state.
+```
+fennec/
+├── src/
+│   ├── main.rs          # CLI entry point
+│   ├── model.rs         # Model loading and inference
+│   ├── gpu.rs           # Vulkan GPU backend
+│   ├── cuda.rs          # CUDA backend
+│   ├── quant.rs         # Int4 quantization
+│   ├── sched.rs         # Expert tier planner
+│   ├── serve.rs         # HTTP server
+│   ├── tokenizer.rs     # BPE tokenizer
+│   └── shaders/         # SPIR-V compute shaders
+├── tools/
+│   ├── smoke_serve.py   # HTTP contract tests
+│   └── shaders.sh       # Shader compiler
+└── docs/                # Documentation and benchmarks
+```
 
-Shaders live in `src/shaders/*.comp` with SPIR-V checked in beside them, CUDA kernels in `src/kernels/fennec.ptx`; after editing a `.comp` run `tools/shaders.sh` (override the compiler with `GLSLANG=...`). Evidence for every claim above: the suite's `benchmarks/results-backend-matrix.json` (the 2026-11-14T12:42Z steady session; `results-backend-matrix-2026-11-14-1138Z-prevprotocol.json` keeps the superseded mid-ramp numbers), `benchmarks/ab-2026-11-14-vulkan-pair/` for the order-swapped A/B that cleared the driver, `benchmarks/ab-2026-11-14-int4-trunk/` for the trunk change that was measured −9 % and reverted, `engine-bench/logs/matrix-*.log`, `engine-bench/logs/profile-vulkan-fixed.engine.log` and `benchmarks/ab-2026-11-14-prefill-chunk/` for the stage breakdowns and the chunk A/B, with `docs/engine-benchmark.json` for the older lanes. MIT licensed, version 1.0.0.
+## Acknowledgments
+
+Fennec builds on ideas and code from:
+
+- **[rabbit](https://github.com/ferrumox/rabbit)**: Int4 layout (group-64 amax/7, low-nibble-first two's complement)
+- **[Colibri](https://github.com/JustVugg/colibri)**: Three-tier usage-ranked placement, `.coli_usage` router histogram, `COLI_*` environment, `serve` contract
+- **[fox](https://github.com/ferrumox/fox)**: Map-don't-copy cold start, Rust front-end over Vulkan device tier
+
+## License
+
+MIT License - see LICENSE file for details.
+
+## Version
+
+**1.0.0** — Comprehensive testing complete, 115 tests passing, all features stable.

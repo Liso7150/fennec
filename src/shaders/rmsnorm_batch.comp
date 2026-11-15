@@ -1,0 +1,42 @@
+#version 450
+// Batched RMSNorm: one workgroup per token. Each workgroup normalises
+// n floats starting at x_off + token * n. Same zero-centred (1 + w) convention
+// as the single-token rmsnorm.
+layout(local_size_x = 256) in;
+layout(push_constant) uniform P {
+    uint n;         // hidden size (per token)
+    uint n_tokens;
+    uint x_off;     // base offset of X
+    uint w_off;     // weight offset (shared across tokens)
+    uint y_off;     // base offset of Y
+    float eps;
+} p;
+layout(set = 0, binding = 0) readonly buffer X { float x[]; };
+layout(set = 0, binding = 1) readonly buffer W { float w[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+
+shared float red[256];
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    if (t >= p.n_tokens) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint base = p.x_off + t * p.n;
+    uint ybase = p.y_off + t * p.n;
+
+    float acc = 0.0;
+    for (uint i = tid; i < p.n; i += 256u) {
+        float v = x[base + i];
+        acc += v * v;
+    }
+    red[tid] = acc;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    float inv = inversesqrt(red[0] / float(p.n) + p.eps);
+    for (uint i = tid; i < p.n; i += 256u) {
+        y[ybase + i] = x[base + i] * inv * (1.0 + w[p.w_off + i]);
+    }
+}

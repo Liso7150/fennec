@@ -652,6 +652,31 @@ impl MoeLayer {
         Routing { ids, weights }
     }
 
+    /// Batch routing: route all n tokens at once, returning n Routing structs.
+    /// More efficient than calling route() n times because it batches the gate.gemv.
+    pub fn route_batch(&self, xs: &[f32], n: usize) -> Vec<Routing> {
+        let h = self.cfg.hidden_size;
+        let e = self.cfg.num_experts;
+        let k = self.cfg.num_experts_per_tok;
+        let t = self.threads;
+        let mut routings = Vec::with_capacity(n);
+        
+        // Batch the gate projection: n tokens × H → n tokens × E
+        let mut all_logits = vec![0f32; n * e];
+        self.gate.gemv_batch(e, h, xs, &mut all_logits, t);
+        
+        // Softmax top-k for each token
+        for i in 0..n {
+            let logits = &all_logits[i * e..(i + 1) * e];
+            let mut weights = vec![0f32; k];
+            let mut ids = vec![0usize; k];
+            kernel::softmax_topk(logits, k, &mut weights, &mut ids);
+            routings.push(Routing { ids, weights });
+        }
+        
+        routings
+    }
+
     /// y = expert_e(x) into `y` (len H). Gate/up are the two halves of the row
     /// block that holds e; `expert` is the id->slot lookup on top of it.
     pub fn expert(&self, e: usize, x: &[f32], hh: &mut [f32], y: &mut [f32]) {
@@ -938,6 +963,7 @@ impl MoeLayer {
                 weights.push(shared_gate);
             }
             let mut g = d.gpu.lock().unwrap();
+            let read_syncs = g.read_syncs();
             g.write(0, x);
             g.write(w_off, &weights);
             drop(_submit);
@@ -1008,7 +1034,11 @@ impl MoeLayer {
             self.cpu_picks(x, &r, &host_picks, &cold, &mut parts);
             self.overlap_ns.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
             drop(_cpu);
-            {
+            // CUDA's read_into is a blocking DtoH that synchronises the context,
+            // so an explicit wait here pays a second WDDM flush per layer for
+            // nothing (the same trade step_fused makes). Vulkan's mapped read
+            // still needs the fence wait first.
+            if !read_syncs {
                 let _sync = prof::start(prof::MOE_SYNC);
                 g.wait().unwrap();
             }
@@ -1186,6 +1216,154 @@ impl MoeLayer {
             kernel::axpy(o, &shared_out[r * h..(r + 1) * h], gate);
         }
         true
+    }
+
+    /// Device-batched grouped expert union: processes all n tokens through the MoE
+    /// layer. Uses grouped expert processing for HOST experts (like Colibri's batch-union moe()).
+    /// 
+    /// If any device experts are present, falls back to per-token forward() to ensure
+    /// correct GPU processing. Otherwise, batches all experts on CPU with grouping.
+    /// 
+    /// Returns the output buffer (n × h floats) ready to write back to GPU.
+    pub fn prefill_device_grouped(&self, xs: &[f32], n: usize) -> Vec<f32> {
+        let (h, i) = (self.cfg.hidden_size, self.cfg.moe_intermediate_size);
+        let (e, k) = (self.cfg.num_experts, self.cfg.num_experts_per_tok);
+        
+        // Check if any token picks a device expert - if so, fall back to per-token forward
+        let routings = self.route_batch(xs, n);
+        let has_device_experts = routings.iter().any(|r| {
+            r.ids.iter().any(|&id| self.dev.as_ref().is_some_and(|d| d.slot[id] >= 0))
+        });
+        
+        if has_device_experts {
+            // Fall back to per-token forward for correctness with device experts
+            let mut out = vec![0f32; n * h];
+            for token_idx in 0..n {
+                let x = &xs[token_idx * h..(token_idx + 1) * h];
+                let (moe_out, _) = self.forward(x);
+                out[token_idx * h..(token_idx + 1) * h].copy_from_slice(&moe_out);
+            }
+            return out;
+        }
+        
+        // No device experts - use batched grouped processing for host experts
+        let mut at = vec![usize::MAX; e];
+        let mut union: Vec<(usize, Vec<(usize, usize, f32)>)> = Vec::new();
+        let mut cold: Vec<(usize, usize, usize, f32)> = Vec::new();
+        
+        for token_idx in 0..n {
+            let routing = &routings[token_idx];
+            for pick_idx in 0..k {
+                let id = routing.ids[pick_idx];
+                let w = routing.weights[pick_idx];
+                
+                if self.slot[id] >= 0 {
+                    // Host resident expert
+                    let u = at[id];
+                    let union_idx = if u == usize::MAX {
+                        at[id] = union.len();
+                        union.push((id, Vec::new()));
+                        union.len() - 1
+                    } else {
+                        u
+                    };
+                    union[union_idx].1.push((token_idx, pick_idx, w));
+                } else {
+                    // Cold (disk) expert
+                    cold.push((token_idx, pick_idx, id, w));
+                }
+            }
+        }
+        
+        let mut parts = vec![0f32; n * k * h];
+        
+        // Process cold experts (disk-streamed)
+        if !cold.is_empty() {
+            let mut pool = self.stream.as_ref().unwrap().lock().unwrap();
+            let mut hh = vec![0f32; i];
+            let mut y = vec![0f32; h];
+            for &(token_idx, pick_idx, id, w) in &cold {
+                let x = &xs[token_idx * h..(token_idx + 1) * h];
+                pool.with(id, |gu, dn| expert_in(gu, dn, i, h, 0, x, &mut hh, &mut y))
+                    .unwrap_or_else(|er| panic!("streamed expert {id}: {er}"));
+                let out = &mut parts[(token_idx * k + pick_idx) * h..(token_idx * k + pick_idx + 1) * h];
+                kernel::axpy(out, &y, w);
+            }
+        }
+        
+        // Process host expert groups
+        if !union.is_empty() {
+            let (gu0, _, _) = self.expert_pair(union[0].0);
+            let int = gu0.wants_int();
+            let px: Vec<DotPrep> = (0..n).map(|r| {
+                let mut prep = DotPrep::with_int(h, int);
+                prep.fill(&xs[r * h..(r + 1) * h]);
+                prep
+            }).collect();
+            
+            let mut hh = vec![0f32; n * k * i];
+            for (_u_idx, (expert_id, picks)) in union.iter().enumerate() {
+                let (gu, _, s) = self.expert_pair(*expert_id);
+                let base = s * 2 * i;
+                for &(token_idx, pick_idx, _) in picks {
+                    let p = &px[token_idx];
+                    let hh_off = (token_idx * k + pick_idx) * i;
+                    for j in 0..i {
+                        let g = gu.dot_prepped(base + j, p);
+                        let u = gu.dot_prepped(base + i + j, p);
+                        hh[hh_off + j] = kernel::silu(g) * u;
+                    }
+                }
+            }
+            
+            let ph: Vec<DotPrep> = (0..n * k).map(|q| {
+                let mut prep = DotPrep::with_int(i, int);
+                prep.fill(&hh[q * i..(q + 1) * i]);
+                prep
+            }).collect();
+            
+            for (_u_idx, (expert_id, picks)) in union.iter().enumerate() {
+                let (_, dn, s) = self.expert_pair(*expert_id);
+                let row_base = s * h;
+                for &(token_idx, pick_idx, w) in picks {
+                    let q = token_idx * k + pick_idx;
+                    let p = &ph[q];
+                    let out = &mut parts[q * h..(q + 1) * h];
+                    for j in 0..h {
+                        let v = dn.dot_prepped(row_base + j, p);
+                        out[j] = w * v;
+                    }
+                }
+            }
+        }
+        
+        // Add shared expert contribution (batched)
+        let si = self.cfg.shared_expert_intermediate_size;
+        let mut shared_out = vec![0f32; n * h];
+        {
+            let mut g = vec![0f32; n * si];
+            let mut u = vec![0f32; n * si];
+            self.s_gate.gemv_batch(si, h, xs, &mut g, self.threads);
+            self.s_up.gemv_batch(si, h, xs, &mut u, self.threads);
+            for q in 0..n * si {
+                u[q] = kernel::silu(g[q]) * u[q];
+            }
+            self.s_down.gemv_batch(h, si, &u, &mut shared_out, self.threads);
+        }
+        
+        // Sum all contributions per token
+        let mut out = vec![0f32; n * h];
+        for r in 0..n {
+            let gate = kernel::sigmoid(kernel::dot(&self.s_egate, &xs[r * h..(r + 1) * h]));
+            let o = &mut out[r * h..(r + 1) * h];
+            o.fill(0.0);
+            for q in r * k..(r + 1) * k {
+                kernel::axpy(o, &parts[q * h..(q + 1) * h], 1.0);
+            }
+            kernel::axpy(o, &shared_out[r * h..(r + 1) * h], gate);
+        }
+        
+        out
     }
 }
 
@@ -1839,6 +2017,89 @@ impl GdnLayer {
         self.out_proj.gemv_batch(h, vd, &normed, out, t);
     }
 
+    /// Device-batched prefill: batch the 5 dense projections on GPU, loop the
+    /// stateful conv+rec per token. This is the device tier's answer to
+    /// [`GdnLayer::prefill`], which batches on CPU. The projections read their
+    /// weights once for all n tokens from VRAM, amortizing the VRAM bandwidth.
+    ///
+    /// Buffer layout in scratch (offsets in floats):
+    /// - xs_off..xs_off+n*h: input tokens
+    /// - ib_off..ib_off+n*(cd+vd+2*nv): intermediate projections (qkv|z|b|a)
+    /// - normed_off..normed_off+n*vd: post-conv/rec normed output
+    /// - out_off..out_off+n*h: final output
+    pub fn prefill_device(&self, gpu: &mut Gpu, xs_off: usize, st: &mut GdnState, out_off: usize, n: usize) -> Result<()> {
+        let Some(d) = &self.dev else {
+            // No device tier, fall back to CPU prefill
+            let mut xs = vec![0f32; n * self.cfg.hidden_size];
+            gpu.read_into(xs_off, &mut xs);
+            let mut out = vec![0f32; n * self.cfg.hidden_size];
+            self.prefill(&xs, st, &mut out);
+            gpu.write(out_off, &out);
+            return Ok(());
+        };
+
+        let cfg = &self.cfg;
+        let (h, cd, vd, nv) = (cfg.hidden_size, cfg.conv_dim(), cfg.value_dim(), cfg.linear_num_value_heads);
+        let ib_off = xs_off + n * h;
+        let normed_off = ib_off + n * (cd + vd + 2 * nv);
+        let scratch_needed = normed_off + n * vd - xs_off + n * h;
+        gpu.reserve(scratch_needed)?;
+
+        // Ensure state is mirrored to device
+        if let Some(m) = &d.mixer {
+            if !st.mirrored {
+                let mut g = d.gpu.lock().unwrap();
+                g.write_buf(m.conv_state, 0, &f32_bytes(&st.conv))?;
+                g.write_buf(m.rec_state, 0, &f32_bytes(&st.rec))?;
+                st.mirrored = true;
+            }
+        }
+
+        // Batch the 4 input projections: xs -> [qkv|z|b|a]
+        {
+            let _p = prof::start(prof::MIXER_PROJ);
+            let mut g = d.gpu.lock().unwrap();
+            let mut bt = g.batch()?;
+            bt.gemv_half_batch(d.qkv, cd, h, n, xs_off, ib_off)?;
+            bt.gemv_half_batch(d.z, vd, h, n, xs_off, ib_off + n * cd)?;
+            bt.gemv_half_batch(d.b, nv, h, n, xs_off, ib_off + n * (cd + vd))?;
+            bt.gemv_half_batch(d.a, nv, h, n, xs_off, ib_off + n * (cd + vd + nv))?;
+            bt.barrier()?;
+            bt.run()?;
+        }
+
+        // Read back intermediate projections for per-token conv+rec
+        let mut ibuf = vec![0f32; n * (cd + vd + 2 * nv)];
+        {
+            let g = d.gpu.lock().unwrap();
+            g.read_into(ib_off, &mut ibuf);
+        }
+
+        // Per-token conv + rec (stateful, cannot batch)
+        let mut normed = vec![0f32; n * vd];
+        {
+            let _cpu = prof::start(prof::MIXER_CPU);
+            for i in 0..n {
+                let qkv = &ibuf[i * (cd + vd + 2 * nv)..i * (cd + vd + 2 * nv) + cd];
+                let z = &ibuf[i * (cd + vd + 2 * nv) + cd..i * (cd + vd + 2 * nv) + cd + vd];
+                let b = &ibuf[i * (cd + vd + 2 * nv) + cd + vd..i * (cd + vd + 2 * nv) + cd + vd + nv];
+                let a = &ibuf[i * (cd + vd + 2 * nv) + cd + vd + nv..i * (cd + vd + 2 * nv) + cd + vd + 2 * nv];
+                self.mix(qkv, z, b, a, st, &mut normed[i * vd..(i + 1) * vd]);
+            }
+        }
+
+        // Upload normed for batched out_proj
+        {
+            let mut g = d.gpu.lock().unwrap();
+            g.write(normed_off, &normed);
+            let mut bt = g.batch()?;
+            bt.gemv_half_batch(d.out, h, vd, n, normed_off, out_off)?;
+            bt.run()?;
+        }
+
+        Ok(())
+    }
+
     /// One token's recursion: the depthwise conv and its rolling window, the
     /// delta update over the heads, and the gated norm whose read-out the
     /// caller's `out_proj` consumes. Everything that sits between the input
@@ -2190,6 +2451,82 @@ impl AttnLayer {
         self.o.gemv_batch(h, nh * hd, &attn, out, t);
     }
 
+    /// Device-batched prefill: batch q/k/v/o projections on GPU, loop attention
+    /// mix per token (KV cache dependencies). Similar pattern to GdnLayer::prefill_device.
+    pub fn prefill_device(&self, gpu: &mut Gpu, xs_off: usize, pos0: usize, st: &mut AttnState, out_off: usize, n: usize) -> Result<()> {
+        let Some(d) = &self.dev else {
+            // No device tier, fall back to CPU prefill
+            let mut xs = vec![0f32; n * self.cfg.hidden_size];
+            gpu.read_into(xs_off, &mut xs);
+            let mut out = vec![0f32; n * self.cfg.hidden_size];
+            self.prefill(&xs, pos0, st, &mut out);
+            gpu.write(out_off, &out);
+            return Ok(());
+        };
+
+        let cfg = &self.cfg;
+        let (h, nh, nkv, hd) = (cfg.hidden_size, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim);
+        let q_out = if cfg.attn_output_gate { nh * hd * 2 } else { nh * hd };
+        
+        // Buffer layout: xs | q | k | v | attn | out
+        let q_off = xs_off + n * h;
+        let k_off = q_off + n * q_out;
+        let v_off = k_off + n * nkv * hd;
+        let attn_off = v_off + n * nkv * hd;
+        let scratch_needed = out_off + n * h - xs_off;
+        gpu.reserve(scratch_needed)?;
+
+        // Batch q/k/v projections (use half batch for now, q4 batch can be added later)
+        {
+            let _p = prof::start(prof::MIXER_PROJ);
+            let mut g = d.gpu.lock().unwrap();
+            let mut bt = g.batch()?;
+            bt.gemv_half_batch(d.q, q_out, h, n, xs_off, q_off)?;
+            bt.gemv_half_batch(d.k, nkv * hd, h, n, xs_off, k_off)?;
+            bt.gemv_half_batch(d.v, nkv * hd, h, n, xs_off, v_off)?;
+            bt.barrier()?;
+            bt.run()?;
+        }
+
+        // Read back projections for per-token attention mix
+        let mut qb = vec![0f32; n * q_out];
+        let mut kb = vec![0f32; n * nkv * hd];
+        let mut vb = vec![0f32; n * nkv * hd];
+        {
+            let g = d.gpu.lock().unwrap();
+            g.read_into(q_off, &mut qb);
+            g.read_into(k_off, &mut kb);
+            g.read_into(v_off, &mut vb);
+        }
+
+        // Per-token attention mix (KV cache dependencies)
+        let mut attn = vec![0f32; n * nh * hd];
+        {
+            let _cpu = prof::start(prof::MIXER_CPU);
+            for i in 0..n {
+                self.mix(
+                    &qb[i * q_out..(i + 1) * q_out],
+                    &kb[i * nkv * hd..(i + 1) * nkv * hd],
+                    &vb[i * nkv * hd..(i + 1) * nkv * hd],
+                    pos0 + i,
+                    st,
+                    &mut attn[i * nh * hd..(i + 1) * nh * hd],
+                );
+            }
+        }
+
+        // Upload attn and batch o projection
+        {
+            let mut g = d.gpu.lock().unwrap();
+            g.write(attn_off, &attn);
+            let mut bt = g.batch()?;
+            bt.gemv_half_batch(d.o, h, nh * hd, n, attn_off, out_off)?;
+            bt.run()?;
+        }
+
+        Ok(())
+    }
+
     /// One token's attention against the KV cache: rope, the cache row, the
     /// causal scores and the output gate - everything between the q/k/v
     /// projections and `o_proj`, so a prefill chunk can project all its tokens
@@ -2405,6 +2742,97 @@ impl Layer {
         }
     }
 
+    /// Device-batched layer forward: processes n tokens through this layer using
+    /// batched GPU operations for rmsnorm and axpy. The mixer (GDN/attention)
+    /// and MoE/MLP still run per-token for now, but the normalization and
+    /// residual operations are batched, reducing CPU-GPU synchronization.
+    ///
+    /// Buffer layout in scratch (all offsets in floats):
+    /// - 0..n*h: input tokens (xs)
+    /// - n*h..2*n*h: buf (normalized activations)
+    /// - 2*n*h..3*n*h: res (mixer/FFN output)
+    pub fn prefill_device(&self, gpu: &mut Gpu, xs_off: usize, st: &mut LayerState, pos0: usize, n: usize) -> Result<()> {
+        let h = self.cfg.hidden_size;
+        let eps = self.cfg.rms_norm_eps as f32;
+        let buf_off = n * h;
+        let res_off = 2 * n * h;
+
+        // Batch rmsnorm: xs -> buf
+        {
+            let _t = prof::start(prof::NORM);
+            let norm_in_off = gpu.upload(&f32_bytes(&self.norm_in))?;
+            let mut bt = gpu.batch()?;
+            bt.rmsnorm_batch(h, n, xs_off, norm_in_off, buf_off, eps)?;
+            bt.run()?;
+        }
+
+        // Mixer: batched device for GDN and attention
+        match (&self.kind, st) {
+            (LayerKind::Linear, LayerState::Linear(g)) => {
+                let gdn = self.gdn.as_ref().unwrap();
+                gdn.prefill_device(gpu, buf_off, g, res_off, n)?;
+            }
+            (LayerKind::Full, LayerState::Full(a)) => {
+                let attn = self.attn.as_ref().unwrap();
+                attn.prefill_device(gpu, buf_off, pos0, a, res_off, n)?;
+            }
+            _ => panic!("layer state mismatch"),
+        }
+
+        // Batch axpy: xs += res
+        {
+            let _t = prof::start(prof::RESIDUAL);
+            let mut bt = gpu.batch()?;
+            bt.axpy_batch(h * n, 1, res_off, xs_off, 1.0, false)?;
+            bt.run()?;
+        }
+
+        // Batch rmsnorm: xs -> buf (post-attention)
+        {
+            let _t = prof::start(prof::NORM);
+            let norm_post_off = gpu.upload(&f32_bytes(&self.norm_post))?;
+            let mut bt = gpu.batch()?;
+            bt.rmsnorm_batch(h, n, xs_off, norm_post_off, buf_off, eps)?;
+            bt.run()?;
+        }
+
+        // MoE/MLP: batched grouped expert union for MoE, per-token for MLP
+        match (&self.moe, &self.mlp) {
+            (Some(moe), _) => {
+                // Read all tokens from GPU
+                let mut all_tokens = vec![0f32; n * h];
+                gpu.read_into(buf_off, &mut all_tokens);
+                
+                // Process all tokens through grouped expert union
+                let moe_out = moe.prefill_device_grouped(&all_tokens, n);
+                
+                // Write results back to GPU
+                gpu.write(res_off, &moe_out);
+                
+                // Batch axpy: xs += res
+                let mut bt = gpu.batch()?;
+                bt.axpy_batch(h * n, 1, res_off, xs_off, 1.0, false)?;
+                bt.run()?;
+            }
+            (None, mlp) => {
+                let mlp = mlp.as_ref().unwrap();
+                for i in 0..n {
+                    let mut token_buf = vec![0f32; h];
+                    gpu.read_into(buf_off + i * h, &mut token_buf);
+                    let mut token_res = vec![0f32; h];
+                    mlp.forward(&token_buf, &mut token_res);
+                    gpu.write(res_off + i * h, &token_res);
+                }
+                // Batch axpy: xs += res
+                let mut bt = gpu.batch()?;
+                bt.axpy_batch(h * n, 1, res_off, xs_off, 1.0, false)?;
+                bt.run()?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// A chunk of prompt tokens through this layer: `xs` holds `n` token-major
     /// rows of `h` floats and is advanced in place. The mixer and a dense FFN
     /// read their weights once for the whole chunk; the routed experts read each
@@ -2481,6 +2909,11 @@ pub struct Model {
     /// the host tier.
     pub gpu: Option<Arc<Mutex<Gpu>>>,
     pub dev_head: Option<DevHead>,
+    /// The lm_head quantised to int8 for the CPU lane when `--dense-i8` is on
+    /// (the default). Colibri ships its head int8 too; reading the checkpoint's
+    /// two-byte rows instead costs twice the bandwidth per token. `None` keeps
+    /// the mmap half-precision path (GPU tier, ORT, or `--no-dense-i8`).
+    pub head_i8: Option<Dense>,
     /// The lm_head parked in an ONNX Runtime session when `--backend ort` is
     /// selected. `None` keeps the device or blocked-CPU head path.
     #[cfg(feature = "ort")]
@@ -2581,6 +3014,18 @@ impl Model {
             }
             dev_ms = t.elapsed().as_secs_f64() * 1e3;
             crate::mem::report("device upload");
+        } else if dense_i8() {
+            // CPU lane: quantise the head to int8 like the rest of the dense
+            // trunk (and like Colibri). The mmap half path reads 2 bytes per
+            // weight every token; int8 reads 1, which is the difference between
+            // a bandwidth-bound head and a worse one. The quality trade is the
+            // same one `--dense-i8` already makes for the projections.
+            let t = std::time::Instant::now();
+            let rows = model.cfg.vocab_size;
+            let cols = model.cfg.hidden_size;
+            model.head_i8 = Some(Dense::load(sh, &model.head)?.quantize_i8(rows, cols));
+            head_ms = t.elapsed().as_secs_f64() * 1e3;
+            crate::mem::report("lm_head int8");
         }
         let (used, held) = model.layers.iter().fold((0usize, 0usize), |(u, h), l| {
             match &l.moe {
@@ -2674,6 +3119,7 @@ impl Model {
             threads: threads.max(1),
             gpu: None,
             dev_head: None,
+            head_i8: None,
             #[cfg(feature = "ort")]
             ort_head: None,
         })
@@ -2719,23 +3165,34 @@ impl Model {
         self.gpu.is_none()
     }
 
-    /// Device-side batched prefill: batch dense GEMV operations on GPU (n rows
-    /// per command buffer submit), while keeping recurrent parts (gdn_rec)
-    /// per-token. This is the device tier's answer to [`Model::prefill`], which
-    /// only works for host tiers.
+    /// Device-side batched prefill: batch dense operations on GPU (n rows per
+    /// command buffer submit), while keeping recurrent parts (gdn_rec) and
+    /// complex routing (MoE) per-token. This is the device tier's answer to
+    /// [`Model::prefill`], which only works for host tiers.
     ///
-    /// Currently a placeholder that loops through forward token-by-token (same
-    /// as the non-batched path). Phase 2 will implement actual device batching.
+    /// The batched operations (rmsnorm, axpy) amortize GPU launch overhead
+    /// across all n tokens. The per-token operations (mixer, MoE/MLP) still
+    /// run sequentially but benefit from the batched normalization and residual
+    /// connections around them.
     pub fn prefill_device(&self, xs: &mut [f32], st: &mut [LayerState], pos0: usize) {
         let h = self.cfg.hidden_size;
         let n = xs.len() / h;
-        // Reuse a single buffer instead of allocating per token
-        let mut x = vec![0f32; h];
-        for i in 0..n {
-            x.copy_from_slice(&xs[i * h..(i + 1) * h]);
-            self.forward(&mut x, st, pos0 + i);
-            xs[i * h..(i + 1) * h].copy_from_slice(&x);
+        let mut g = self.gpu.as_ref().expect("prefill_device requires GPU").lock().unwrap();
+
+        // Reserve space for n tokens + buf + res in scratch buffer
+        let scratch_needed = 3 * n * h;
+        g.reserve(scratch_needed).expect("scratch buffer too small for batched prefill");
+
+        // Upload all tokens to scratch at offset 0
+        g.write(0, xs);
+
+        // Process each layer with batched operations
+        for (l, s) in self.layers.iter().zip(st.iter_mut()) {
+            l.prefill_device(&mut *g, 0, s, pos0, n).expect("layer prefill_device failed");
         }
+
+        // Download results back to xs
+        g.read_into(0, xs);
     }
 
     /// Whether [`Model::prefill_device`] can take the prompt: requires a GPU
@@ -2754,6 +3211,12 @@ impl Model {
         // lm_head — device, ORT, host, `bench`, `serve` — lands in one stage.
         let _h = prof::start(prof::HEAD);
         let cols = self.cfg.hidden_size;
+        if let Some(d) = &self.head_i8 {
+            if out.len() == self.cfg.vocab_size {
+                d.gemv(self.cfg.vocab_size, cols, x, out, self.threads);
+                return Ok(());
+            }
+        }
         #[cfg(feature = "ort")]
         if let Some(d) = &self.ort_head {
             if out.len() == d.rows() {

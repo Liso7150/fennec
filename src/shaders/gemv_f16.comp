@@ -25,15 +25,21 @@ shared float red[256];
 // version (shift the field up 13, scale by 2^112) needs a subnormal f32
 // intermediate for subnormal halves, and this driver flushes those to zero:
 // it silently zeroed 61% of the weights in a small-magnitude test. Normalising
-// the mantissa with findMSB keeps every intermediate normal.
+// the mantissa with findMSB keeps every intermediate normal. The normal-weight
+// case (e != 0, the overwhelming majority of a trained head) needs no findMSB
+// at all, so it returns early and only subnormals pay for the normalisation.
 float hf(uint h) {
     uint s = (h & 0x8000u) << 16;
     uint e = (h >> 10) & 0x1Fu;
     uint m = h & 0x3FFu;
-    uint sh = 10u - uint(findMSB(m | 1u));
-    uint nrm = s | ((e == 31u ? 255u : e + 112u) << 23) | (m << 13);
-    uint sub = s | ((113u - sh) << 23) | (((m << sh) & 0x3FFu) << 13);
-    return uintBitsToFloat(e != 0u ? nrm : (m != 0u ? sub : s));
+    if (e != 0u) {
+        return uintBitsToFloat(s | ((e == 31u ? 255u : e + 112u) << 23) | (m << 13));
+    }
+    if (m == 0u) {
+        return uintBitsToFloat(s);
+    }
+    uint sh = 10u - uint(findMSB(m));
+    return uintBitsToFloat(s | ((113u - sh) << 23) | (((m << sh) & 0x3FFu) << 13));
 }
 
 void main() {

@@ -473,9 +473,14 @@ pub enum Op {
     GdnConv = 6,
     GdnRec = 7,
     MoeReduce = 8,
+    GemvBf16Batch = 9,
+    GemvF16Batch = 10,
+    RmsNormBatch = 11,
+    SiluMulBatch = 12,
+    AxpyBatch = 13,
 }
 
-const SPV: [&[u8]; 9] = [
+const SPV: [&[u8]; 14] = [
     include_bytes!("shaders/gemv_bf16.spv"),
     include_bytes!("shaders/gemv_q4.spv"),
     include_bytes!("shaders/rmsnorm.spv"),
@@ -485,6 +490,11 @@ const SPV: [&[u8]; 9] = [
     include_bytes!("shaders/gdn_conv.spv"),
     include_bytes!("shaders/gdn_rec.spv"),
     include_bytes!("shaders/moe_reduce.spv"),
+    include_bytes!("shaders/gemv_bf16_batch.spv"),
+    include_bytes!("shaders/gemv_f16_batch.spv"),
+    include_bytes!("shaders/rmsnorm_batch.spv"),
+    include_bytes!("shaders/silu_mul_batch.spv"),
+    include_bytes!("shaders/axpy_batch.spv"),
 ];
 
 pub struct VkGpu {
@@ -1449,6 +1459,86 @@ impl<'a> VkBatch<'a> {
         Ok(self)
     }
 
+    // ── Batched variants: process n_tokens vectors per dispatch ──
+
+    /// Batched y[t] = W x[t] for bf16/f16 weights. One dispatch amortises the
+    /// weight read across all n_tokens tokens — the prefill batching win.
+    pub fn gemv_half_batch(&mut self, w: usize, rows: usize, cols: usize, n_tokens: usize, x_off: usize, y_off: usize) -> Result<&mut VkBatch<'a>> {
+        assert!(cols % 2 == 0, "half pairs need an even column count");
+        let s = self.gpu.scratch;
+        let op = if self.gpu.bufs[w].f16 { Op::GemvF16Batch } else { Op::GemvBf16Batch };
+        let groups = (rows as u32 + 3) / 4;
+        self.gpu.record(
+            op,
+            [w, s, s, w],
+            &[
+                rows as u32,
+                cols as u32,
+                n_tokens as u32,
+                cols as u32,     // x_stride
+                rows as u32,     // y_stride
+                x_off as u32,
+                y_off as u32,
+                0,               // row_base (filled by tall-split)
+            ],
+            groups,
+            groups,
+            true,
+        )?;
+        self.ops += 1;
+        Ok(self)
+    }
+
+    /// Batched RMSNorm: one workgroup per token, n floats each.
+    pub fn rmsnorm_batch(&mut self, n: usize, n_tokens: usize, x_off: usize, w_off: usize, y_off: usize, eps: f32) -> Result<&mut VkBatch<'a>> {
+        let s = self.gpu.scratch;
+        let d = self.gpu.dummy;
+        self.gpu.record(
+            Op::RmsNormBatch,
+            [s, s, s, d],
+            &[n as u32, n_tokens as u32, x_off as u32, w_off as u32, y_off as u32, eps.to_bits(), 0, 0],
+            n_tokens as u32,
+            1,
+            false,
+        )?;
+        self.ops += 1;
+        Ok(self)
+    }
+
+    /// Batched silu_mul: n elements per token, n_tokens tokens.
+    pub fn silu_mul_batch(&mut self, n: usize, n_tokens: usize, a_off: usize, b_off: usize, y_off: usize) -> Result<&mut VkBatch<'a>> {
+        let s = self.gpu.scratch;
+        let d = self.gpu.dummy;
+        let total = n * n_tokens;
+        self.gpu.record(
+            Op::SiluMulBatch,
+            [s, s, s, d],
+            &[n as u32, n_tokens as u32, a_off as u32, b_off as u32, y_off as u32, 0, 0, 0],
+            total.div_ceil(256) as u32,
+            1,
+            false,
+        )?;
+        self.ops += 1;
+        Ok(self)
+    }
+
+    /// Batched axpy: n elements per token, n_tokens tokens.
+    pub fn axpy_batch(&mut self, n: usize, n_tokens: usize, x_off: usize, y_off: usize, w: f32, set: bool) -> Result<&mut VkBatch<'a>> {
+        let s = self.gpu.scratch;
+        let d = self.gpu.dummy;
+        let total = n * n_tokens;
+        self.gpu.record(
+            Op::AxpyBatch,
+            [s, s, d, d],
+            &[n as u32, n_tokens as u32, x_off as u32, y_off as u32, w.to_bits(), set as u32, 0, 0],
+            total.div_ceil(256) as u32,
+            1,
+            false,
+        )?;
+        self.ops += 1;
+        Ok(self)
+    }
+
     /// Depthwise conv + SiLU in place over the qkv projection. `state` is the
     /// persistent rolling window, one thread per channel so it needs no barrier.
     pub fn gdn_conv(&mut self, w: usize, state: usize, base: usize, cd: usize, kernel: usize, hist: usize) -> Result<&mut VkBatch<'a>> {
@@ -1834,6 +1924,54 @@ impl<'a> Batch<'a> {
         match self {
             Batch::Vk(b) => { b.axpy(n, x_off, y_off, w, set)?; }
             Batch::Cuda(b) => { b.axpy(n, x_off, y_off, w, set)?; }
+        };
+        Ok(self)
+    }
+
+    // ── Batched variants ──
+
+    pub fn gemv_half_batch(&mut self, w: usize, rows: usize, cols: usize, n_tokens: usize, x_off: usize, y_off: usize) -> Result<&mut Batch<'a>> {
+        match self {
+            Batch::Vk(b) => { b.gemv_half_batch(w, rows, cols, n_tokens, x_off, y_off)?; }
+            Batch::Cuda(b) => {
+                // CUDA falls back to per-token dispatches; same weights, different offsets.
+                for t in 0..n_tokens {
+                    b.gemv_half(w, rows, cols, x_off + t * cols, y_off + t * rows)?;
+                }
+            }
+        };
+        Ok(self)
+    }
+
+    pub fn rmsnorm_batch(&mut self, n: usize, n_tokens: usize, x_off: usize, w_off: usize, y_off: usize, eps: f32) -> Result<&mut Batch<'a>> {
+        match self {
+            Batch::Vk(b) => { b.rmsnorm_batch(n, n_tokens, x_off, w_off, y_off, eps)?; }
+            Batch::Cuda(b) => {
+                for t in 0..n_tokens {
+                    b.rmsnorm(n, x_off + t * n, w_off, y_off + t * n, eps)?;
+                }
+            }
+        };
+        Ok(self)
+    }
+
+    pub fn silu_mul_batch(&mut self, n: usize, n_tokens: usize, a_off: usize, b_off: usize, y_off: usize) -> Result<&mut Batch<'a>> {
+        match self {
+            Batch::Vk(b) => { b.silu_mul_batch(n, n_tokens, a_off, b_off, y_off)?; }
+            Batch::Cuda(b) => {
+                // CUDA: one launch covering all tokens' elements
+                b.silu_mul(n * n_tokens, a_off, b_off, y_off)?;
+            }
+        };
+        Ok(self)
+    }
+
+    pub fn axpy_batch(&mut self, n: usize, n_tokens: usize, x_off: usize, y_off: usize, w: f32, set: bool) -> Result<&mut Batch<'a>> {
+        match self {
+            Batch::Vk(b) => { b.axpy_batch(n, n_tokens, x_off, y_off, w, set)?; }
+            Batch::Cuda(b) => {
+                b.axpy(n * n_tokens, x_off, y_off, w, set)?;
+            }
         };
         Ok(self)
     }

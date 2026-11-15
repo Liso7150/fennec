@@ -1,0 +1,27 @@
+#version 450
+// Batched axpy: y[token][i] += w * x[token][i], or y = w * x when set != 0.
+// One thread per element across all tokens.
+layout(local_size_x = 256) in;
+layout(push_constant) uniform P {
+    uint n;         // elements per token
+    uint n_tokens;
+    uint x_off;
+    uint y_off;
+    float w;
+    uint set;
+} p;
+layout(set = 0, binding = 0) readonly buffer X { float x[]; };
+layout(set = 0, binding = 1) buffer Y { float y[]; };
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = p.n * p.n_tokens;
+    if (idx >= total) return;
+    uint xi = p.x_off + idx;
+    uint yi = p.y_off + idx;
+    if (p.set != 0u) {
+        y[yi] = p.w * x[xi];
+    } else {
+        y[yi] += p.w * x[xi];
+    }
+}

@@ -1084,6 +1084,35 @@ mod avx2 {
 
     #[target_feature(enable = "avx2,fma")]
     #[inline]
+    unsafe fn block_i32<const SIGNED: bool>(
+        row_bytes: *const u8,
+        p: &I8Prep,
+        b: usize,
+        m4: __m256i,
+        flip: __m256i,
+        one: __m256i,
+    ) -> __m256i {
+        let mut v = _mm256_loadu_si256(row_bytes.add(b * 32) as *const __m256i);
+        if SIGNED {
+            // One XOR on the packed byte flips bit 3 of both nibbles, so the
+            // split below lands on offset-binary without a second pass.
+            v = _mm256_xor_si256(v, flip);
+        }
+        let lo = _mm256_and_si256(v, m4);
+        let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(v), m4);
+        let xe = _mm256_loadu_si256(p.xe.as_ptr().add(b * 32) as *const __m256i);
+        let xo = _mm256_loadu_si256(p.xo.as_ptr().add(b * 32) as *const __m256i);
+        // maddubs takes the nibbles unsigned and the activations signed.
+        // 15 * 127 * 2 = 3810 fits the i16 pair sum with room to spare.
+        let s = _mm256_add_epi32(
+            _mm256_madd_epi16(_mm256_maddubs_epi16(lo, xe), one),
+            _mm256_madd_epi16(_mm256_maddubs_epi16(hi, xo), one),
+        );
+        _mm256_sub_epi32(s, _mm256_loadu_si256(p.corr.as_ptr().add(b * 8) as *const __m256i))
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    #[inline]
     unsafe fn dot_int<const SIGNED: bool>(q: &Q4, r: usize, p: &I8Prep) -> f32 {
         let blocks = q.cols / 64;
         let per = q.group / 64;
@@ -1093,37 +1122,36 @@ mod avx2 {
         let m4 = _mm256_set1_epi8(15);
         let flip = _mm256_set1_epi8(0x88u8 as i8);
         let one = _mm256_set1_epi16(1);
-        let mut acc = _mm256_setzero_ps();
-        for gi in 0..ng {
-            let sc = *row_scale.add(gi);
-            let b1 = ((gi + 1) * per).min(blocks);
-            for b in gi * per..b1 {
-                let mut v = _mm256_loadu_si256(row_bytes.add(b * 32) as *const __m256i);
-                if SIGNED {
-                    // One XOR on the packed byte flips bit 3 of both nibbles, so
-                    // the split below lands on offset-binary without a second pass.
-                    v = _mm256_xor_si256(v, flip);
-                }
-                let lo = _mm256_and_si256(v, m4);
-                let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(v), m4);
-                let xe = _mm256_loadu_si256(p.xe.as_ptr().add(b * 32) as *const __m256i);
-                let xo = _mm256_loadu_si256(p.xo.as_ptr().add(b * 32) as *const __m256i);
-                // maddubs takes the nibbles unsigned and the activations signed.
-                // 15 * 127 * 2 = 3810 fits the i16 pair sum with room to spare.
-                let s = _mm256_add_epi32(
-                    _mm256_madd_epi16(_mm256_maddubs_epi16(lo, xe), one),
-                    _mm256_madd_epi16(_mm256_maddubs_epi16(hi, xo), one),
-                );
-                let s = _mm256_sub_epi32(
-                    s,
-                    _mm256_loadu_si256(p.corr.as_ptr().add(b * 8) as *const __m256i),
-                );
-                // The weight scale and the activation scale fold into one
-                // multiply: the dot is against x * 127/amax, not against x.
-                let sd = _mm256_set1_ps(sc * *p.d.as_ptr().add(b));
-                acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s), sd, acc);
-            }
+        // Four independent accumulators break the serial FMA chain: a single
+        // accumulator makes every block wait the ~4-cycle FMA latency of the
+        // last, so a 2048-column row (32 blocks) stalls ~128 cycles per row on
+        // the accumulate alone. Four chains let the two FMA ports stay busy and
+        // the maddubs of the next block overlap the accumulate of this one. The
+        // sum is the same set of products, only the addition order changes,
+        // which stays well inside the routed-expert golden band.
+        let mut a0 = _mm256_setzero_ps();
+        let mut a1 = _mm256_setzero_ps();
+        let mut a2 = _mm256_setzero_ps();
+        let mut a3 = _mm256_setzero_ps();
+        let scale = |b: usize| _mm256_set1_ps(*row_scale.add(b / per) * *p.d.as_ptr().add(b));
+        let mut b = 0;
+        while b + 4 <= blocks {
+            let s0 = block_i32::<SIGNED>(row_bytes, p, b, m4, flip, one);
+            let s1 = block_i32::<SIGNED>(row_bytes, p, b + 1, m4, flip, one);
+            let s2 = block_i32::<SIGNED>(row_bytes, p, b + 2, m4, flip, one);
+            let s3 = block_i32::<SIGNED>(row_bytes, p, b + 3, m4, flip, one);
+            a0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s0), scale(b), a0);
+            a1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s1), scale(b + 1), a1);
+            a2 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s2), scale(b + 2), a2);
+            a3 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s3), scale(b + 3), a3);
+            b += 4;
         }
+        while b < blocks {
+            let s = block_i32::<SIGNED>(row_bytes, p, b, m4, flip, one);
+            a0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s), scale(b), a0);
+            b += 1;
+        }
+        let acc = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
         let h = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps::<1>(acc));
         let h = _mm_add_ps(h, _mm_movehl_ps(h, h));
         _mm_cvtss_f32(_mm_add_ss(h, _mm_shuffle_ps::<1>(h, h)))

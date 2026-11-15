@@ -1,0 +1,24 @@
+#version 450
+// Batched silu_mul: y[token][i] = silu(a[token][i]) * b[token][i].
+// One thread per element across all tokens.
+layout(local_size_x = 256) in;
+layout(push_constant) uniform P {
+    uint n;         // elements per token (e.g. intermediate_size)
+    uint n_tokens;
+    uint a_off;     // base offset of A
+    uint b_off;     // base offset of B
+    uint y_off;     // base offset of Y
+} p;
+layout(set = 0, binding = 0) readonly buffer A { float a[]; };
+layout(set = 0, binding = 1) readonly buffer B { float b[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = p.n * p.n_tokens;
+    if (idx >= total) return;
+    uint ai = p.a_off + idx;
+    uint bi = p.b_off + idx;
+    float g = a[ai];
+    y[p.y_off + idx] = (g / (1.0 + exp(-g))) * b[bi];
+}

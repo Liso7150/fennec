@@ -1,0 +1,102 @@
+#version 450
+// Batched y[token] = W x[token] for f16 weights. Same structure as
+// gemv_bf16_batch but unpacks f16 instead of bf16.
+layout(local_size_x = 256) in;
+layout(push_constant) uniform P {
+    uint rows;
+    uint cols;
+    uint n_tokens;
+    uint x_stride;
+    uint y_stride;
+    uint x_off;
+    uint y_off;
+    uint row_base;
+} p;
+layout(set = 0, binding = 0) readonly buffer W { uint w[]; };
+layout(set = 0, binding = 1) readonly buffer X { float x[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+layout(set = 0, binding = 3) readonly buffer W4 { uvec4 w4[]; };
+
+shared float red[256];
+
+// f16 unpack: IEEE 754 half-precision to f32
+float fh(uint u, uint hi) {
+    uint h = (u >> (16u * hi)) & 0xFFFFu;
+    uint sign = (h >> 15) & 1u;
+    uint exp = (h >> 10) & 0x1Fu;
+    uint mant = h & 0x3FFu;
+    uint f32_bits;
+    if (exp == 0u) {
+        if (mant == 0u) {
+            f32_bits = sign << 31;
+        } else {
+            // subnormal
+            exp = 1u;
+            while ((mant & 0x400u) == 0u) {
+                mant <<= 1;
+                exp--;
+            }
+            mant &= 0x3FFu;
+            f32_bits = (sign << 31) | ((exp + 127u - 15u) << 23) | (mant << 13);
+        }
+    } else if (exp == 31u) {
+        f32_bits = (sign << 31) | 0x7F800000u | (mant << 13);
+    } else {
+        f32_bits = (sign << 31) | ((exp + 127u - 15u) << 23) | (mant << 13);
+    }
+    return uintBitsToFloat(f32_bits);
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint lane = tid & 63u;
+    uint slot = tid >> 6;
+    uint r = (p.row_base + gl_WorkGroupID.x) * 4u + slot;
+    uint half_cols = p.cols >> 1;
+
+    if (r >= p.rows) {
+        for (uint t = 0; t < p.n_tokens; t++) {
+            red[tid] = 0.0;
+            barrier();
+            for (uint s = 32u; s > 0u; s >>= 1) {
+                if (lane < s) red[tid] += red[tid + s];
+                barrier();
+            }
+        }
+        return;
+    }
+
+    uint w_base = r * half_cols;
+    bool aligned = (half_cols & 3u) == 0u;
+    uint quads = aligned ? (half_cols >> 2) : 0u;
+
+    for (uint t = 0; t < p.n_tokens; t++) {
+        float acc = 0.0;
+        uint x_base = p.x_off + t * p.x_stride;
+        if (aligned) {
+            for (uint i = lane; i < quads; i += 64u) {
+                uvec4 u = w4[(w_base >> 2) + i];
+                uint c = x_base + (i << 3);
+                vec4 x0 = vec4(x[c], x[c + 1u], x[c + 2u], x[c + 3u]);
+                vec4 x1 = vec4(x[c + 4u], x[c + 5u], x[c + 6u], x[c + 7u]);
+                acc += fh(u.x, 0u) * x0.x + fh(u.x, 1u) * x0.y
+                     + fh(u.y, 0u) * x0.z + fh(u.y, 1u) * x0.w
+                     + fh(u.z, 0u) * x1.x + fh(u.z, 1u) * x1.y
+                     + fh(u.w, 0u) * x1.z + fh(u.w, 1u) * x1.w;
+            }
+        } else {
+            for (uint i = lane; i < half_cols; i += 64u) {
+                uint u = w[w_base + i];
+                uint c = x_base + (i << 1);
+                acc += fh(u, 0u) * x[c] + fh(u, 1u) * x[c + 1u];
+            }
+        }
+        red[tid] = acc;
+        barrier();
+        for (uint s = 32u; s > 0u; s >>= 1) {
+            if (lane < s) red[tid] += red[tid + s];
+            barrier();
+        }
+        if (lane == 0u) y[p.y_off + t * p.y_stride + r] = red[tid];
+    }
+}

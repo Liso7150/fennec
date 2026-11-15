@@ -237,7 +237,14 @@ impl Server {
         // kernels measured 2166 ms against 1750 ms on the VRAM path, so the
         // device tier keeps its own batched path.
         let prompt_len = ids.len();
-        let batched = prompt_len > 1 && (model.prefill_ready() || model.prefill_device_ready());
+        // Only the host tier batches the prompt. The device tier's batched
+        // `prefill_device` deadlocks: it holds the GPU mutex across the layer
+        // loop, and the MoE device-expert fallback re-locks that same
+        // non-reentrant mutex inside `forward`. Its scratch arena also overlaps
+        // the decode MoE arena. So the device tier prefills token by token
+        // through `forward`, the same path decode uses; decode throughput is
+        // unchanged because only the prompt prefill differs.
+        let batched = prompt_len > 1 && model.prefill_ready();
         let first = first_forward(prompt_len, batched);
         if batched {
             let mut xs = vec![0f32; PREFILL_CHUNK.min(first) * h];
@@ -249,11 +256,7 @@ impl Server {
             let row = model.embed_row(&self.shards, id as usize)?;
                     xs[i * h..(i + 1) * h].copy_from_slice(&row);
                 }
-                if model.prefill_device_ready() {
-                    model.prefill_device(&mut xs[..n * h], &mut st, c0);
-                } else {
-                    model.prefill(&mut xs[..n * h], &mut st, c0);
-                }
+                model.prefill(&mut xs[..n * h], &mut st, c0);
                 c0 += n;
             }
             crate::prof::split(first);
