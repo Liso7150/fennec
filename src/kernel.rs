@@ -42,9 +42,9 @@ struct RowJob<T, F> {
 impl Task {
     fn new<T: Send, F: Fn(&mut [T], usize) + Sync>(part: &mut [T], start: usize, f: &F) -> Task {
         unsafe fn call<T, F: Fn(&mut [T], usize)>(p: *mut ()) {
-            let j = Box::from_raw(p as *mut RowJob<T, F>);
-            let part = std::slice::from_raw_parts_mut(j.part, j.len);
-            (*j.f)(part, j.start);
+            let j = unsafe { Box::from_raw(p as *mut RowJob<T, F>) };
+            let part = unsafe { std::slice::from_raw_parts_mut(j.part, j.len) };
+            unsafe { (*j.f)(part, j.start) };
         }
         let job = Box::new(RowJob {
             part: part.as_mut_ptr(),
@@ -57,8 +57,8 @@ impl Task {
 
     fn index<F: Fn(usize, usize) + Sync>(start: usize, len: usize, f: &F) -> Task {
         unsafe fn call<F: Fn(usize, usize)>(p: *mut ()) {
-            let j = Box::from_raw(p as *mut IndexJob<F>);
-            (*j.f)(j.start, j.len);
+            let j = unsafe { Box::from_raw(p as *mut IndexJob<F>) };
+            unsafe { (*j.f)(j.start, j.len) };
         }
         let job = Box::new(IndexJob { start, len, f: f as *const F });
         Task { ptr: Box::into_raw(job) as *mut (), call: call::<F> }
@@ -143,7 +143,7 @@ mod placement {
     const RELATION_PROCESSOR_CORE: u32 = 0;
 
     #[link(name = "kernel32")]
-    extern "system" {
+    unsafe extern "system" {
         fn GetLogicalProcessorInformationEx(rel: u32, buf: *mut u8, len: *mut u32) -> i32;
         fn GetCurrentThread() -> *mut c_void;
         fn SetThreadAffinityMask(thread: *mut c_void, mask: usize) -> usize;
@@ -400,7 +400,7 @@ where
 /// pointee outlives the call, which blocks until every worker is done.
 ///
 /// The field is private on purpose: a closure that read `p.0` would capture the
-/// bare pointer (edition 2021 captures fields, not whole structs) and lose the
+/// bare pointer (disjoint capture takes fields, not whole structs) and lose the
 /// `Sync` impl below. Going through `at` captures the wrapper instead.
 pub struct SharedPtr<T>(*mut T);
 // Manual impls: deriving would add a `T: Copy` bound, but the pointer is
@@ -776,12 +776,12 @@ mod i8_avx {
         let mut k = 0usize;
         while k + 64 <= cols {
             let p0 = _mm256_maddubs_epi16(
-                _mm256_loadu_si256(xu.add(k) as *const __m256i),
-                _mm256_loadu_si256(w.add(k) as *const __m256i),
+                unsafe { _mm256_loadu_si256(xu.add(k) as *const __m256i) },
+                unsafe { _mm256_loadu_si256(w.add(k) as *const __m256i) },
             );
             let p1 = _mm256_maddubs_epi16(
-                _mm256_loadu_si256(xu.add(k + 32) as *const __m256i),
-                _mm256_loadu_si256(w.add(k + 32) as *const __m256i),
+                unsafe { _mm256_loadu_si256(xu.add(k + 32) as *const __m256i) },
+                unsafe { _mm256_loadu_si256(w.add(k + 32) as *const __m256i) },
             );
             a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(p0, one));
             a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(p1, one));
@@ -789,8 +789,8 @@ mod i8_avx {
         }
         while k + 32 <= cols {
             let p = _mm256_maddubs_epi16(
-                _mm256_loadu_si256(xu.add(k) as *const __m256i),
-                _mm256_loadu_si256(w.add(k) as *const __m256i),
+                unsafe { _mm256_loadu_si256(xu.add(k) as *const __m256i) },
+                unsafe { _mm256_loadu_si256(w.add(k) as *const __m256i) },
             );
             a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(p, one));
             k += 32;
@@ -804,7 +804,7 @@ mod i8_avx {
         let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0b1011_0001>(s));
         let mut total = _mm_cvtsi128_si32(s);
         while k < cols {
-            total += (*xu.add(k) as i32 - 64) * *w.add(k) as i32;
+            total += (unsafe { *xu.add(k) } as i32 - 64) * unsafe { *w.add(k) } as i32;
             k += 1;
         }
         total
@@ -925,9 +925,9 @@ mod half_avx {
     #[target_feature(enable = "avx2,f16c")]
     pub unsafe fn row(w: *const u8, cols: usize, x: *const f32, fmt: Half) -> f32 {
         if fmt == Half::Bf16 {
-            row_fmt::<true>(w, cols, x)
+            unsafe { row_fmt::<true>(w, cols, x) }
         } else {
-            row_fmt::<false>(w, cols, x)
+            unsafe { row_fmt::<false>(w, cols, x) }
         }
     }
 
@@ -946,25 +946,25 @@ mod half_avx {
         // which is more accurate but drifted 1.1e-6 relative rms past the golden
         // band. The loop is bandwidth-bound, so the extra multiply is free.
         while k + 32 <= cols {
-            a0 = _mm256_add_ps(a0, _mm256_mul_ps(load8::<BF16>(w.add(k * 2)), _mm256_loadu_ps(x.add(k))));
-            a1 = _mm256_add_ps(a1, _mm256_mul_ps(load8::<BF16>(w.add(k * 2 + 16)), _mm256_loadu_ps(x.add(k + 8))));
-            a2 = _mm256_add_ps(a2, _mm256_mul_ps(load8::<BF16>(w.add(k * 2 + 32)), _mm256_loadu_ps(x.add(k + 16))));
-            a3 = _mm256_add_ps(a3, _mm256_mul_ps(load8::<BF16>(w.add(k * 2 + 48)), _mm256_loadu_ps(x.add(k + 24))));
+            a0 = _mm256_add_ps(a0, _mm256_mul_ps(unsafe { load8::<BF16>(w.add(k * 2)) }, unsafe { _mm256_loadu_ps(x.add(k)) }));
+            a1 = _mm256_add_ps(a1, _mm256_mul_ps(unsafe { load8::<BF16>(w.add(k * 2 + 16)) }, unsafe { _mm256_loadu_ps(x.add(k + 8)) }));
+            a2 = _mm256_add_ps(a2, _mm256_mul_ps(unsafe { load8::<BF16>(w.add(k * 2 + 32)) }, unsafe { _mm256_loadu_ps(x.add(k + 16)) }));
+            a3 = _mm256_add_ps(a3, _mm256_mul_ps(unsafe { load8::<BF16>(w.add(k * 2 + 48)) }, unsafe { _mm256_loadu_ps(x.add(k + 24)) }));
             k += 32;
         }
         while k + 8 <= cols {
-            a0 = _mm256_add_ps(a0, _mm256_mul_ps(load8::<BF16>(w.add(k * 2)), _mm256_loadu_ps(x.add(k))));
+            a0 = _mm256_add_ps(a0, _mm256_mul_ps(unsafe { load8::<BF16>(w.add(k * 2)) }, unsafe { _mm256_loadu_ps(x.add(k)) }));
             k += 8;
         }
         let s = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
         let mut lane = [0f32; 8];
-        _mm256_storeu_ps(lane.as_mut_ptr(), s);
+        unsafe { _mm256_storeu_ps(lane.as_mut_ptr(), s) };
         let mut acc = ((lane[0] + lane[1]) + (lane[2] + lane[3]))
             + ((lane[4] + lane[5]) + (lane[6] + lane[7]));
         while k < cols {
-            let bits = u16::from_le_bytes([*w.add(k * 2), *w.add(k * 2 + 1)]);
+            let bits = u16::from_le_bytes([unsafe { *w.add(k * 2) }, unsafe { *w.add(k * 2 + 1) }]);
             let v = if BF16 { f32::from_bits((bits as u32) << 16) } else { crate::safetensors::f16_to_f32(bits) };
-            acc += v * *x.add(k);
+            acc += v * unsafe { *x.add(k) };
             k += 1;
         }
         acc
@@ -973,7 +973,7 @@ mod half_avx {
     #[target_feature(enable = "avx2,f16c")]
     #[inline]
     unsafe fn load8<const BF16: bool>(p: *const u8) -> __m256 {
-        let v = _mm_loadu_si128(p as *const __m128i);
+        let v = unsafe { _mm_loadu_si128(p as *const __m128i) };
         if BF16 {
             _mm256_castsi256_ps(_mm256_slli_epi32::<16>(_mm256_cvtepu16_epi32(v)))
         } else {
@@ -1162,19 +1162,19 @@ mod avx {
         while i + 32 <= n {
             let p = x.as_ptr();
             let q = y.as_ptr();
-            a0 = _mm256_add_ps(a0, _mm256_mul_ps(_mm256_loadu_ps(p.add(i)), _mm256_loadu_ps(q.add(i))));
-            a1 = _mm256_add_ps(a1, _mm256_mul_ps(_mm256_loadu_ps(p.add(i + 8)), _mm256_loadu_ps(q.add(i + 8))));
-            a2 = _mm256_add_ps(a2, _mm256_mul_ps(_mm256_loadu_ps(p.add(i + 16)), _mm256_loadu_ps(q.add(i + 16))));
-            a3 = _mm256_add_ps(a3, _mm256_mul_ps(_mm256_loadu_ps(p.add(i + 24)), _mm256_loadu_ps(q.add(i + 24))));
+            a0 = _mm256_add_ps(a0, _mm256_mul_ps(unsafe { _mm256_loadu_ps(p.add(i)) }, unsafe { _mm256_loadu_ps(q.add(i)) }));
+            a1 = _mm256_add_ps(a1, _mm256_mul_ps(unsafe { _mm256_loadu_ps(p.add(i + 8)) }, unsafe { _mm256_loadu_ps(q.add(i + 8)) }));
+            a2 = _mm256_add_ps(a2, _mm256_mul_ps(unsafe { _mm256_loadu_ps(p.add(i + 16)) }, unsafe { _mm256_loadu_ps(q.add(i + 16)) }));
+            a3 = _mm256_add_ps(a3, _mm256_mul_ps(unsafe { _mm256_loadu_ps(p.add(i + 24)) }, unsafe { _mm256_loadu_ps(q.add(i + 24)) }));
             i += 32;
         }
         while i + 8 <= n {
-            a0 = _mm256_add_ps(a0, _mm256_mul_ps(_mm256_loadu_ps(x.as_ptr().add(i)), _mm256_loadu_ps(y.as_ptr().add(i))));
+            a0 = _mm256_add_ps(a0, _mm256_mul_ps(unsafe { _mm256_loadu_ps(x.as_ptr().add(i)) }, unsafe { _mm256_loadu_ps(y.as_ptr().add(i)) }));
             i += 8;
         }
         let acc = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
         let mut t = [0f32; 8];
-        _mm256_storeu_ps(t.as_mut_ptr(), acc);
+        unsafe { _mm256_storeu_ps(t.as_mut_ptr(), acc) };
         let mut s: f32 = ((t[0] + t[1]) + (t[2] + t[3])) + ((t[4] + t[5]) + (t[6] + t[7]));
         while i < n {
             s += x[i] * y[i];

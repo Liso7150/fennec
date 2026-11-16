@@ -180,12 +180,12 @@ pub struct Vulkan {
 
 unsafe fn get_inst_fn(lib: &Library, inst: *mut c_void, name: &str) -> Option<*mut c_void> {
     type GPA = unsafe extern "system" fn(*mut c_void, *const c_char) -> *mut c_void;
-    let gpa: Symbol<GPA> = lib.get(b"vkGetInstanceProcAddr").ok()?;
+    let gpa: Symbol<GPA> = unsafe { lib.get(b"vkGetInstanceProcAddr") }.ok()?;
     let mut buf = Vec::with_capacity(name.len() + 1);
     buf.extend_from_slice(name.as_bytes());
     buf.push(0);
     // vkGetInstanceProcAddr answers null for a name the loader does not know
-    let p = gpa(inst, buf.as_ptr() as *const c_char);
+    let p = unsafe { gpa(inst, buf.as_ptr() as *const c_char) };
     if p.is_null() {
         None
     } else {
@@ -267,15 +267,15 @@ fn extension_names(raw: &[u8]) -> Vec<String> {
 
 unsafe fn instance_extensions(lib: &Library) -> Vec<String> {
     type Enum = unsafe extern "system" fn(*const c_char, *mut u32, *mut c_void) -> i32;
-    let Ok(sym) = lib.get::<Enum>(b"vkEnumerateInstanceExtensionProperties") else {
+    let Ok(sym) = (unsafe { lib.get::<Enum>(b"vkEnumerateInstanceExtensionProperties") }) else {
         return Vec::new();
     };
     let mut n = 0u32;
-    if sym(std::ptr::null(), &mut n, std::ptr::null_mut()) != 0 || n == 0 {
+    if unsafe { sym(std::ptr::null(), &mut n, std::ptr::null_mut()) } != 0 || n == 0 {
         return Vec::new();
     }
     let mut buf = vec![0u8; n as usize * (VK_MAX_EXTENSION_NAME + 4)];
-    if sym(std::ptr::null(), &mut n, buf.as_mut_ptr() as *mut c_void) != 0 {
+    if unsafe { sym(std::ptr::null(), &mut n, buf.as_mut_ptr() as *mut c_void) } != 0 {
         return Vec::new();
     }
     extension_names(&buf)
@@ -508,13 +508,13 @@ impl Vulkan {
         let Some(p) = self.gpa(inst, "vkEnumerateDeviceExtensionProperties") else {
             return Vec::new();
         };
-        let fp: Enum = std::mem::transmute(p);
+        let fp: Enum = unsafe { std::mem::transmute(p) };
         let mut n = 0u32;
-        if fp(phys, std::ptr::null(), &mut n, std::ptr::null_mut()) != 0 || n == 0 {
+        if unsafe { fp(phys, std::ptr::null(), &mut n, std::ptr::null_mut()) } != 0 || n == 0 {
             return Vec::new();
         }
         let mut buf = vec![0u8; n as usize * (VK_MAX_EXTENSION_NAME + 4)];
-        if fp(phys, std::ptr::null(), &mut n, buf.as_mut_ptr() as *mut c_void) != 0 {
+        if unsafe { fp(phys, std::ptr::null(), &mut n, buf.as_mut_ptr() as *mut c_void) } != 0 {
             return Vec::new();
         }
         extension_names(&buf)

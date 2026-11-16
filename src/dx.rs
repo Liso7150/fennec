@@ -171,20 +171,20 @@ mod imp {
     /// IUnknown (3 slots); IDXCore* derive it directly, IDXGIFactory also
     /// carries IDXGIObject's four before its own five.
     unsafe fn vt(obj: Handle, i: usize) -> *mut c_void {
-        let v = *(obj as *const *const *mut c_void);
-        *v.add(i)
+        let v = unsafe { *(obj as *const *const *mut c_void) };
+        unsafe { *v.add(i) }
     }
 
     unsafe fn release(obj: Handle) {
         if !obj.is_null() {
-            let r: Release = std::mem::transmute(vt(obj, 2));
-            r(obj);
+            let r: Release = unsafe { std::mem::transmute(vt(obj, 2)) };
+            unsafe { r(obj) };
         }
     }
 
     unsafe fn sym<T>(lib: &Library, name: &[u8]) -> Option<T> {
-        let s = lib.get::<*mut c_void>(name).ok()?;
-        Some(std::mem::transmute_copy::<*mut c_void, T>(&*s))
+        let s = unsafe { lib.get::<*mut c_void>(name) }.ok()?;
+        Some(unsafe { std::mem::transmute_copy::<*mut c_void, T>(&*s) })
     }
 
     fn gib(b: usize) -> f64 {
@@ -192,30 +192,30 @@ mod imp {
     }
 
     unsafe fn dxgi(out: &mut Report) {
-        let Ok(lib) = Library::new("dxgi.dll") else {
+        let Ok(lib) = (unsafe { Library::new("dxgi.dll") }) else {
             out.notes.push("dxgi.dll did not load".into());
             return;
         };
-        let Some(create) = sym::<CreateDxgiFactory1>(&lib, b"CreateDXGIFactory1\0") else {
+        let Some(create) = (unsafe { sym::<CreateDxgiFactory1>(&lib, b"CreateDXGIFactory1\0") }) else {
             out.notes.push("CreateDXGIFactory1 missing from dxgi.dll".into());
             return;
         };
         let mut factory: Handle = std::ptr::null_mut();
-        if create(&IID_IDXGIFACTORY1, &mut factory) != 0 || factory.is_null() {
+        if unsafe { create(&IID_IDXGIFACTORY1, &mut factory) } != 0 || factory.is_null() {
             out.notes.push("CreateDXGIFactory1 failed".into());
             return;
         }
         // IUnknown(3) + IDXGIObject(4) + IDXGIFactory(5) -> EnumAdapters1 at 12.
-        let enum_adapters: EnumAdapters1 = std::mem::transmute(vt(factory, 12));
+        let enum_adapters: EnumAdapters1 = unsafe { std::mem::transmute(vt(factory, 12)) };
         for i in 0..32u32 {
             let mut a: Handle = std::ptr::null_mut();
-            if enum_adapters(factory, i, &mut a) != 0 || a.is_null() {
+            if unsafe { enum_adapters(factory, i, &mut a) } != 0 || a.is_null() {
                 break;
             }
             // IDXGIAdapter1::GetDesc1 is slot 10.
-            let get_desc: GetDesc1 = std::mem::transmute(vt(a, 10));
-            let mut d: AdapterDesc1 = std::mem::zeroed();
-            if get_desc(a, &mut d) == 0 {
+            let get_desc: GetDesc1 = unsafe { std::mem::transmute(vt(a, 10)) };
+            let mut d: AdapterDesc1 = unsafe { std::mem::zeroed() };
+            if unsafe { get_desc(a, &mut d) } == 0 {
                 let end = d.description.iter().position(|&c| c == 0).unwrap_or(128);
                 out.adapters.push(Adapter {
                     name: String::from_utf16_lossy(&d.description[..end]),
@@ -230,21 +230,21 @@ mod imp {
                     core_compute: false,
                 });
             }
-            release(a);
+            unsafe { release(a) };
         }
-        release(factory);
+        unsafe { release(factory) };
     }
 
     unsafe fn driver_description(adapter: Handle) -> String {
         // DXCoreAdapterProperty::DriverDescription = 2, a null-terminated char[].
-        let size_of: GetPropertySize = std::mem::transmute(vt(adapter, 7));
-        let get: GetProperty = std::mem::transmute(vt(adapter, 6));
+        let size_of: GetPropertySize = unsafe { std::mem::transmute(vt(adapter, 7)) };
+        let get: GetProperty = unsafe { std::mem::transmute(vt(adapter, 6)) };
         let mut n = 0usize;
-        if size_of(adapter, 2, &mut n) != 0 || n == 0 || n > 4096 {
+        if unsafe { size_of(adapter, 2, &mut n) } != 0 || n == 0 || n > 4096 {
             return "<no description>".into();
         }
         let mut buf = vec![0u8; n];
-        if get(adapter, 2, n, buf.as_mut_ptr() as *mut c_void) != 0 {
+        if unsafe { get(adapter, 2, n, buf.as_mut_ptr() as *mut c_void) } != 0 {
             return "<unreadable>".into();
         }
         let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
@@ -254,19 +254,19 @@ mod imp {
     /// DXCore has no DXGI descriptor: ids come from HardwareIDParts (property
     /// 14, five u32) and the memory sizes are separate u64 properties.
     unsafe fn hardware(adapter: Handle) -> (u32, u32, f64, f64) {
-        let size_of: GetPropertySize = std::mem::transmute(vt(adapter, 7));
-        let get: GetProperty = std::mem::transmute(vt(adapter, 6));
+        let size_of: GetPropertySize = unsafe { std::mem::transmute(vt(adapter, 7)) };
+        let get: GetProperty = unsafe { std::mem::transmute(vt(adapter, 6)) };
         let mut ids = [0u32; 5];
         let mut n = 0usize;
-        if size_of(adapter, 14, &mut n) == 0 && n == std::mem::size_of_val(&ids) {
-            let _ = get(adapter, 14, n, ids.as_mut_ptr() as *mut c_void);
+        if unsafe { size_of(adapter, 14, &mut n) } == 0 && n == std::mem::size_of_val(&ids) {
+            let _ = unsafe { get(adapter, 14, n, ids.as_mut_ptr() as *mut c_void) };
         }
         let mem = |prop: u32| -> f64 {
             let mut v = 0u64;
             let mut n = 0usize;
-            if size_of(adapter, prop, &mut n) == 0
+            if unsafe { size_of(adapter, prop, &mut n) } == 0
                 && n == 8
-                && get(adapter, prop, 8, &mut v as *mut u64 as *mut c_void) == 0
+                && unsafe { get(adapter, prop, 8, &mut v as *mut u64 as *mut c_void) } == 0
             {
                 gib(v as usize)
             } else {
@@ -277,67 +277,67 @@ mod imp {
     }
 
     unsafe fn dxcore(out: &mut Report, d3d12: Option<&Library>) {
-        let Ok(lib) = Library::new("dxcore.dll") else {
+        let Ok(lib) = (unsafe { Library::new("dxcore.dll") }) else {
             out.notes.push("dxcore.dll did not load: no NPU enumeration".into());
             return;
         };
-        let Some(create) = sym::<CreateAdapterFactory>(&lib, b"DXCoreCreateAdapterFactory\0") else {
+        let Some(create) = (unsafe { sym::<CreateAdapterFactory>(&lib, b"DXCoreCreateAdapterFactory\0") }) else {
             out.notes.push("DXCoreCreateAdapterFactory missing".into());
             return;
         };
         let mut factory: Handle = std::ptr::null_mut();
-        if create(&IID_FACTORY, &mut factory) != 0 || factory.is_null() {
+        if unsafe { create(&IID_FACTORY, &mut factory) } != 0 || factory.is_null() {
             out.notes.push("DXCoreCreateAdapterFactory failed".into());
             return;
         }
-        let make_list: CreateAdapterList = std::mem::transmute(vt(factory, 3));
+        let make_list: CreateAdapterList = unsafe { std::mem::transmute(vt(factory, 3)) };
         let create_device =
-            d3d12.and_then(|l| sym::<D3D12CreateDevice>(l, b"D3D12CreateDevice\0"));
+            d3d12.and_then(|l| unsafe { sym::<D3D12CreateDevice>(l, b"D3D12CreateDevice\0") });
         // GENERIC_ML is the attribute an NPU carries; CORE_COMPUTE is the
         // fallback the sample tries when no ML adapter exists.
         for attr in [ATTR_GENERIC_ML, ATTR_CORE_COMPUTE] {
             let mut list: Handle = std::ptr::null_mut();
-            if make_list(factory, 1, &attr, &IID_LIST, &mut list) != 0 || list.is_null() {
+            if unsafe { make_list(factory, 1, &attr, &IID_LIST, &mut list) } != 0 || list.is_null() {
                 continue;
             }
-            let count: GetAdapterCount = std::mem::transmute(vt(list, 4));
-            let get_adapter: GetAdapter = std::mem::transmute(vt(list, 3));
-            for i in 0..count(list) {
+            let count: GetAdapterCount = unsafe { std::mem::transmute(vt(list, 4)) };
+            let get_adapter: GetAdapter = unsafe { std::mem::transmute(vt(list, 3)) };
+            for i in 0..unsafe { count(list) } {
                 let mut a: Handle = std::ptr::null_mut();
-                if get_adapter(list, i, &IID_ADAPTER, &mut a) != 0 || a.is_null() {
+                if unsafe { get_adapter(list, i, &IID_ADAPTER, &mut a) } != 0 || a.is_null() {
                     continue;
                 }
-                let is_attr: IsAttributeSupported = std::mem::transmute(vt(a, 4));
-                let (vendor_id, device_id, dedicated_gib, shared_gib) = hardware(a);
+                let is_attr: IsAttributeSupported = unsafe { std::mem::transmute(vt(a, 4)) };
+                let (vendor_id, device_id, dedicated_gib, shared_gib) = unsafe { hardware(a) };
                 let ad = Adapter {
-                    name: driver_description(a),
+                    name: unsafe { driver_description(a) },
                     vendor_id,
                     device_id,
                     vendor: if vendor_id == 0 { "unknown" } else { vendor_name(vendor_id) },
                     dedicated_gib,
                     shared_gib,
                     software: false,
-                    graphics: is_attr(a, &ATTR_GRAPHICS) != 0,
-                    generic_ml: is_attr(a, &ATTR_GENERIC_ML) != 0,
-                    core_compute: is_attr(a, &ATTR_CORE_COMPUTE) != 0,
+                    graphics: unsafe { is_attr(a, &ATTR_GRAPHICS) } != 0,
+                    generic_ml: unsafe { is_attr(a, &ATTR_GENERIC_ML) } != 0,
+                    core_compute: unsafe { is_attr(a, &ATTR_CORE_COMPUTE) } != 0,
                 };
                 if ad.is_npu() && !out.npus.iter().any(|n| n.adapter.name == ad.name) {
                     // D3D_FEATURE_LEVEL_1_0_GENERIC. 1_0_CORE is the fallback.
                     let hr = create_device.map(|cd| {
                         let mut dev: Handle = std::ptr::null_mut();
-                        let hr = cd(a, 0x100, &IID_ID3D12DEVICE, &mut dev);
+                        let hr = unsafe { cd(a, 0x100, &IID_ID3D12DEVICE, &mut dev) };
                         if hr == 0 {
-                            release(dev);
+                            unsafe { release(dev) };
                         }
                         hr
                     });
                     out.npus.push(Npu { adapter: ad, d3d12_hr: hr });
                 }
-                release(a);
+                unsafe { release(a) };
             }
-            release(list);
+            unsafe { release(list) };
         }
-        release(factory);
+        unsafe { release(factory) };
     }
 
     pub fn probe() -> Report {

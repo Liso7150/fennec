@@ -433,7 +433,7 @@ fn cstr(s: &str) -> Vec<u8> {
 
 unsafe fn raw(gpa: Gpa, h: Handle, name: &str) -> Handle {
     let n = cstr(name);
-    gpa(h, n.as_ptr() as *const c_char)
+    unsafe { gpa(h, n.as_ptr() as *const c_char) }
 }
 
 macro_rules! api {

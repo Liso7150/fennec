@@ -1076,9 +1076,9 @@ mod avx2 {
     #[target_feature(enable = "avx2,fma")]
     pub unsafe fn dot_prepped_int(q: &Q4, r: usize, p: &I8Prep) -> f32 {
         if q.signed {
-            dot_int::<true>(q, r, p)
+            unsafe { dot_int::<true>(q, r, p) }
         } else {
-            dot_int::<false>(q, r, p)
+            unsafe { dot_int::<false>(q, r, p) }
         }
     }
 
@@ -1092,7 +1092,7 @@ mod avx2 {
         flip: __m256i,
         one: __m256i,
     ) -> __m256i {
-        let mut v = _mm256_loadu_si256(row_bytes.add(b * 32) as *const __m256i);
+        let mut v = unsafe { _mm256_loadu_si256(row_bytes.add(b * 32) as *const __m256i) };
         if SIGNED {
             // One XOR on the packed byte flips bit 3 of both nibbles, so the
             // split below lands on offset-binary without a second pass.
@@ -1100,15 +1100,15 @@ mod avx2 {
         }
         let lo = _mm256_and_si256(v, m4);
         let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(v), m4);
-        let xe = _mm256_loadu_si256(p.xe.as_ptr().add(b * 32) as *const __m256i);
-        let xo = _mm256_loadu_si256(p.xo.as_ptr().add(b * 32) as *const __m256i);
+        let xe = unsafe { _mm256_loadu_si256(p.xe.as_ptr().add(b * 32) as *const __m256i) };
+        let xo = unsafe { _mm256_loadu_si256(p.xo.as_ptr().add(b * 32) as *const __m256i) };
         // maddubs takes the nibbles unsigned and the activations signed.
         // 15 * 127 * 2 = 3810 fits the i16 pair sum with room to spare.
         let s = _mm256_add_epi32(
             _mm256_madd_epi16(_mm256_maddubs_epi16(lo, xe), one),
             _mm256_madd_epi16(_mm256_maddubs_epi16(hi, xo), one),
         );
-        _mm256_sub_epi32(s, _mm256_loadu_si256(p.corr.as_ptr().add(b * 8) as *const __m256i))
+        _mm256_sub_epi32(s, unsafe { _mm256_loadu_si256(p.corr.as_ptr().add(b * 8) as *const __m256i) })
     }
 
     #[target_feature(enable = "avx2,fma")]
@@ -1117,8 +1117,8 @@ mod avx2 {
         let blocks = q.cols / 64;
         let per = q.group / 64;
         let ng = q.ngroups();
-        let row_bytes = q.data.as_ptr().add(r * (q.cols / 2));
-        let row_scale = q.scale.as_ptr().add(r * ng);
+        let row_bytes = unsafe { q.data.as_ptr().add(r * (q.cols / 2)) };
+        let row_scale = unsafe { q.scale.as_ptr().add(r * ng) };
         let m4 = _mm256_set1_epi8(15);
         let flip = _mm256_set1_epi8(0x88u8 as i8);
         let one = _mm256_set1_epi16(1);
@@ -1133,13 +1133,13 @@ mod avx2 {
         let mut a1 = _mm256_setzero_ps();
         let mut a2 = _mm256_setzero_ps();
         let mut a3 = _mm256_setzero_ps();
-        let scale = |b: usize| _mm256_set1_ps(*row_scale.add(b / per) * *p.d.as_ptr().add(b));
+        let scale = |b: usize| _mm256_set1_ps(unsafe { *row_scale.add(b / per) } * unsafe { *p.d.as_ptr().add(b) });
         let mut b = 0;
         while b + 4 <= blocks {
-            let s0 = block_i32::<SIGNED>(row_bytes, p, b, m4, flip, one);
-            let s1 = block_i32::<SIGNED>(row_bytes, p, b + 1, m4, flip, one);
-            let s2 = block_i32::<SIGNED>(row_bytes, p, b + 2, m4, flip, one);
-            let s3 = block_i32::<SIGNED>(row_bytes, p, b + 3, m4, flip, one);
+            let s0 = unsafe { block_i32::<SIGNED>(row_bytes, p, b, m4, flip, one) };
+            let s1 = unsafe { block_i32::<SIGNED>(row_bytes, p, b + 1, m4, flip, one) };
+            let s2 = unsafe { block_i32::<SIGNED>(row_bytes, p, b + 2, m4, flip, one) };
+            let s3 = unsafe { block_i32::<SIGNED>(row_bytes, p, b + 3, m4, flip, one) };
             a0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s0), scale(b), a0);
             a1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s1), scale(b + 1), a1);
             a2 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s2), scale(b + 2), a2);
@@ -1147,7 +1147,7 @@ mod avx2 {
             b += 4;
         }
         while b < blocks {
-            let s = block_i32::<SIGNED>(row_bytes, p, b, m4, flip, one);
+            let s = unsafe { block_i32::<SIGNED>(row_bytes, p, b, m4, flip, one) };
             a0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s), scale(b), a0);
             b += 1;
         }
@@ -1160,9 +1160,9 @@ mod avx2 {
     #[target_feature(enable = "avx2,fma")]
     pub unsafe fn dot_prepped(q: &Q4, r: usize, p: &DotPrep) -> f32 {
         if q.signed {
-            dot_chunks::<true>(q, r, p)
+            unsafe { dot_chunks::<true>(q, r, p) }
         } else {
-            dot_chunks::<false>(q, r, p)
+            unsafe { dot_chunks::<false>(q, r, p) }
         }
     }
 
@@ -1172,23 +1172,23 @@ mod avx2 {
         let chunks = q.cols / 32;
         let per = q.group / 32;
         let ng = q.ngroups();
-        let row_bytes = q.data.as_ptr().add(r * (q.cols / 2));
-        let row_scale = q.scale.as_ptr().add(r * ng);
+        let row_bytes = unsafe { q.data.as_ptr().add(r * (q.cols / 2)) };
+        let row_scale = unsafe { q.scale.as_ptr().add(r * ng) };
         let mask = _mm256_set1_epi32(0x0f);
         let flip = _mm256_set1_epi32(8);
         let mut acc_all = _mm256_setzero_ps();
         for gi in 0..ng {
-            let sc = _mm256_set1_ps(*row_scale.add(gi));
+            let sc = _mm256_set1_ps(unsafe { *row_scale.add(gi) });
             // The last group can be short when cols is not a multiple of group.
             let g1 = ((gi + 1) * per).min(chunks);
             for g in gi * per..g1 {
-                let b = row_bytes.add(g * 16);
-                let xp = p.xp.as_ptr().add(g * 32);
-                let nx = p.nx.as_ptr().add(g * 32);
+                let b = unsafe { row_bytes.add(g * 16) };
+                let xp = unsafe { p.xp.as_ptr().add(g * 32) };
+                let nx = unsafe { p.nx.as_ptr().add(g * 32) };
                 // Eight bytes each, not sixteen: the second load would run past
                 // the row on the final chunk of the final row.
-                let v0 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(b as *const __m128i));
-                let v1 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(b.add(8) as *const __m128i));
+                let v0 = _mm256_cvtepu8_epi32(unsafe { _mm_loadl_epi64(b as *const __m128i) });
+                let v1 = _mm256_cvtepu8_epi32(unsafe { _mm_loadl_epi64(b.add(8) as *const __m128i) });
                 let (mut l0, mut h0) = (_mm256_and_si256(v0, mask), _mm256_srli_epi32::<4>(v0));
                 let (mut l1, mut h1) = (_mm256_and_si256(v1, mask), _mm256_srli_epi32::<4>(v1));
                 if SIGNED {
@@ -1201,23 +1201,23 @@ mod avx2 {
                 }
                 let t0 = _mm256_fmadd_ps(
                     _mm256_cvtepi32_ps(l0),
-                    _mm256_loadu_ps(xp),
-                    _mm256_loadu_ps(nx),
+                    unsafe { _mm256_loadu_ps(xp) },
+                    unsafe { _mm256_loadu_ps(nx) },
                 );
                 let t1 = _mm256_fmadd_ps(
                     _mm256_cvtepi32_ps(h0),
-                    _mm256_loadu_ps(xp.add(8)),
-                    _mm256_loadu_ps(nx.add(8)),
+                    unsafe { _mm256_loadu_ps(xp.add(8)) },
+                    unsafe { _mm256_loadu_ps(nx.add(8)) },
                 );
                 let t2 = _mm256_fmadd_ps(
                     _mm256_cvtepi32_ps(l1),
-                    _mm256_loadu_ps(xp.add(16)),
-                    _mm256_loadu_ps(nx.add(16)),
+                    unsafe { _mm256_loadu_ps(xp.add(16)) },
+                    unsafe { _mm256_loadu_ps(nx.add(16)) },
                 );
                 let t3 = _mm256_fmadd_ps(
                     _mm256_cvtepi32_ps(h1),
-                    _mm256_loadu_ps(xp.add(24)),
-                    _mm256_loadu_ps(nx.add(24)),
+                    unsafe { _mm256_loadu_ps(xp.add(24)) },
+                    unsafe { _mm256_loadu_ps(nx.add(24)) },
                 );
                 let s = _mm256_add_ps(_mm256_add_ps(t0, t1), _mm256_add_ps(t2, t3));
                 acc_all = _mm256_fmadd_ps(s, sc, acc_all);
