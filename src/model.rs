@@ -393,8 +393,10 @@ pub struct NpuExperts {
     /// per slot: gate_up nibbles, gate_up scales, down nibbles, down scales
     pub bufs: Vec<[usize; 4]>,
     pub group: usize,
-    // TODO: Add NPU device handle (OpenVINO/DirectML)
-    // pub npu: Arc<Mutex<NpuDevice>>,
+    // NPU device handle: D3D12CreateDevice refuses the Intel AI Boost NPU
+    // (0x887a0004). DirectML is blocked by the same driver limitation.
+    // OpenVINO runtime-linking infrastructure exists in the NPU tier but
+    // compute dispatch requires a working device handle from the OS.
 }
 
 /// Arena layout for one MoE batch, in floats: x at 0, the device accumulator
