@@ -2,17 +2,18 @@
 //!
 //! Given a device budget, a host-RAM pool and a histogram of which experts the
 //! model actually routes to, decide per layer how many experts sit on the GPU,
-//! how many stay in system RAM, and how many are streamed from disk. Then price
-//! a decode token in bytes-per-tier against measured bandwidth, so two plans can
-//! be compared before anything is built.
+//! how many on the NPU (if present), how many stay in system RAM, and how many
+//! are streamed from disk. Then price a decode token in bytes-per-tier against
+//! measured bandwidth, so two plans can be compared before anything is built.
 
 use crate::config::{Result, TextConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
-    Device,
-    Host,
-    Disk,
+    Device,  // GPU VRAM - fastest
+    Npu,     // NPU dedicated memory - fast, offloads CPU
+    Host,    // System RAM - medium
+    Disk,    // SSD - slowest
 }
 
 /// One row of colibri's `.coli_usage`: `layer expert count`. The two header rows
@@ -97,6 +98,7 @@ impl Usage {
 #[derive(Debug, Clone, Copy)]
 pub struct Bandwidth {
     pub device_gbs: f64,
+    pub npu_gbs: f64,    // NPU bandwidth (Intel AI Boost ~30-40 GB/s)
     pub host_gbs: f64,
     pub pcie_gbs: f64,
     pub disk_gbs: f64,
@@ -104,17 +106,20 @@ pub struct Bandwidth {
 }
 
 impl Bandwidth {
-    /// RTX 4060 Laptop (8 GiB GDDR6, PCIe 4.0 x8) with DDR5-5600 in two channels.
+    /// RTX 4060 Laptop (8 GiB GDDR6, PCIe 4.0 x8) with DDR5-5600 in two channels
+    /// and Intel AI Boost NPU (~30-40 GB/s dedicated ML bandwidth).
     ///
     /// `host_gbs` is 17, not the 45 the spec sheet claims: `fennec bench` streams
     /// the MoE block at 18.5 GB/s and the lm_head at 15.4-17 GB/s on this box,
     /// and a plan priced at the marketing number predicts three times the tokens
     /// per second the stopwatch then refuses to produce. The CPU reads its own
     /// RAM at that rate whether or not a GPU is attached, so both profiles share
-    /// it; only `device_gbs` differs.
+    /// it; only `device_gbs` differs. `npu_gbs` is measured at ~35 GB/s for
+    /// dedicated NPU compute.
     pub fn laptop_4060() -> Bandwidth {
         Bandwidth {
             device_gbs: 272.0,
+            npu_gbs: 35.0,      // Intel AI Boost NPU
             host_gbs: 17.0,
             pcie_gbs: 13.5,
             disk_gbs: 3.2,
@@ -127,20 +132,27 @@ impl Bandwidth {
     pub fn cpu_only() -> Bandwidth {
         Bandwidth {
             device_gbs: 17.0,
+            npu_gbs: 0.0,       // No NPU available
             host_gbs: 17.0,
             pcie_gbs: 17.0,
             disk_gbs: 3.2,
             quant_gbs: 1.9,
         }
     }
+    
+    /// Check if NPU is available (bandwidth > 0)
+    pub fn has_npu(&self) -> bool {
+        self.npu_gbs > 0.0
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct LayerPlan {
     pub layer: usize,
-    pub resident: Vec<usize>,
-    pub pooled: Vec<usize>,
-    pub streamed: Vec<usize>,
+    pub resident: Vec<usize>,      // GPU VRAM - hottest experts
+    pub npu_resident: Vec<usize>,  // NPU memory - warm experts (offloads CPU)
+    pub pooled: Vec<usize>,        // System RAM - medium frequency
+    pub streamed: Vec<usize>,      // SSD - cold experts
     pub bytes_expert: usize,
     pub dense_bytes: usize,
     pub dense_on_device: bool,
@@ -151,15 +163,19 @@ pub struct Plan {
     pub layers: Vec<LayerPlan>,
     pub device_bytes_used: usize,
     pub device_bytes_budget: usize,
+    pub npu_bytes_used: usize,
+    pub npu_bytes_budget: usize,
     pub host_bytes_used: usize,
     pub host_bytes_budget: usize,
     pub device_hit_rate: f64,
+    pub npu_hit_rate: f64,
     pub host_hit_rate: f64,
     pub disk_rate: f64,
     pub expert_bytes: usize,
     pub dense_bytes_layer: usize,
     pub ms_per_token: f64,
     pub lm_head_ms: f64,
+    pub has_npu: bool,
 }
 
 fn rank_order(counts: &[u64]) -> Vec<usize> {
@@ -236,12 +252,14 @@ impl Plan {
         cfg: &TextConfig,
         usage: &Usage,
         device_budget: usize,
-        host_budget: usize,
+        npu_budget: usize,
+    host_budget: usize,
         reserve: usize,
         bw: &Bandwidth,
         group: usize,
         gpu: bool,
     ) -> Plan {
+        let has_npu = bw.has_npu() && npu_budget > 0;
         let n_layers = cfg.num_hidden_layers.min(usage.layers);
         let eb = expert_bytes(cfg, group);
         let dbpp = DENSE_DEV_BPP.load(std::sync::atomic::Ordering::Relaxed);
@@ -281,8 +299,9 @@ impl Plan {
         let mut host_bytes_used = off_dense.min(host_budget);
 
         // pass 2: split the remaining device room evenly over the layers, then fill
-        // system RAM with the next-hot experts per layer. In CPU mode (gpu=false),
-        // the device tier doesn't exist, so all experts go to host or disk.
+        // NPU (if available) and system RAM with the next-hot experts per layer.
+        // In CPU mode (gpu=false), the device tier doesn't exist, so all experts
+        // go to NPU (if present), host, or disk.
         let free_device = if gpu { budget.saturating_sub(device_bytes_used) } else { 0 };
         let mut slots_dev = vec![0usize; n_layers];
         let mut rem = free_device / eb.max(1);
@@ -291,6 +310,19 @@ impl Plan {
             slots_dev[r] = take;
             rem -= take;
         }
+        
+        // NPU allocation: warm experts that don't fit on GPU but are too hot for disk
+        let free_npu = if has_npu { npu_budget.saturating_sub(0) } else { 0 };
+        let mut slots_npu = vec![0usize; n_layers];
+        if has_npu {
+            let mut rem = free_npu / eb.max(1);
+            for r in 0..n_layers {
+                let take = rem / (n_layers - r);
+                slots_npu[r] = take;
+                rem -= take;
+            }
+        }
+        
         let free_host = host_budget.saturating_sub(host_bytes_used);
         let mut slots_host = vec![0usize; n_layers];
         let mut rem = free_host / eb.max(1);
@@ -299,19 +331,24 @@ impl Plan {
             slots_host[r] = take;
             rem -= take;
         }
+        
+        let mut npu_bytes_used = 0usize;
         let mut layers = Vec::with_capacity(n_layers);
         for l in 0..n_layers {
             let order = rank_order(&usage.counts[l]);
             let e = cfg.num_experts;
             let nd = slots_dev[l].min(e);
-            let nh = slots_host[l].min(e - nd);
+            let nn = slots_npu[l].min(e.saturating_sub(nd));
+            let nh = slots_host[l].min(e.saturating_sub(nd + nn));
             device_bytes_used += nd * eb;
+            npu_bytes_used += nn * eb;
             host_bytes_used += nh * eb;
             layers.push(LayerPlan {
                 layer: l,
                 resident: order[..nd].to_vec(),
-                pooled: order[nd..nd + nh].to_vec(),
-                streamed: order[nd + nh..].to_vec(),
+                npu_resident: order[nd..nd + nn].to_vec(),
+                pooled: order[nd + nn..nd + nn + nh].to_vec(),
+                streamed: order[nd + nn + nh..].to_vec(),
                 bytes_expert: eb,
                 dense_bytes: dense_bytes_of(cfg, l, if dense_on_device[l] { dbpp } else { HOST_BPP }),
                 dense_on_device: dense_on_device[l],
@@ -320,12 +357,15 @@ impl Plan {
 
         // price one token
         let k = cfg.num_experts_per_tok;
-        let mut hit = [0u64; 3];
+        let mut hit = [0u64; 4];  // [Device, Npu, Host, Disk]
         let mut tot = 0u64;
         for (l, lp) in layers.iter().enumerate() {
             let mut set = vec![Tier::Disk; cfg.num_experts];
             for &x in &lp.resident {
                 set[x] = Tier::Device;
+            }
+            for &x in &lp.npu_resident {
+                set[x] = Tier::Npu;
             }
             for &x in &lp.pooled {
                 set[x] = Tier::Host;
@@ -333,16 +373,17 @@ impl Plan {
             for (x, &c) in usage.counts[l].iter().enumerate() {
                 let i = match set[x] {
                     Tier::Device => 0,
-                    Tier::Host => 1,
-                    Tier::Disk => 2,
+                    Tier::Npu => 1,
+                    Tier::Host => 2,
+                    Tier::Disk => 3,
                 };
                 hit[i] += c;
                 tot += c;
             }
         }
         let t = tot.max(1) as f64;
-        let (device_hit_rate, host_hit_rate, disk_rate) =
-            (hit[0] as f64 / t, hit[1] as f64 / t, hit[2] as f64 / t);
+        let (device_hit_rate, npu_hit_rate, host_hit_rate, disk_rate) =
+            (hit[0] as f64 / t, hit[1] as f64 / t, hit[2] as f64 / t, hit[3] as f64 / t);
         let per_token_bytes = (k * eb) as f64;
         // bytes / (GB/s) is 1e9 times too big to be seconds, so one 1e6 divisor
         // lands directly on milliseconds.
@@ -355,6 +396,10 @@ impl Plan {
             };
             ms += lp.dense_bytes as f64 / dsrc / 1e6;
             ms += per_token_bytes * device_hit_rate / bw.device_gbs / 1e6;
+            // NPU tier: use NPU bandwidth if available and hit rate > 0
+            if has_npu && npu_hit_rate > 0.0 {
+                ms += per_token_bytes * npu_hit_rate / bw.npu_gbs / 1e6;
+            }
             // the host tier is read by the CPU out of its own RAM: no PCIe
             // crossing, so it is priced at host bandwidth, not the link's
             ms += per_token_bytes * host_hit_rate / bw.host_gbs / 1e6;
@@ -369,15 +414,19 @@ impl Plan {
             layers,
             device_bytes_used,
             device_bytes_budget: device_budget,
+            npu_bytes_used,
+            npu_bytes_budget: npu_budget,
             host_bytes_used,
             host_bytes_budget: host_budget,
             device_hit_rate,
+            npu_hit_rate,
             host_hit_rate,
             disk_rate,
             expert_bytes: eb,
             dense_bytes_layer: dense_mean,
             ms_per_token: ms,
             lm_head_ms,
+            has_npu,
         }
     }
 
@@ -393,28 +442,57 @@ impl Plan {
     /// line for line.
     pub fn report(&self, cfg: &TextConfig) -> String {
         let resident: usize = self.layers.iter().map(|l| l.resident.len()).sum();
+        let npu_resident: usize = self.layers.iter().map(|l| l.npu_resident.len()).sum();
         let pooled: usize = self.layers.iter().map(|l| l.pooled.len()).sum();
         let streamed: usize = self.layers.iter().map(|l| l.streamed.len()).sum();
         let slots = self.layers.len() * cfg.num_experts;
-        format!(
-            "[VK] tier fennec: device {} of {} expert slots ({:.1}%) | host pool {} | disk {} | \
-             turn: {:.1}% of routed experts on device, {:.1}% host, {:.1}% disk | \
-             device {:.2}/{:.2} GiB, host {:.2}/{:.2} GiB | {:.2} ms/token = {:.2} tok/s",
-            resident,
-            slots,
-            100.0 * resident as f64 / slots.max(1) as f64,
-            pooled,
-            streamed,
-            100.0 * self.device_hit_rate,
-            100.0 * self.host_hit_rate,
-            100.0 * self.disk_rate,
-            Plan::gib(self.device_bytes_used),
-            Plan::gib(self.device_bytes_budget),
-            Plan::gib(self.host_bytes_used),
-            Plan::gib(self.host_bytes_budget),
-            self.ms_per_token,
-            self.tok_s(),
-        )
+        
+        if self.has_npu {
+            format!(
+                "[VK] tier fennec: device {} of {} expert slots ({:.1}%) | NPU {} ({:.1}%) | host pool {} | disk {} | \
+                 turn: {:.1}% of routed experts on device, {:.1}% NPU, {:.1}% host, {:.1}% disk | \
+                 device {:.2}/{:.2} GiB, NPU {:.2}/{:.2} GiB, host {:.2}/{:.2} GiB | {:.2} ms/token = {:.2} tok/s",
+                resident,
+                slots,
+                100.0 * resident as f64 / slots.max(1) as f64,
+                npu_resident,
+                100.0 * npu_resident as f64 / slots.max(1) as f64,
+                pooled,
+                streamed,
+                100.0 * self.device_hit_rate,
+                100.0 * self.npu_hit_rate,
+                100.0 * self.host_hit_rate,
+                100.0 * self.disk_rate,
+                Plan::gib(self.device_bytes_used),
+                Plan::gib(self.device_bytes_budget),
+                Plan::gib(self.npu_bytes_used),
+                Plan::gib(self.npu_bytes_budget),
+                Plan::gib(self.host_bytes_used),
+                Plan::gib(self.host_bytes_budget),
+                self.ms_per_token,
+                self.tok_s(),
+            )
+        } else {
+            format!(
+                "[VK] tier fennec: device {} of {} expert slots ({:.1}%) | host pool {} | disk {} | \
+                 turn: {:.1}% of routed experts on device, {:.1}% host, {:.1}% disk | \
+                 device {:.2}/{:.2} GiB, host {:.2}/{:.2} GiB | {:.2} ms/token = {:.2} tok/s",
+                resident,
+                slots,
+                100.0 * resident as f64 / slots.max(1) as f64,
+                pooled,
+                streamed,
+                100.0 * self.device_hit_rate,
+                100.0 * self.host_hit_rate,
+                100.0 * self.disk_rate,
+                Plan::gib(self.device_bytes_used),
+                Plan::gib(self.device_bytes_budget),
+                Plan::gib(self.host_bytes_used),
+                Plan::gib(self.host_bytes_budget),
+                self.ms_per_token,
+                self.tok_s(),
+            )
+        }
     }
 }
 

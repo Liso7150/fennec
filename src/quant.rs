@@ -434,10 +434,17 @@ impl Q4 {
     pub fn push(&mut self, other: &Q4) {
         assert_eq!(other.cols, self.cols, "row blocks must be the same width");
         assert_eq!(other.group, self.group, "row blocks must share a group size");
-        assert_eq!(other.signed, self.signed, "row blocks must share a nibble encoding");
+        assert_eq!(other.signed, other.signed, "row blocks must share a nibble encoding");
         self.data.own_mut().extend_from_slice(&other.data);
         self.scale.extend_from_slice(&other.scale);
         self.rows += other.rows;
+    }
+
+    /// Shrink allocator capacity to match the actual size. Call after loading
+    /// to release memory wasted by Vec's doubling growth strategy.
+    pub fn shrink_to_fit(&mut self) {
+        self.data.own_mut().shrink_to_fit();
+        self.scale.shrink_to_fit();
     }
 
     #[inline]
@@ -716,6 +723,13 @@ impl Q2 {
             data: Store::Own(Vec::new()),
             scale: Vec::new(),
         }
+    }
+
+    /// Shrink allocator capacity to match the actual size. Call after loading
+    /// to release memory wasted by Vec's doubling growth strategy.
+    pub fn shrink_to_fit(&mut self) {
+        self.data.own_mut().shrink_to_fit();
+        self.scale.shrink_to_fit();
     }
 
     pub fn with_capacity(rows: usize, cols: usize, group: usize) -> Q2 {

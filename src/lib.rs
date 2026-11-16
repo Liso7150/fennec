@@ -36,6 +36,7 @@ pub mod ort;
 pub mod plugin;
 pub mod plugins;
 pub mod pool;
+pub mod prefetch;
 pub mod prof;
 pub mod quant;
 pub mod safetensors;

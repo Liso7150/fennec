@@ -119,8 +119,12 @@ impl std::fmt::Display for PluginError {
 
 impl std::error::Error for PluginError {}
 
-/// Event handler function type.
+/// Event handler function type (observe-only).
 pub type EventHandler = Box<dyn Fn(&Event) + Send + Sync>;
+
+/// Intercept handler function type (can modify or pass through events).
+/// Returns the (possibly modified) event to continue the chain.
+pub type InterceptHandler = Box<dyn Fn(Event) -> Event + Send + Sync>;
 
 /// An event that can be emitted and observed by plugins.
 #[derive(Clone, Debug)]
@@ -129,6 +133,10 @@ pub struct Event {
     pub name: String,
     /// Event payload (type-erased).
     pub payload: Arc<dyn Any + Send + Sync>,
+    /// Whether this event has been marked as intercepted/blocked.
+    pub intercepted: bool,
+    /// Optional metadata for intercept handlers to attach.
+    pub metadata: HashMap<String, String>,
 }
 
 impl Event {
@@ -137,12 +145,36 @@ impl Event {
         Self {
             name: name.into(),
             payload: Arc::new(payload),
+            intercepted: false,
+            metadata: HashMap::new(),
         }
     }
 
     /// Get the payload as a specific type.
     pub fn payload<T: Any + 'static>(&self) -> Option<&T> {
         self.payload.downcast_ref::<T>()
+    }
+
+    /// Create a new event with a different payload (for intercept modifications).
+    pub fn with_payload<U: Any + Send + Sync + 'static>(self, payload: U) -> Self {
+        Self {
+            name: self.name,
+            payload: Arc::new(payload),
+            intercepted: self.intercepted,
+            metadata: self.metadata,
+        }
+    }
+
+    /// Mark this event as intercepted (blocks further processing).
+    pub fn mark_intercepted(mut self) -> Self {
+        self.intercepted = true;
+        self
+    }
+
+    /// Attach metadata to the event.
+    pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.metadata.insert(key.into(), value.into());
+        self
     }
 }
 
@@ -170,8 +202,10 @@ impl Effect {
 pub struct Context {
     /// Registered services (keyed by name).
     services: RwLock<HashMap<String, Arc<dyn Service>>>,
-    /// Event subscribers (keyed by event name).
+    /// Event subscribers (keyed by event name) — observe-only.
     subscribers: RwLock<HashMap<String, Vec<Arc<EventHandler>>>>,
+    /// Intercept handlers (keyed by event name) — can modify events.
+    interceptors: RwLock<HashMap<String, Vec<Arc<InterceptHandler>>>>,
     /// Active effects (for cleanup on unload).
     effects: Mutex<Vec<Effect>>,
     /// Loaded plugins (for dependency tracking).
@@ -184,6 +218,7 @@ impl Context {
         Self {
             services: RwLock::new(HashMap::new()),
             subscribers: RwLock::new(HashMap::new()),
+            interceptors: RwLock::new(HashMap::new()),
             effects: Mutex::new(Vec::new()),
             loaded_plugins: Mutex::new(Vec::new()),
         }
@@ -243,6 +278,41 @@ impl Context {
                 handler(&event);
             }
         }
+    }
+
+    /// Subscribe to an event as an intercept handler (can modify the event).
+    /// Intercept handlers run in registration order before observe-only subscribers.
+    pub fn on_intercept<F>(
+        &self,
+        event_name: impl Into<String>,
+        handler: F,
+    ) -> Result<(), PluginError>
+    where
+        F: Fn(Event) -> Event + Send + Sync + 'static,
+    {
+        let event_name = event_name.into();
+        let mut interceptors = self.interceptors.write().unwrap();
+        let handlers = interceptors.entry(event_name).or_insert_with(Vec::new);
+        handlers.push(Arc::new(Box::new(handler)));
+        Ok(())
+    }
+
+    /// Emit an event through the intercept chain, then to observe-only subscribers.
+    /// Returns the (possibly modified) event after all intercept handlers have run.
+    /// If the event is marked as intercepted, observe-only subscribers are still notified.
+    pub fn emit_intercept(&self, event: Event) -> Event {
+        let mut current = event;
+
+        let interceptors = self.interceptors.read().unwrap();
+        if let Some(handlers) = interceptors.get(&current.name) {
+            for handler in handlers {
+                current = handler(current);
+            }
+        }
+        drop(interceptors);
+
+        self.emit(current.clone());
+        current
     }
 
     /// Register a reversible effect.
@@ -409,5 +479,61 @@ mod tests {
 
         ctx.emit(Event::new("test/event", ()));
         assert!(*received.lock().unwrap());
+    }
+
+    #[test]
+    fn test_intercept_modifies_event() {
+        let ctx = Context::new();
+
+        ctx.on_intercept("test/intercept", |mut event| {
+            event = event.with_metadata("modified_by", "interceptor");
+            event
+        })
+        .unwrap();
+
+        let received_meta = Arc::new(Mutex::new(None));
+        let received_clone = received_meta.clone();
+
+        ctx.on("test/intercept", move |event| {
+            let val = event.metadata.get("modified_by").cloned();
+            let mut r = received_clone.lock().unwrap();
+            *r = val;
+        })
+        .unwrap();
+
+        let result = ctx.emit_intercept(Event::new("test/intercept", ()));
+        assert_eq!(
+            result.metadata.get("modified_by").map(|s| s.as_str()),
+            Some("interceptor")
+        );
+        assert_eq!(
+            received_meta.lock().unwrap().as_deref(),
+            Some("interceptor")
+        );
+    }
+
+    #[test]
+    fn test_intercept_chain_order() {
+        let ctx = Context::new();
+        let order = Arc::new(Mutex::new(Vec::new()));
+
+        let o1 = order.clone();
+        ctx.on_intercept("test/chain", move |event| {
+            o1.lock().unwrap().push(1);
+            event.with_metadata("step", "1")
+        })
+        .unwrap();
+
+        let o2 = order.clone();
+        ctx.on_intercept("test/chain", move |event| {
+            o2.lock().unwrap().push(2);
+            let prev = event.metadata.get("step").cloned().unwrap_or_default();
+            event.with_metadata("step", format!("{},2", prev))
+        })
+        .unwrap();
+
+        let result = ctx.emit_intercept(Event::new("test/chain", ()));
+        assert_eq!(*order.lock().unwrap(), vec![1, 2]);
+        assert_eq!(result.metadata.get("step").map(|s| s.as_str()), Some("1,2"));
     }
 }

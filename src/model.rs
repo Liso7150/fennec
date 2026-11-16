@@ -385,6 +385,18 @@ pub struct DevExperts {
     pub shared: Option<[usize; 3]>,
 }
 
+/// The NPU tier of one layer: warm experts that live in dedicated NPU memory
+/// (Intel AI Boost or similar). Runs int4 GEMV on the NPU, offloading CPU work.
+pub struct NpuExperts {
+    /// expert id -> NPU slot, or -1
+    pub slot: Vec<i32>,
+    /// per slot: gate_up nibbles, gate_up scales, down nibbles, down scales
+    pub bufs: Vec<[usize; 4]>,
+    pub group: usize,
+    // TODO: Add NPU device handle (OpenVINO/DirectML)
+    // pub npu: Arc<Mutex<NpuDevice>>,
+}
+
 /// Arena layout for one MoE batch, in floats: x at 0, the device accumulator
 /// next, then a disjoint gate_up / hidden / out block per routed pick so all k
 /// experts can be in flight in one command buffer. Returns (acc, base, stride).
@@ -579,11 +591,13 @@ pub struct MoeLayer {
     pub slot: Vec<i32>,
     pub stream: Option<Mutex<Stream>>,
     pub dev: Option<DevExperts>,
+    pub npu: Option<NpuExperts>,  // NPU tier: warm experts offloaded from CPU
     pub threads: usize,
     /// Routed picks answered by each tier, and the CPU milliseconds spent on the
     /// host and disk tiers while a device batch was in flight. The overlap is
     /// the claim the split exists for, so it gets counted rather than asserted.
     pub dev_hits: AtomicU64,
+    pub npu_hits: AtomicU64,
     pub host_hits: AtomicU64,
     pub disk_hits: AtomicU64,
     pub overlap_ns: AtomicU64,
@@ -694,8 +708,10 @@ impl MoeLayer {
             slot,
             stream: stream.map(Mutex::new),
             dev: None,
+            npu: None,
             threads: threads.max(1),
             dev_hits: AtomicU64::new(0),
+            npu_hits: AtomicU64::new(0),
             host_hits: AtomicU64::new(0),
             disk_hits: AtomicU64::new(0),
             overlap_ns: AtomicU64::new(0),
@@ -738,8 +754,10 @@ impl MoeLayer {
             slot,
             stream: None,
             dev: None,
+            npu: None,
             threads: threads.max(1),
             dev_hits: AtomicU64::new(0),
+            npu_hits: AtomicU64::new(0),
             host_hits: AtomicU64::new(0),
             disk_hits: AtomicU64::new(0),
             overlap_ns: AtomicU64::new(0),
@@ -1091,11 +1109,14 @@ impl MoeLayer {
         let (h, i) = (self.cfg.hidden_size, self.cfg.moe_intermediate_size);
         let k = r.ids.len();
         let mut parts: Vec<Vec<f32>> = vec![Vec::new(); k];
-        let (mut dev_picks, mut host_picks, mut cold) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut dev_picks, mut npu_picks, mut host_picks, mut cold) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for n in 0..k {
             let id = r.ids[n];
             if self.dev.as_ref().is_some_and(|d| d.slot[id] >= 0) {
                 dev_picks.push(n);
+            } else if self.npu.as_ref().is_some_and(|npu| npu.slot[id] >= 0) {
+                npu_picks.push(n);
             } else if self.slot[id] >= 0 {
                 host_picks.push(n);
             } else {
@@ -1104,12 +1125,15 @@ impl MoeLayer {
         }
         let mut dev_out = vec![0f32; h];
         self.dev_hits.fetch_add(dev_picks.len() as u64, Relaxed);
+        self.npu_hits.fetch_add(npu_picks.len() as u64, Relaxed);
         self.host_hits.fetch_add(host_picks.len() as u64, Relaxed);
         self.disk_hits.fetch_add(cold.len() as u64, Relaxed);
         let dev_shared = self.dev.as_ref().and_then(|d| d.shared);
         // The sigmoid gate is 2048 f32 MACs on the host; computing it here lets
         // the shared expert's axpy ride in the same batch as the routed picks.
         let shared_gate = kernel::sigmoid(kernel::dot(&self.s_egate, x));
+        // NPU compute not yet implemented: route NPU picks through host path
+        host_picks.extend_from_slice(&npu_picks);
         if dev_picks.is_empty() && dev_shared.is_none() {
             let _t = prof::start(prof::MOE_CPU);
             self.cpu_picks(x, &r, &host_picks, &cold, &mut parts);
@@ -1721,6 +1745,8 @@ pub fn gather_experts(
             gu.push(&sc.rows(&gi, e * 2 * i, (e + 1) * 2 * i)?);
             dn.push(&sc.rows(&di, e * h, (e + 1) * h)?);
         }
+        gu.shrink_to_fit();
+        dn.shrink_to_fit();
         return Ok((gu, dn));
     }
     if sh.contains(&format!("{p}.0.merged_weight")) {
@@ -1742,6 +1768,8 @@ pub fn gather_experts(
             gu.push(&g);
             dn.push(&d);
         }
+        gu.shrink_to_fit();
+        dn.shrink_to_fit();
         return Ok((gu, dn));
     }
     for &e in ids {
@@ -1750,6 +1778,10 @@ pub fn gather_experts(
         let d = sh.slice_f32(&dn_name, e * h * i, (e + 1) * h * i)?;
         dn.push(&Q4::quantize(&d, h, i, group, threads));
     }
+    // Shrink to fit: release memory wasted by Vec's doubling growth strategy.
+    // This is automatic memory management so the user never needs to clean up RAM by hand.
+    gu.shrink_to_fit();
+    dn.shrink_to_fit();
     Ok((gu, dn))
 }
 
@@ -3131,9 +3163,16 @@ impl Model {
         let t_host = std::time::Instant::now();
         for lp in &plan.layers {
             let ids: Vec<usize> = if gpu.is_some() {
-                lp.pooled.clone()
+                // GPU path: load host + NPU experts (NPU falls back to CPU)
+                lp.pooled.iter().chain(&lp.npu_resident).copied().collect()
             } else {
-                lp.resident.iter().chain(&lp.pooled).copied().collect()
+                // CPU-only path: load device + host + NPU experts
+                lp.resident
+                    .iter()
+                    .chain(&lp.pooled)
+                    .chain(&lp.npu_resident)
+                    .copied()
+                    .collect()
             };
             let stream = if lp.streamed.is_empty() || stream_slots == 0 {
                 None

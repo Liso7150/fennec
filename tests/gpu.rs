@@ -421,6 +421,7 @@ fn a_planned_stack_splits_one_token_across_cpu_and_device() {
         layers: vec![LayerPlan {
             layer: 0,
             resident,
+            npu_resident: Vec::new(),
             pooled,
             streamed: Vec::new(),
             bytes_expert: 0,
@@ -429,15 +430,19 @@ fn a_planned_stack_splits_one_token_across_cpu_and_device() {
         }],
         device_bytes_used: 0,
         device_bytes_budget: 0,
+        npu_bytes_used: 0,
+        npu_bytes_budget: 0,
         host_bytes_used: 0,
         host_bytes_budget: 0,
         device_hit_rate: 0.0,
+        npu_hit_rate: 0.0,
         host_hit_rate: 0.0,
         disk_rate: 0.0,
         expert_bytes: 0,
         dense_bytes_layer: 0,
         ms_per_token: 0.0,
         lm_head_ms: 0.0,
+        has_npu: false,
     };
 
     let cpu = Model::load_plan(
@@ -532,6 +537,7 @@ fn dense_projections_on_the_device_match_the_cpu_stack() {
             .map(|&l| LayerPlan {
                 layer: l,
                 resident: Vec::new(),
+                npu_resident: Vec::new(),
                 pooled: all.clone(),
                 streamed: Vec::new(),
                 bytes_expert: 0,
@@ -541,15 +547,19 @@ fn dense_projections_on_the_device_match_the_cpu_stack() {
             .collect(),
         device_bytes_used: 0,
         device_bytes_budget: 0,
+        npu_bytes_used: 0,
+        npu_bytes_budget: 0,
         host_bytes_used: 0,
         host_bytes_budget: 0,
         device_hit_rate: 0.0,
+        npu_hit_rate: 0.0,
         host_hit_rate: 0.0,
         disk_rate: 0.0,
         expert_bytes: 0,
         dense_bytes_layer: 0,
         ms_per_token: 0.0,
         lm_head_ms: 0.0,
+        has_npu: false,
     };
 
     let cpu = Model::load_plan(&sh, cfg.clone(), &plan_of(false), group, threads, 8, 0, None)
@@ -626,6 +636,7 @@ fn fused_mixer_matches_the_cpu_mixer_and_its_state() {
         layers: vec![LayerPlan {
             layer: 0,
             resident: Vec::new(),
+            npu_resident: Vec::new(),
             pooled: all.clone(),
             streamed: Vec::new(),
             bytes_expert: 0,
@@ -634,15 +645,19 @@ fn fused_mixer_matches_the_cpu_mixer_and_its_state() {
         }],
         device_bytes_used: 0,
         device_bytes_budget: 0,
+        npu_bytes_used: 0,
+        npu_bytes_budget: 0,
         host_bytes_used: 0,
         host_bytes_budget: 0,
         device_hit_rate: 0.0,
+        npu_hit_rate: 0.0,
         host_hit_rate: 0.0,
         disk_rate: 0.0,
         expert_bytes: 0,
         dense_bytes_layer: 0,
         ms_per_token: 0.0,
         lm_head_ms: 0.0,
+        has_npu: false,
     };
     let cpu = Model::load_plan(&sh, cfg.clone(), &plan_of(false), group, threads, 8, 0, None).expect("cpu stack");
     let gpu = Arc::new(Mutex::new(g));
@@ -1562,6 +1577,7 @@ fn the_batched_device_prefill_is_the_token_loop() {
                 .map(|&l| LayerPlan {
                     layer: l,
                     resident: Vec::new(),
+                    npu_resident: Vec::new(),
                     pooled: all.clone(),
                     streamed: Vec::new(),
                     bytes_expert: 0,
@@ -1571,15 +1587,19 @@ fn the_batched_device_prefill_is_the_token_loop() {
                 .collect(),
             device_bytes_used: 0,
             device_bytes_budget: 0,
+            npu_bytes_used: 0,
+            npu_bytes_budget: 0,
             host_bytes_used: 0,
             host_bytes_budget: 0,
             device_hit_rate: 0.0,
+            npu_hit_rate: 0.0,
             host_hit_rate: 0.0,
             disk_rate: 0.0,
             expert_bytes: 0,
             dense_bytes_layer: 0,
             ms_per_token: 0.0,
             lm_head_ms: 0.0,
+            has_npu: false,
         };
         let dev = Model::load_plan(&sh, cfg.clone(), &plan, group, threads, 8, 0, Some(gpu.clone()))
             .expect("device stack");

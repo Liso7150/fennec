@@ -1220,16 +1220,17 @@ impl VkGpu {
 
     fn set(&mut self, bufs: [usize; 4]) -> Result<Handle> {
         unsafe {
+            let mut set: Handle = std::ptr::null_mut();
+            let layout = self.set_layout;
             let dsai = DescriptorSetAllocateInfo {
                 s_type: ST_DESCRIPTOR_SET_ALLOCATE_INFO,
                 p_next: std::ptr::null(),
                 pool: self.pool,
                 count: 1,
-                layouts: &self.set_layout,
+                layouts: &layout,
             };
-            let mut set: Handle = std::ptr::null_mut();
             if (self.api.allocate_sets)(self.device, &dsai, &mut set) != 0 {
-                return Err("descriptor pool exhausted".into());
+                return Err("descriptor set allocation failed".into());
             }
             let mut infos: Vec<DescriptorBufferInfo> = bufs
                 .iter()

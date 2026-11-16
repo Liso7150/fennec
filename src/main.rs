@@ -472,6 +472,16 @@ fn default_device_gib(opts: &Opts) -> f64 {
     }
 }
 
+/// The NPU budget: dedicated ML accelerator memory (Intel AI Boost ~4 GiB).
+/// Returns 0 if NPU is not available or not wanted.
+fn npu_gib(opts: &Opts, bw: &Bandwidth) -> f64 {
+    if !bw.has_npu() {
+        return 0.0;
+    }
+    // Default NPU budget: 4 GiB for Intel AI Boost class devices
+    opts.num("npu", 4.0)
+}
+
 fn setup(opts: &Opts, cfg: &Arc<TextConfig>, group: usize) -> Result<Setup, String> {
     let gpu = gpu_wanted(opts);
     let device_gib = if opts.has("device") { opts.num("device", 8.0) } else { default_device_gib(opts) };
@@ -500,6 +510,7 @@ fn setup(opts: &Opts, cfg: &Arc<TextConfig>, group: usize) -> Result<Setup, Stri
     } else {
         Bandwidth::laptop_4060()
     };
+    let npu = (npu_gib(opts, &bw) * 2f64.powi(30)) as usize;
     let usage = if !cfg.is_moe() {
         // A dense checkpoint routes nothing, so there is no histogram to look
         // for and nothing to warn about when none is found: the plan's expert
@@ -526,7 +537,7 @@ fn setup(opts: &Opts, cfg: &Arc<TextConfig>, group: usize) -> Result<Setup, Stri
             }
         }
     };
-    let plan = Plan::build(cfg, &usage, device, host, reserve, &bw, group, gpu);
+    let plan = Plan::build(cfg, &usage, device, npu, host, reserve, &bw, group, gpu);
     Ok(Setup { plan, bw, usage })
 }
 
@@ -536,17 +547,19 @@ fn plan(opts: &Opts) -> Result<(), String> {
     let s = setup(opts, &cfg, group)?;
     let (plan, bw, usage) = (s.plan, s.bw, s.usage);
     let host = (host_gb(opts) * 2f64.powi(30)) as usize;
+    let npu = (npu_gib(opts, &bw) * 2f64.powi(30)) as usize;
     println!("{}", plan.report(&cfg));
     println!(
-        "  dense {:.1} MiB/layer | FQ4 expert {:.1} MiB | lm_head {:.2} ms | tiers device {:.1} / PCIe {:.1} / disk {:.1} GB/s",
+        "  dense {:.1} MiB/layer | FQ4 expert {:.1} MiB | lm_head {:.2} ms | tiers device {:.1} / NPU {:.1} / PCIe {:.1} / disk {:.1} GB/s",
         mib(plan.dense_bytes_layer),
         mib(plan.expert_bytes),
         plan.lm_head_ms,
         bw.device_gbs,
+        bw.npu_gbs,
         bw.pcie_gbs,
         bw.disk_gbs
     );
-    let ideal = Plan::build(&cfg, &usage, usize::MAX / 8, host, 0, &bw, group, gpu_wanted(opts));
+    let ideal = Plan::build(&cfg, &usage, usize::MAX / 8, npu, host, 0, &bw, group, gpu_wanted(opts));
     println!(
         "  upper bound, every expert resident: {:.2} tok/s | histogram: {} selections over {} layers x {}",
         ideal.tok_s(),
@@ -1384,13 +1397,19 @@ fn load_engine(opts: &Opts, threads: usize) -> Result<Engine, String> {
         .iter()
         .map(|l| l.moe.as_ref().map_or(0, |x| x.dev.as_ref().map_or(0, |d| d.bufs.len())))
         .sum();
-    let pooled: usize = s.plan.layers.iter().map(|l| l.pooled.len()).sum();
+    let pooled: usize = s
+        .plan
+        .layers
+        .iter()
+        .map(|l| l.pooled.len() + l.npu_resident.len())
+        .sum();
     // A dense stack routes nothing, so the expert counts would only ever read
     // zero; say what the layer actually holds instead.
     if m.cfg.is_moe() {
         eprintln!(
             "[fennec] {} layers, {on_dev} experts in VRAM, {pooled} in RAM, loaded in {:.1} s",
-            m.layers.len(), t0.elapsed().as_secs_f64()
+            m.layers.len(),
+            t0.elapsed().as_secs_f64()
         );
     } else {
         eprintln!(
