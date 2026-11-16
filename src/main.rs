@@ -358,7 +358,7 @@ fn host_gb(opts: &Opts) -> f64 {
     }
     env_name("FENNEC_VK_TIER_HOST_GB")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(5.0)
+        .unwrap_or(8.0)  // Increased from 5.0 to balance memory and performance
 }
 
 /// `--gpu` turns the device tier into real VRAM; `--gpu N` picks the ranked
@@ -487,17 +487,26 @@ fn setup(opts: &Opts, cfg: &Arc<TextConfig>, group: usize) -> Result<Setup, Stri
     let device_gib = if opts.has("device") { opts.num("device", 8.0) } else { default_device_gib(opts) };
     let device = (device_gib * 2f64.powi(30)) as usize;
     let mut host = (host_gb(opts) * 2f64.powi(30)) as usize;
-    // A host pool larger than the RAM the box can actually keep resident is not
-    // a memory tier, it is a disk tier with extra page faults: every "resident"
-    // pick faults a trimmed page back from the file. Cap the budget to available
-    // physical memory less headroom for the OS, the dense trunk, the KV cache and
-    // the device staging, so a busy box streams cold experts on purpose instead
-    // of thrashing. `0` means the platform does not expose it; leave the budget.
-    let avail = fennec::mem::available_bytes();
-    if avail > 0 {
-        let headroom = 3u64 << 30;
-        host = host.min(avail.saturating_sub(headroom) as usize);
+    
+    // Strict memory limit: if --max-memory-gb is set, enforce it absolutely
+    if let Some(max_gb) = opts.str("max-memory-gb").and_then(|v| v.parse::<f64>().ok()) {
+        let max_bytes = (max_gb * 2f64.powi(30)) as usize;
+        host = host.min(max_bytes);
+        eprintln!("[fennec] strict memory limit: {:.1} GB", max_gb);
+    } else {
+        // A host pool larger than the RAM the box can actually keep resident is not
+        // a memory tier, it is a disk tier with extra page faults: every "resident"
+        // pick faults a trimmed page back from the file. Cap the budget to available
+        // physical memory less headroom for the OS, the dense trunk, the KV cache and
+        // the device staging, so a busy box streams cold experts on purpose instead
+        // of thrashing. `0` means the platform does not expose it; leave the budget.
+        let avail = fennec::mem::available_bytes();
+        if avail > 0 {
+            let headroom = 3u64 << 30;
+            host = host.min(avail.saturating_sub(headroom) as usize);
+        }
     }
+    
     let mut reserve = (opts.num("reserve", 0.5) * 2f64.powi(30)) as usize;
     if gpu {
         // the lm_head is parked in VRAM whole, and the upload path needs its
