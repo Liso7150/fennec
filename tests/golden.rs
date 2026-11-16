@@ -337,7 +337,7 @@ fn moe_from_fixtures(c: Arc<TextConfig>) -> MoeLayer {
     let (dn_rows, dn_cols) = dn_n.as2();
     let gu = Q4::quantize(&f32s(&gu_n.data), gu_rows, gu_cols, 32, 4);
     let dn = Q4::quantize(&f32s(&dn_n.data), dn_rows, dn_cols, 32, 4);
-    MoeLayer::from_parts(c, parts, gu, dn, 1)
+    MoeLayer::from_parts(c, 0, parts, gu, dn, 1)
 }
 
 #[test]

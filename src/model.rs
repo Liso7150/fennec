@@ -567,6 +567,8 @@ fn put_set(g: &mut Gpu, sh: &Shards, names: &[String]) -> Result<Option<Vec<usiz
 /// int4 grouped experts.
 pub struct MoeLayer {
     pub cfg: Arc<TextConfig>,
+    /// Layer index in the model, used for prefetcher cache keys.
+    pub layer: usize,
     pub gate: Dense,
     pub s_gate: Dense,
     pub s_up: Dense,
@@ -592,6 +594,10 @@ pub struct MoeLayer {
     /// eight times a token.
     pub slot: Vec<i32>,
     pub stream: Option<Mutex<Stream>>,
+    /// Shared prefetcher cache for cold experts. When present, the disk path
+    /// checks here before loading from shards, and the forward pass hints it
+    /// with the next layer's cold experts.
+    pub prefetcher: Option<Arc<crate::prefetch::Prefetcher>>,
     pub dev: Option<DevExperts>,
     pub npu: Option<NpuExperts>,  // NPU tier: warm experts offloaded from CPU
     pub threads: usize,
@@ -696,6 +702,7 @@ impl MoeLayer {
         
         Ok(MoeLayer {
             cfg,
+            layer,
             gate,
             s_gate,
             s_up,
@@ -709,6 +716,7 @@ impl MoeLayer {
             ids,
             slot,
             stream: stream.map(Mutex::new),
+            prefetcher: None,
             dev: None,
             npu: None,
             threads: threads.max(1),
@@ -720,7 +728,7 @@ impl MoeLayer {
         })
     }
 
-    pub fn from_parts(cfg: Arc<TextConfig>, parts: MoeParts, gu: Q4, dn: Q4, threads: usize) -> MoeLayer {
+    pub fn from_parts(cfg: Arc<TextConfig>, layer: usize, parts: MoeParts, gu: Q4, dn: Q4, threads: usize) -> MoeLayer {
         // the matrices carry the resident set: gu.rows / 2I experts, ids 0..n
         let ids: Vec<usize> = (0..gu.rows / (2 * cfg.moe_intermediate_size)).collect();
         let mut slot = vec![-1i32; cfg.num_experts];
@@ -742,6 +750,7 @@ impl MoeLayer {
         
         MoeLayer {
             cfg,
+            layer,
             gate: parts.gate,
             s_gate: parts.s_gate,
             s_up: parts.s_up,
@@ -755,6 +764,7 @@ impl MoeLayer {
             ids,
             slot,
             stream: None,
+            prefetcher: None,
             dev: None,
             npu: None,
             threads: threads.max(1),
@@ -990,6 +1000,12 @@ impl MoeLayer {
     fn cpu_picks(&self, x: &[f32], r: &Routing, host: &[usize], cold: &[usize], parts: &mut [Vec<f32>]) {
         let (h, i) = (self.cfg.hidden_size, self.cfg.moe_intermediate_size);
         if !cold.is_empty() {
+            // Hint the prefetcher with this layer's cold experts so the next
+            // layer's loads may already be in cache.
+            if let Some(pf) = &self.prefetcher {
+                let cold_ids: Vec<usize> = cold.iter().map(|&n| r.ids[n]).collect();
+                pf.prefetch_next_layer(self.layer, &cold_ids);
+            }
             let mut pool = self
                 .stream
                 .as_ref()
@@ -1001,8 +1017,21 @@ impl MoeLayer {
                 let mut hh = vec![0f32; i];
                 let mut y = vec![0f32; h];
                 let mut part = vec![0f32; h];
-                pool.with(id, |gu, dn| expert_in(gu, dn, i, h, 0, x, &mut hh, &mut y))
-                    .unwrap_or_else(|e| panic!("streamed expert {id}: {e}"));
+                // Check the prefetcher cache before hitting the disk pool.
+                let loaded = if let Some(pf) = &self.prefetcher {
+                    if let Some(cached) = pf.get_cached(self.layer, id) {
+                        expert_in(&cached.gate_up, &cached.down, i, h, 0, x, &mut hh, &mut y);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if !loaded {
+                    pool.with(id, |gu, dn| expert_in(gu, dn, i, h, 0, x, &mut hh, &mut y))
+                        .unwrap_or_else(|e| panic!("streamed expert {id}: {e}"));
+                }
                 kernel::axpy(&mut part, &y, w);
                 parts[n] = part;
             }
@@ -1313,6 +1342,11 @@ impl MoeLayer {
             self.host_hits
                 .fetch_add((n * k - cold.len()) as u64, Relaxed);
             if !cold.is_empty() {
+                // Hint the prefetcher with this layer's cold experts.
+                if let Some(pf) = &self.prefetcher {
+                    let cold_ids: Vec<usize> = cold.iter().map(|&q| ids[q]).collect();
+                    pf.prefetch_next_layer(self.layer, &cold_ids);
+                }
                 let mut pool = self
                     .stream
                     .as_ref()
@@ -1323,10 +1357,23 @@ impl MoeLayer {
                 let mut y = vec![0f32; h];
                 for &q in &cold {
                     let (id, w, r) = (ids[q], wts[q], q / k);
-                    pool.with(id, |gu, dn| {
-                        expert_in(gu, dn, i, h, 0, &xs[r * h..(r + 1) * h], &mut hh, &mut y)
-                    })
-                    .unwrap_or_else(|er| panic!("streamed expert {id}: {er}"));
+                    // Check the prefetcher cache before hitting the disk pool.
+                    let loaded = if let Some(pf) = &self.prefetcher {
+                        if let Some(cached) = pf.get_cached(self.layer, id) {
+                            expert_in(&cached.gate_up, &cached.down, i, h, 0, &xs[r * h..(r + 1) * h], &mut hh, &mut y);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if !loaded {
+                        pool.with(id, |gu, dn| {
+                            expert_in(gu, dn, i, h, 0, &xs[r * h..(r + 1) * h], &mut hh, &mut y)
+                        })
+                        .unwrap_or_else(|er| panic!("streamed expert {id}: {er}"));
+                    }
                     kernel::axpy(&mut parts[q * h..(q + 1) * h], &y, w);
                 }
             }
@@ -1459,13 +1506,31 @@ impl MoeLayer {
         
         // Process cold experts (disk-streamed)
         if !cold.is_empty() {
+            // Hint the prefetcher with this layer's cold experts.
+            if let Some(pf) = &self.prefetcher {
+                let cold_ids: Vec<usize> = cold.iter().map(|&(_tok, _pick, id, _w)| id).collect();
+                pf.prefetch_next_layer(self.layer, &cold_ids);
+            }
             let mut pool = self.stream.as_ref().unwrap().lock().unwrap();
             let mut hh = vec![0f32; i];
             let mut y = vec![0f32; h];
             for &(token_idx, pick_idx, id, w) in &cold {
                 let x = &xs[token_idx * h..(token_idx + 1) * h];
-                pool.with(id, |gu, dn| expert_in(gu, dn, i, h, 0, x, &mut hh, &mut y))
-                    .unwrap_or_else(|er| panic!("streamed expert {id}: {er}"));
+                // Check the prefetcher cache before hitting the disk pool.
+                let loaded = if let Some(pf) = &self.prefetcher {
+                    if let Some(cached) = pf.get_cached(self.layer, id) {
+                        expert_in(&cached.gate_up, &cached.down, i, h, 0, x, &mut hh, &mut y);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if !loaded {
+                    pool.with(id, |gu, dn| expert_in(gu, dn, i, h, 0, x, &mut hh, &mut y))
+                        .unwrap_or_else(|er| panic!("streamed expert {id}: {er}"));
+                }
                 let out = &mut parts[(token_idx * k + pick_idx) * h..(token_idx * k + pick_idx + 1) * h];
                 kernel::axpy(out, &y, w);
             }
@@ -3121,6 +3186,10 @@ pub struct Model {
     /// selected. `None` keeps the device or blocked-CPU head path.
     #[cfg(feature = "ort")]
     pub ort_head: Option<crate::ort::OrtDense>,
+    /// Background prefetcher for cold experts. When present, layers check its
+    /// cache before hitting the disk pool, and hint it with the next layer's
+    /// cold experts after each forward pass.
+    pub prefetcher: Option<Arc<crate::prefetch::Prefetcher>>,
 }
 
 impl Model {
@@ -3197,7 +3266,31 @@ impl Model {
         crate::mem::report("host pool");
         let first = plan.layers.first().map(|lp| lp.layer).unwrap_or(0);
         let t_finish = std::time::Instant::now();
-        let mut model = Model::finish(sh, cfg, first, layers, threads)?;
+        let mut model = Model::finish(sh, cfg.clone(), first, layers, threads)?;
+        // Start the prefetcher when any layer has streamed (cold) experts.
+        // The cache holds one layer's worth of cold experts: overlapping disk
+        // reads with the compute of the current layer.
+        let has_streamed = plan.layers.iter().any(|lp| !lp.streamed.is_empty());
+        if has_streamed && stream_slots > 0 {
+            let cache_bytes = stream_slots * 20 * 1024 * 1024;
+            model.prefetcher = Some(Arc::new(crate::prefetch::Prefetcher::start(
+                cache_bytes,
+                sh.clone(),
+                cfg.clone(),
+                group,
+                threads,
+            )));
+            eprintln!("[fennec] prefetcher started with {} MiB cache", cache_bytes / 1024 / 1024);
+            // Share the prefetcher with every layer's MoE so cold-expert loads
+            // can check the cache before hitting the disk pool.
+            if let Some(pf) = &model.prefetcher {
+                for layer in &mut model.layers {
+                    if let Some(moe) = &mut layer.moe {
+                        moe.prefetcher = Some(pf.clone());
+                    }
+                }
+            }
+        }
         let finish_ms = t_finish.elapsed().as_secs_f64() * 1e3;
         crate::mem::report("dense+embed");
         let (mut head_ms, mut dev_ms) = (0.0, 0.0);
@@ -3332,6 +3425,7 @@ impl Model {
             head_i8: None,
             #[cfg(feature = "ort")]
             ort_head: None,
+            prefetcher: None,
         })
     }
 
