@@ -270,6 +270,14 @@ impl Server {
         for t in first..end {
             let mut x = model.embed_row(&self.shards, ids[t] as usize)?;
             model.forward(&mut x, &mut st, t);
+            // Only the chunked arm has a phase boundary of its own: a prompt run
+            // token by token would otherwise leave every prompt stage in the
+            // decode counters, and `prompt` would mean two different things in
+            // the two profiles being compared. One token short, same as
+            // `split(first)` above.
+            if !batched && t + 2 == prompt_len {
+                crate::prof::split(t + 1);
+            }
             if t + 1 < ids.len() {
                 continue;
             }

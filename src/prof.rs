@@ -182,6 +182,19 @@ pub fn report(wall_ms: f64) -> String {
     if let Some(line) = prompt_line() {
         out.push_str(&line);
         out.push('\n');
+        // The line above says the prompt is slow; only the stages say which one.
+        // A chunked prefill and a token loop can total the same and disagree
+        // stage by stage, and that difference is the whole measurement.
+        let (pms, tokens) = prompt_millis();
+        let psum: f64 = pms.iter().sum();
+        out.push_str(&format!(
+            "  prompt stage breakdown (ms/token, {} prompt tokens):\n",
+            tokens
+        ));
+        for (name, v) in STAGES.iter().zip(&pms) {
+            out.push_str(&format!("    {name:<20} {:7.3}  {:5.1}%\n", v / tokens as f64, 100.0 * v / psum.max(1e-9)));
+        }
+        out.push_str(&format!("    {:<20} {:7.3}\n", "accounted", psum / tokens as f64));
     }
     out
 }
