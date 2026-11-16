@@ -2,14 +2,14 @@
 
 **A high-performance LLM inference engine written in Rust, supporting Qwen3.5-MoE and Edge0-145B models with Vulkan, CUDA, Metal, and ONNX Runtime backends.**
 
-Fennec replaces multiple inference engines with one codebase: raw Vulkan through `vulkan-1.dll`, CUDA through the driver API with hand-written PTX, Metal via MoltenVK, and ONNX Runtime for portability. Features int4 quantization, three-tier expert routing (device/host/cold), batched GPU prefill with grouped expert union, and an OpenAI-compatible HTTP API.
+Fennec replaces multiple inference engines with one codebase: raw Vulkan through `vulkan-1.dll`, CUDA through the driver API with hand-written PTX, Metal via MoltenVK, and ONNX Runtime for portability. Features int4 quantization, four-tier expert routing (device/NPU/host/cold), batched GPU prefill with grouped expert union, and an OpenAI-compatible HTTP API.
 
 ## Features
 
 - **Multi-backend support**: Vulkan, CUDA, Metal, ONNX Runtime, and CPU
 - **Model support**: Qwen3.5-MoE (30B-A3B) and Edge0-145B architectures
 - **Int4 quantization**: Hand-written quantizer with group-64 amax scaling
-- **Three-tier expert routing**: Hot experts in VRAM, warm experts in RAM, cold experts on NVMe
+- **Four-tier expert routing**: Hot experts in VRAM, warm experts on NPU, system RAM, or cold on NVMe
 - **Batched GPU prefill**: Grouped expert union matches Colibri's batch-union strategy (built and tested, but `serve` does not use it yet - see below)
 - **Plugin architecture**: Extensible system for backends, models, tokenizers, and servers
 - **OpenAI-compatible API**: `/v1/chat/completions`, `/v1/models`, streaming SSE
@@ -50,16 +50,16 @@ fennec help      # Show help
 
 ## Architecture
 
-![Three-tier expert routing architecture](docs/architecture.png)
+![Four-tier expert routing architecture](docs/architecture.png)
 
-**CPU and GPU run concurrently.** The device tier holds hot experts in VRAM (FQ4 format over SPIR-V or PTX), the host pool holds warm experts in system RAM with zero-copy borrow, and cold experts stream from NVMe on demand.
+**CPU, GPU, and NPU run concurrently.** The device tier holds hot experts in VRAM (FQ4 format over SPIR-V or PTX), the NPU tier holds warm experts in dedicated AI accelerator memory (Intel AI Boost via OpenVINO), the host pool holds warm experts in system RAM with zero-copy borrow, and cold experts stream from NVMe on demand.
 
 The routing pipeline:
 1. **Route**: Router picks top-8 of 256 experts per layer
-2. **Bucket**: Picks grouped by residency (device/host/cold)
+2. **Bucket**: Picks grouped by residency (device/NPU/host/cold)
 3. **Execute**: Single `VkBatch` with three barrier-free phases (gate_up → silu_mul → down)
 4. **Reduce**: `moe_reduce` kernel weighted-sums top-k slots and shared expert
-5. **Overlap**: Host experts and disk fetches run while device is busy
+5. **Overlap**: NPU experts, host experts, and disk fetches run while device is busy
 
 ### Batched GPU Prefill
 
@@ -175,7 +175,7 @@ fennec serve --cpu --model <model-dir>          # CPU-only
 
 ## ONNX Runtime Integration
 
-ORT runs dense F16 projections (lm_head, delta-net, attention, shared expert, router gate) as ONNX MatMul graphs on accelerators without hand-written kernels. The int4 routed experts and three-tier residency stay on Fennec's own kernels.
+ORT runs dense F16 projections (lm_head, delta-net, attention, shared expert, router gate) as ONNX MatMul graphs on accelerators without hand-written kernels. The int4 routed experts and four-tier residency stay on Fennec's own kernels.
 
 ```bash
 # Use ORT backend for portability
