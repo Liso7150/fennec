@@ -122,6 +122,7 @@ fn main() {
     kernel::set_threads(threads);
     fennec::model::set_dense_int4(opts.has("dense-int4"));
     fennec::model::set_dense_i8(opts.on("dense-i8", true));
+    fennec::model::set_host_int2(opts.has("host-int2"));
     fennec::quant::set_planar_dot(opts.has("planar-dot"));
     let r = match cmd.as_str() {
         "info" => info(&opts),
@@ -136,6 +137,7 @@ fn main() {
         "decode" => decode(&opts, threads),
         "serve" => serve_cmd(&opts, threads),
         "run" => run_cmd(&opts, threads),
+        "update" => update_cmd(&opts),
         "help" => {
             usage();
             Ok(())
@@ -163,6 +165,7 @@ fn usage() {
          \x20 decode            run the plan: greedy tokens, measured against predicted ms\n\
          \x20 run               one prompt, streamed to the terminal\n\
          \x20 serve             OpenAI-compatible HTTP on loopback\n\
+         \x20 update            check for updates and apply them\n\
          \x20 help              show this help message\n\n\
          options\n\
          \x20 --group 32        quant group width (32 is the AVX2 path)\n\
@@ -184,13 +187,15 @@ fn usage() {
          \x20 --prompt IDS      comma-separated token ids (default: the fixture trace)\n\
          \x20 --verbose         per-layer placement table\n\
          \x20 --json            one machine-readable line as well\n\
-         \x20 --host-gb 18.0    system-RAM pool for `run`/`serve` (`--host` there is the bind address)\n\
+         \x20 --host-gb 5.0     system-RAM pool for `run`/`serve` (`--host` there is the bind address)\n\
          \x20 --allow-remote    permit a non-loopback bind (no TLS, model in RAM)\n\
          \x20 --ctx 32768       context window `run`/`serve` allocates state for\n\
          \x20 --ngen 4096       generation ceiling per request\n\
          \x20 --auto-tier       turn the device tier on without spelling out --gpu\n\
          \x20 --dense-i8        one byte per weight for the host dense projections; on by default, --no-dense-i8 restores the exact bf16/f16 dot\n\
-         \x20 --host-gb GiB     system-RAM host pool, default 100 (the plan trims it to what fits)\n\n\
+         \x20 --host-int2       quantise host-resident experts to int2 (50% RAM reduction, opt-in); default int4\n\
+         \x20 --host-gb GiB     system-RAM host pool, default 5 (the plan trims it to what fits)\n\
+         \x20 --experimental    check for updates from main branch instead of releases\n\n\
          default model dir: {DEFAULT_MODEL}",
         fennec::VERSION
     );
@@ -345,12 +350,15 @@ fn host_gb(opts: &Opts) -> f64 {
     if let Some(v) = opts.str("host-gb").and_then(|v| v.parse::<f64>().ok()) {
         return v;
     }
-    if opts.kv.contains_key("host") {
-        return opts.num("host", 18.0);
+    // Only use "host" as the RAM budget if it's actually numeric (not an IP address)
+    if let Some(v) = opts.str("host") {
+        if let Ok(n) = v.parse::<f64>() {
+            return n;
+        }
     }
     env_name("FENNEC_VK_TIER_HOST_GB")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(18.0)
+        .unwrap_or(5.0)
 }
 
 /// `--gpu` turns the device tier into real VRAM; `--gpu N` picks the ranked
@@ -1336,12 +1344,7 @@ fn load_engine(opts: &Opts, threads: usize) -> Result<Engine, String> {
     // `serve --host` is the bind address, exactly as `coli serve` takes it, so the RAM
     // pool budget cannot also live under that name: resolve it here and hand
     // `setup` a numeric `host` it can read back.
-    let pool = opts.str("host-gb").and_then(|v| v.parse::<f64>().ok())
-        .or_else(|| {
-            env_name("FENNEC_VK_TIER_HOST_GB")
-                .and_then(|v| v.parse().ok())
-        })
-        .unwrap_or(18.0);
+    let pool = host_gb(opts);
     let mut po = Opts { pos: opts.pos.clone(), kv: opts.kv.clone(), flags: opts.flags.clone() };
     po.kv.insert("host".into(), pool.to_string());
     po.kv.remove("ctx");
@@ -1356,7 +1359,11 @@ fn load_engine(opts: &Opts, threads: usize) -> Result<Engine, String> {
         n => n.max(512),
     };
     let ngen = opts.usize_at("ngen", 4096).max(1);
-    let slots = opts.usize_at("slots", 16);
+    // Streaming pool: 2 slots per layer (80 total for 40 layers) keeps RAM under
+    // 9 GB during inference. The LRU eviction in pool.rs works, but 16 slots per
+    // layer cached too many experts (14 GB RSS). 2 slots is enough to absorb
+    // repeated picks without bloating memory.
+    let slots = opts.usize_at("slots", 2);
     if let Some(p) = opts.str("policy") {
         eprintln!("[fennec] policy {p}: placement is usage-ranked device/host/disk");
     }
@@ -1461,6 +1468,89 @@ fn run_cmd(opts: &Opts, threads: usize) -> Result<(), String> {
         eprint!("{}", fennec::prof::report(dt * 1e3));
     }
     Ok(())
+}
+
+fn update_cmd(opts: &Opts) -> Result<(), String> {
+    let experimental = opts.has("experimental");
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("Runtime: {e}"))?;
+
+    rt.block_on(async {
+        if experimental {
+            eprintln!("[update] Checking experimental channel (main branch)...");
+            match fennec::updater::check_experimental().await {
+                Ok(Some(release)) => {
+                    eprintln!("[update] New commit available: {}", &release.version[..8.min(release.version.len())]);
+                    let platform = fennec::updater::Platform::current();
+                    let asset_name = platform.asset_name("fennec");
+                    let asset = release.assets.iter().find(|a| a.name == asset_name);
+                    if let Some(asset) = asset {
+                        eprintln!("[update] Downloading {}...", asset_name);
+                        let checksum = release.checksums_url.as_deref();
+                        match fennec::updater::download_asset(&asset.download_url, checksum).await {
+                            Ok(bytes) => {
+                                let temp_path = std::env::temp_dir().join(&asset_name);
+                                std::fs::write(&temp_path, &bytes).map_err(|e| format!("Write: {e}"))?;
+                                eprintln!("[update] Downloaded to {}", temp_path.display());
+                                eprintln!("[update] To apply: stop fennec, replace binary, restart");
+                            }
+                            Err(e) => return Err(format!("Download failed: {e}")),
+                        }
+                    } else {
+                        return Err(format!("No asset for platform: {}", asset_name));
+                    }
+                }
+                Ok(None) => {
+                    eprintln!("[update] Already on latest experimental build");
+                }
+                Err(e) => return Err(format!("Check failed: {e}")),
+            }
+        } else {
+            eprintln!("[update] Checking stable releases...");
+            let current = fennec::VERSION;
+            match fennec::updater::check_stable(current).await {
+                Ok(Some(release)) => {
+                    eprintln!("[update] New version available: {} (current: {})", release.version, current);
+                    let platform = fennec::updater::Platform::current();
+                    let asset_name = platform.asset_name("fennec");
+                    let asset = release.assets.iter().find(|a| a.name == asset_name);
+                    if let Some(asset) = asset {
+                        eprintln!("[update] Downloading {}...", asset_name);
+                        let checksum = release.checksums_url.as_deref();
+                        match fennec::updater::download_asset(&asset.download_url, checksum).await {
+                            Ok(bytes) => {
+                                let current_exe = std::env::current_exe().map_err(|e| format!("Exe path: {e}"))?;
+                                if cfg!(target_os = "windows") {
+                                    let backup = current_exe.with_extension("exe.old");
+                                    if backup.exists() {
+                                        std::fs::remove_file(&backup).map_err(|e| format!("Remove backup: {e}"))?;
+                                    }
+                                    std::fs::rename(&current_exe, &backup).map_err(|e| format!("Backup: {e}"))?;
+                                    std::fs::write(&current_exe, &bytes).map_err(|e| format!("Install: {e}"))?;
+                                } else {
+                                    std::fs::write(&current_exe, &bytes).map_err(|e| format!("Install: {e}"))?;
+                                    #[cfg(unix)]
+                                    {
+                                        use std::os::unix::fs::PermissionsExt;
+                                        let perms = std::fs::Permissions::from_mode(0o755);
+                                        std::fs::set_permissions(&current_exe, perms).map_err(|e| format!("Chmod: {e}"))?;
+                                    }
+                                }
+                                eprintln!("[update] Updated to {} - restart required", release.version);
+                            }
+                            Err(e) => return Err(format!("Download failed: {e}")),
+                        }
+                    } else {
+                        return Err(format!("No asset for platform: {}", asset_name));
+                    }
+                }
+                Ok(None) => {
+                    eprintln!("[update] Already on latest version ({})", current);
+                }
+                Err(e) => return Err(format!("Check failed: {e}")),
+            }
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]

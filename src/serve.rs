@@ -238,17 +238,6 @@ impl Server {
         // own device path for the prompt even though it runs it one token at a
         // time.
         let prompt_len = ids.len();
-        // The device tier has a chunked prefill of its own now (`prefill_device`:
-        // batched projections and the grouped expert union, deadlock-free and
-        // numerically the token loop to 5e-7 relative RMS - tests/gpu.rs), and
-        // serving it measured worse. A 25-token prompt prefilled in 2.014-2.120 s
-        // chunked against 1.419-1.540 s as 25 per-token device forwards, over
-        // four ABBA rounds in one session with both orders agreeing. On a tier
-        // with this much of the stack in VRAM almost every prompt token picks at
-        // least one device expert, and each of those still runs the device chain
-        // one at a time - so the chunk pays the arena round-trips and the union
-        // bookkeeping without amortising the host-expert work that dominates its
-        // own prompt profile. Fix that split before flipping this gate.
         let batched = prompt_len > 1 && model.prefill_ready();
         let first = first_forward(prompt_len, batched);
         if batched {

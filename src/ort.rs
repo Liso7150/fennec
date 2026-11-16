@@ -29,6 +29,8 @@ use crate::vk::Device;
 /// vendor extension: one API reaches every accelerator the runtime supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrtEp {
+    /// NVIDIA GPU through CUDA (cuDNN required).
+    Cuda,
     /// AMD / Intel GPU through DirectX 12 (Windows 10 1903+).
     DirectML,
     /// Intel AI Boost NPU through the OpenVINO plugin (never goes via D3D12).
@@ -42,6 +44,7 @@ pub enum OrtEp {
 impl OrtEp {
     pub fn name(self) -> &'static str {
         match self {
+            OrtEp::Cuda => "CUDA",
             OrtEp::DirectML => "DirectML",
             OrtEp::OpenVINO => "OpenVINO",
             OrtEp::CoreML => "CoreML",
@@ -52,13 +55,15 @@ impl OrtEp {
     /// Pick the provider from the device. The NPU is the Intel AI Boost adapter
     /// that DXCore reports as a non-graphics `GENERIC_ML` device (see `dx`);
     /// Vulkan does not enumerate it, so it is recognised by name here. Apple is
-    /// the portability subset or the Apple vendor id; every other GPU on Windows
-    /// is DirectML, and elsewhere the CPU EP is the fallback.
+    /// the portability subset or the Apple vendor id; NVIDIA is CUDA; every
+    /// other GPU on Windows is DirectML, and elsewhere the CPU EP is the fallback.
     pub fn for_device(dev: &Device) -> OrtEp {
         if dev.vendor_id == 0x8086 && dev.name.contains("AI Boost") {
             OrtEp::OpenVINO
         } else if dev.portability() || dev.vendor_id == 0x106B {
             OrtEp::CoreML
+        } else if dev.vendor_id == 0x10DE {
+            OrtEp::Cuda
         } else if cfg!(windows) {
             OrtEp::DirectML
         } else {
@@ -274,6 +279,7 @@ mod session {
 
         fn dispatch(&self) -> ort::ep::ExecutionProviderDispatch {
             let ep = match self.ep {
+                OrtEp::Cuda => ort::ep::CUDA::default().build(),
                 OrtEp::DirectML => ort::ep::DirectML::default().build(),
                 OrtEp::OpenVINO => ort::ep::OpenVINO::default().build(),
                 OrtEp::CoreML => ort::ep::CoreML::default().build(),
@@ -451,6 +457,7 @@ mod tests {
         let gpu_ep = if cfg!(windows) { OrtEp::DirectML } else { OrtEp::Cpu };
         assert_eq!(OrtEp::for_device(&dev(0x1002, "AMD", "Radeon", false)), gpu_ep);
         assert_eq!(OrtEp::for_device(&dev(0x8086, "Intel", "Arc", false)), gpu_ep);
+        assert_eq!(OrtEp::for_device(&dev(0x10DE, "NVIDIA", "RTX 4060", false)), OrtEp::Cuda);
         assert_eq!(OrtEp::for_device(&dev(0x8086, "Intel", "Intel(R) AI Boost", false)), OrtEp::OpenVINO);
         assert_eq!(OrtEp::for_device(&dev(0x106B, "Apple", "M3", true)), OrtEp::CoreML);
         assert_eq!(OrtEp::for_device(&dev(0, "Apple", "M3", true)), OrtEp::CoreML);

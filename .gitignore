@@ -4,3 +4,11 @@ __pycache__/
 *.pyc
 .qoder/
 skills-lock.json
+
+# Auto-update artifacts
+*.old
+*.new
+*.exe.old
+*.bin.old
+fennec-*.exe
+fennec-*.bin

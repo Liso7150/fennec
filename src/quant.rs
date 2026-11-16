@@ -95,7 +95,20 @@ pub struct Q4 {
     pub signed: bool,
 }
 
+/// Int2 grouped weights: 4 values per byte, one f32 scale per `group` columns.
+/// Layout: row r, group g: w[r][g*group .. g*group+group] = (2-bit - 2) * scale[r * ngroups + g]
+/// 2-bit values are 0..3, offset by 2 to get -2..1 range.
+#[derive(Debug, Clone)]
+pub struct Q2 {
+    pub rows: usize,
+    pub cols: usize,
+    pub group: usize,
+    pub data: Store,
+    pub scale: Vec<f32>,
+}
+
 pub const MAGIC: &[u8; 8] = b"FNN1Q4\0\0";
+pub const MAGIC_Q2: &[u8; 8] = b"FNN1Q2\0\0";
 
 /// round-to-nearest, ties-to-even: what torch/numpy `round` does, so a Rust
 /// quantizer and a Python reference produce the same nibbles.
@@ -144,6 +157,34 @@ fn quant_rows(src: &[f32], rows: usize, cols: usize, group: usize, data: &mut [u
                 } else {
                     data[pos] = (data[pos] & 0x0f) | (nib << 4);
                 }
+            }
+        }
+    }
+}
+
+/// Int2 quantization: 4 values per byte, 2-bit unsigned (0..3), offset by 2 for signed range (-2..1).
+fn quant_rows_q2(src: &[f32], rows: usize, cols: usize, group: usize, data: &mut [u8], scale: &mut [f32]) {
+    const QMAX: f32 = 1.0;  // 2-bit max value after offset
+    let ng = cols.div_ceil(group);
+    let quarter = cols / 4;  // 4 values per byte
+    for r in 0..rows {
+        let src = &src[r * cols..(r + 1) * cols];
+        for g in 0..ng {
+            let c0 = g * group;
+            let c1 = (c0 + group).min(cols);
+            let mut amax = 0f32;
+            for &v in &src[c0..c1] {
+                amax = amax.max(v.abs());
+            }
+            let sc = (amax / QMAX).max(1e-8);
+            scale[r * ng + g] = sc;
+            for (i, &v) in src[c0..c1].iter().enumerate() {
+                // Quantize to 0..3 range (2-bit unsigned)
+                let q = round_half_even((v / sc).clamp(-2.0, QMAX)) + 2.0;
+                let bits = (q as u8) & 0x03;
+                let byte_pos = r * quarter + (c0 + i) / 4;
+                let bit_offset = ((c0 + i) % 4) * 2;
+                data[byte_pos] = (data[byte_pos] & !(0x03 << bit_offset)) | (bits << bit_offset);
             }
         }
     }
@@ -420,6 +461,21 @@ impl Q4 {
         out
     }
 
+    /// Convert this Q4 matrix to Q2 by dequantizing to f32 then requantizing.
+    /// Used when --host-int2 is set to reduce RAM at the cost of precision.
+    /// Streams row-by-row to avoid allocating a temporary f32 matrix.
+    pub fn to_q2(&self, _threads: usize) -> Q2 {
+        let mut q2 = Q2::with_capacity(self.rows, self.cols, self.group);
+        
+        // Process sequentially row by row to avoid large temporary allocation.
+        // The Q2 push() method handles quantization internally.
+        for r in 0..self.rows {
+            let row_f32 = self.dequant_row(r);
+            q2.push(&row_f32);
+        }
+        q2
+    }
+
     /// y = dot(row r, x)
     pub fn dot_row(&self, r: usize, x: &[f32]) -> f32 {
         self.dot_prepped(r, &self.prepare(x))
@@ -590,6 +646,143 @@ impl Q4 {
             scale: qs,
             signed,
         }
+    }
+}
+
+impl Q2 {
+    pub fn ngroups(&self) -> usize {
+        self.cols.div_ceil(self.group)
+    }
+
+    pub fn bytes_data(&self) -> usize {
+        self.rows * self.cols.div_ceil(4)  // 4 values per byte
+    }
+
+    pub fn bytes_scale(&self) -> usize {
+        self.rows * self.ngroups() * 4
+    }
+
+    pub fn bytes_total(&self) -> usize {
+        self.bytes_data() + self.bytes_scale()
+    }
+
+    pub fn bytes_held(&self) -> usize {
+        self.data.held() + self.scale.capacity() * 4
+    }
+
+    pub fn is_mapped(&self) -> bool {
+        matches!(self.data, Store::Map(..))
+    }
+
+    /// Grouped int2 quantization over real weights.
+    pub fn quantize(src: &[f32], rows: usize, cols: usize, group: usize, threads: usize) -> Q2 {
+        assert_eq!(src.len(), rows * cols);
+        assert_eq!(cols % 4, 0, "int2 packing needs a column count divisible by 4");
+        let ng = cols.div_ceil(group);
+        let quarter = cols / 4;
+        let mut data = vec![0u8; rows * quarter];
+        let mut scale = vec![0f32; rows * ng];
+        let nthreads = threads.max(1).min(rows);
+        let per = rows.div_ceil(nthreads);
+        std::thread::scope(|s| {
+            let mut drest = data.as_mut_slice();
+            let mut srest = scale.as_mut_slice();
+            let mut r0 = 0usize;
+            while r0 < rows {
+                let r1 = (r0 + per).min(rows);
+                let (dlo, dhi) = drest.split_at_mut((r1 - r0) * quarter);
+                let (slo, shi) = srest.split_at_mut((r1 - r0) * ng);
+                drest = dhi;
+                srest = shi;
+                let block = &src[r0 * cols..r1 * cols];
+                s.spawn(move || quant_rows_q2(block, r1 - r0, cols, group, dlo, slo));
+                r0 = r1;
+            }
+        });
+        Q2 {
+            rows,
+            cols,
+            group,
+            data: Store::Own(data),
+            scale,
+        }
+    }
+
+    pub fn empty(cols: usize, group: usize) -> Q2 {
+        Q2 {
+            rows: 0,
+            cols,
+            group,
+            data: Store::Own(Vec::new()),
+            scale: Vec::new(),
+        }
+    }
+
+    pub fn with_capacity(rows: usize, cols: usize, group: usize) -> Q2 {
+        let ng = cols.div_ceil(group);
+        let quarter = cols / 4;
+        Q2 {
+            rows: 0,
+            cols,
+            group,
+            data: Store::Own(Vec::with_capacity(rows * quarter)),
+            scale: Vec::with_capacity(rows * ng),
+        }
+    }
+
+    pub fn push(&mut self, src: &[f32]) {
+        let ng = self.ngroups();
+        let quarter = self.cols / 4;
+        let d = self.data.own_mut();
+        let old_len = d.len();
+        d.resize(old_len + quarter, 0);
+        self.scale.resize(self.rows * ng + ng, 0.0);
+        quant_rows_q2(src, 1, self.cols, self.group, &mut d[old_len..], &mut self.scale[self.rows * ng..]);
+        self.rows += 1;
+    }
+
+    /// Extract the 2-bit value at row r, column c (0..3 range, offset by 2 for signed -2..1).
+    #[inline]
+    fn bits(&self, r: usize, c: usize) -> f32 {
+        let quarter = self.cols / 4;
+        let byte_pos = r * quarter + c / 4;
+        let bit_offset = (c % 4) * 2;
+        let byte = self.data.bytes()[byte_pos];
+        let val = ((byte >> bit_offset) & 0x03) as f32;
+        val - 2.0  // Convert from 0..3 to -2..1
+    }
+
+    pub fn dot_row(&self, r: usize, x: &[f32]) -> f32 {
+        let ng = self.ngroups();
+        let mut y = 0f32;
+        for g in 0..ng {
+            let sc = self.scale[r * ng + g];
+            let c1 = ((g + 1) * self.group).min(self.cols);
+            let mut acc = 0f32;
+            for c in g * self.group..c1 {
+                acc += x[c] * self.bits(r, c);
+            }
+            y += acc * sc;
+        }
+        y
+    }
+
+    pub fn rel_error(&self, src: &[f32]) -> f32 {
+        let mut num = 0f64;
+        let mut den = 0f64;
+        for r in 0..self.rows {
+            for c in 0..self.cols {
+                let orig = src[r * self.cols + c] as f64;
+                let ng = self.ngroups();
+                let g = c / self.group;
+                let sc = self.scale[r * ng + g] as f64;
+                let recon = self.bits(r, c) as f64 * sc;
+                let diff = orig - recon;
+                num += diff * diff;
+                den += orig * orig;
+            }
+        }
+        (num / den.max(1e-30)).sqrt() as f32
     }
 }
 

@@ -281,8 +281,9 @@ impl Plan {
         let mut host_bytes_used = off_dense.min(host_budget);
 
         // pass 2: split the remaining device room evenly over the layers, then fill
-        // system RAM with the next-hot experts per layer
-        let free_device = budget.saturating_sub(device_bytes_used);
+        // system RAM with the next-hot experts per layer. In CPU mode (gpu=false),
+        // the device tier doesn't exist, so all experts go to host or disk.
+        let free_device = if gpu { budget.saturating_sub(device_bytes_used) } else { 0 };
         let mut slots_dev = vec![0usize; n_layers];
         let mut rem = free_device / eb.max(1);
         for r in 0..n_layers {

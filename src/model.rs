@@ -84,6 +84,10 @@ static DENSE_I8: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 pub fn set_dense_i8(v: bool) { DENSE_I8.store(v, std::sync::atomic::Ordering::Relaxed); }
 pub fn dense_i8() -> bool { DENSE_I8.load(std::sync::atomic::Ordering::Relaxed) }
 
+static HOST_INT2: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn set_host_int2(v: bool) { HOST_INT2.store(v, std::sync::atomic::Ordering::Relaxed); }
+pub fn host_int2() -> bool { HOST_INT2.load(std::sync::atomic::Ordering::Relaxed) }
+
 pub enum Dense {
     F32(Vec<f32>),
     Half(Vec<u8>, kernel::Half),
@@ -558,6 +562,10 @@ pub struct MoeLayer {
     pub gu: Q4,
     /// rows = ids.len() * H, cols = I
     pub dn: Q4,
+    /// Int2 host experts: when RAM is the constraint, host-resident experts use
+    /// 2-bit quantization (50% memory reduction vs int4). Device experts stay Q4.
+    pub host_gu: Option<crate::quant::Q2>,
+    pub host_dn: Option<crate::quant::Q2>,
     /// The same resident set borrowed from the checkpoint's mapping, one pair per
     /// slot, when the container is already int4. `gu`/`dn` are then empty: the
     /// nibbles are clean file pages, not 13 GiB of anonymous memory the OS has to
@@ -618,11 +626,8 @@ impl MoeLayer {
         group: usize,
         threads: usize,
     ) -> Result<MoeLayer> {
-        if let Some(mapped) = map_experts(sh, &cfg, layer, ids, group)? {
-            let gu = Q4::empty(cfg.hidden_size, group);
-            let dn = Q4::empty(cfg.moe_intermediate_size, group);
-            return Self::assemble(sh, cfg, layer, ids.to_vec(), gu, dn, Some(mapped), stream, threads);
-        }
+        // Memory mapping pulls too much into RAM (entire checkpoint regions).
+        // Only load the experts we actually need to keep RAM usage bounded.
         let (gu, dn) = gather_experts(sh, &cfg, layer, ids, group, threads)?;
         Self::assemble(sh, cfg, layer, ids.to_vec(), gu, dn, None, stream, threads)
     }
@@ -648,6 +653,31 @@ impl MoeLayer {
         for (s, &e) in ids.iter().enumerate() {
             slot[e] = s as i32;
         }
+        
+        // Convert Q4 host experts to Q2 when --host-int2 is set
+        let (host_gu, host_dn, gu, dn) = if host_int2() && mapped.is_none() {
+            let t0 = std::time::Instant::now();
+            let q4_bytes = gu.bytes_total() + dn.bytes_total();
+            let group = gu.group;
+            let q2_gu = gu.to_q2(threads);
+            let q2_dn = dn.to_q2(threads);
+            let q2_bytes = q2_gu.bytes_total() + q2_dn.bytes_total();
+            eprintln!(
+                "[fennec] layer {layer}: converted {} host experts to int2 in {:.1} s ({:.2} -> {:.2} GiB, saved {:.1}%)",
+                ids.len(),
+                t0.elapsed().as_secs_f64(),
+                q4_bytes as f64 / 2f64.powi(30),
+                q2_bytes as f64 / 2f64.powi(30),
+                100.0 * (1.0 - q2_bytes as f64 / q4_bytes as f64)
+            );
+            // Free the Q4 matrices: replace with empty shells so only Q2 is held
+            let gu_empty = Q4::empty(cfg.hidden_size, group);
+            let dn_empty = Q4::empty(cfg.moe_intermediate_size, group);
+            (Some(q2_gu), Some(q2_dn), gu_empty, dn_empty)
+        } else {
+            (None, None, gu, dn)
+        };
+        
         Ok(MoeLayer {
             cfg,
             gate,
@@ -657,6 +687,8 @@ impl MoeLayer {
             s_egate,
             gu,
             dn,
+            host_gu,
+            host_dn,
             mapped,
             ids,
             slot,
@@ -677,6 +709,19 @@ impl MoeLayer {
         for (s, &e) in ids.iter().enumerate() {
             slot[e] = s as i32;
         }
+        
+        // Convert Q4 host experts to Q2 when --host-int2 is set
+        let (host_gu, host_dn, gu, dn) = if host_int2() {
+            let group = gu.group;
+            let q2_gu = gu.to_q2(threads);
+            let q2_dn = dn.to_q2(threads);
+            let gu_empty = Q4::empty(cfg.hidden_size, group);
+            let dn_empty = Q4::empty(cfg.moe_intermediate_size, group);
+            (Some(q2_gu), Some(q2_dn), gu_empty, dn_empty)
+        } else {
+            (None, None, gu, dn)
+        };
+        
         MoeLayer {
             cfg,
             gate: parts.gate,
@@ -686,6 +731,8 @@ impl MoeLayer {
             s_egate: parts.s_egate,
             gu,
             dn,
+            host_gu,
+            host_dn,
             mapped: None,
             ids,
             slot,
@@ -739,9 +786,17 @@ impl MoeLayer {
     /// y = expert_e(x) into `y` (len H). Gate/up are the two halves of the row
     /// block that holds e; `expert` is the id->slot lookup on top of it.
     pub fn expert(&self, e: usize, x: &[f32], hh: &mut [f32], y: &mut [f32]) {
-        let (gu, dn, s) = self.expert_pair(e);
         let (i, h) = (self.cfg.moe_intermediate_size, self.cfg.hidden_size);
-        expert_in(gu, dn, i, h, s, x, hh, y);
+        let s = self.slot[e];
+        assert!(s >= 0, "expert {e} is not resident in this layer");
+        
+        // Use Q2 path when host experts are int2-quantized
+        if let (Some(gu_q2), Some(dn_q2)) = (&self.host_gu, &self.host_dn) {
+            expert_in_q2(gu_q2, dn_q2, i, h, s as usize, x, hh, y);
+        } else {
+            let (gu, dn, s) = self.expert_pair(e);
+            expert_in(gu, dn, i, h, s, x, hh, y);
+        }
     }
 
     /// The two matrices backing expert `e`, and the row block they start at, so
@@ -767,14 +822,28 @@ impl MoeLayer {
     pub fn host_gu_bytes(&self) -> usize {
         match &self.mapped {
             Some(v) => v.iter().map(|(g, _)| g.bytes_total()).sum(),
-            None => self.gu.bytes_total(),
+            None => {
+                // Q2 takes precedence when active
+                if let Some(q2) = &self.host_gu {
+                    q2.bytes_total()
+                } else {
+                    self.gu.bytes_total()
+                }
+            }
         }
     }
 
     pub fn host_dn_bytes(&self) -> usize {
         match &self.mapped {
             Some(v) => v.iter().map(|(_, d)| d.bytes_total()).sum(),
-            None => self.dn.bytes_total(),
+            None => {
+                // Q2 takes precedence when active
+                if let Some(q2) = &self.host_dn {
+                    q2.bytes_total()
+                } else {
+                    self.dn.bytes_total()
+                }
+            }
         }
     }
 
@@ -782,7 +851,20 @@ impl MoeLayer {
     pub fn host_bytes_held(&self) -> usize {
         match &self.mapped {
             Some(v) => v.iter().map(|(g, d)| g.bytes_held() + d.bytes_held()).sum(),
-            None => self.gu.bytes_held() + self.dn.bytes_held(),
+            None => {
+                // Q2 takes precedence when active
+                let gu_bytes = if let Some(q2) = &self.host_gu {
+                    q2.bytes_held()
+                } else {
+                    self.gu.bytes_held()
+                };
+                let dn_bytes = if let Some(q2) = &self.host_dn {
+                    q2.bytes_held()
+                } else {
+                    self.dn.bytes_held()
+                };
+                gu_bytes + dn_bytes
+            }
         }
     }
 
@@ -905,7 +987,9 @@ impl MoeLayer {
                 parts[n] = part;
             }
         }
-        if self.threads == 1 || host.len() < 2 {
+        if self.threads == 1 || host.len() < 2 || self.host_gu.is_some() {
+            // Serial path: one expert at a time. Also used when int2 host experts
+            // are active, since the batched DotPrep path is Q4-specific.
             let mut hh = vec![0f32; i];
             let mut y = vec![0f32; h];
             for &n in host {
@@ -1459,6 +1543,20 @@ pub fn expert_in(gu: &Q4, dn: &Q4, i: usize, h: usize, s: usize, x: &[f32], hh: 
     let ph = dn.prepare(hh);
     for j in 0..h {
         y[j] = dn.dot_prepped(s * h + j, &ph);
+    }
+}
+
+/// Int2 variant of expert_in: uses Q2 dot product for host-resident experts when
+/// --host-int2 is set. Slower per-dot but halves RAM usage.
+pub fn expert_in_q2(gu: &crate::quant::Q2, dn: &crate::quant::Q2, i: usize, h: usize, s: usize, x: &[f32], hh: &mut [f32], y: &mut [f32]) {
+    let base = s * 2 * i;
+    for j in 0..i {
+        let g = gu.dot_row(base + j, x);
+        let u = gu.dot_row(base + i + j, x);
+        hh[j] = kernel::silu(g) * u;
+    }
+    for j in 0..h {
+        y[j] = dn.dot_row(s * h + j, hh);
     }
 }
 

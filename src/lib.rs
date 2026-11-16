@@ -42,6 +42,7 @@ pub mod safetensors;
 pub mod sched;
 pub mod serve;
 pub mod tokenizer;
+pub mod updater;
 pub mod vk;
 
 pub use config::{LayerKind, TextConfig};
