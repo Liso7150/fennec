@@ -2126,6 +2126,7 @@ impl GdnLayer {
         debug_assert!(nk > 0, "linear_num_key_heads must be > 0 for GDN layers");
         let mut g = d.gpu.lock().unwrap();
         if !st.mirrored {
+            let _u = prof::start(prof::MIXER_DEV_UPLOAD);
             g.write_buf(m.conv_state, 0, &f32_bytes(&st.conv)).unwrap();
             g.write_buf(m.rec_state, 0, &f32_bytes(&st.rec)).unwrap();
             st.mirrored = true;
@@ -2134,9 +2135,13 @@ impl GdnLayer {
         // CUDA's half gemv reads x as v4.f32, so the offset must be 16-byte
         // aligned; Vulkan reads scalars and would not notice an odd nv.
         let normed = (ib + cd + vd + 2 * nv + 3) & !3;
-        g.write(DENSE_OFF, x);
+        {
+            let _u = prof::start(prof::MIXER_DEV_UPLOAD);
+            g.write(DENSE_OFF, x);
+        }
         let read_syncs = g.read_syncs();
         {
+            let _c = prof::start(prof::MIXER_DEV_COMPUTE);
             let mut bt = g.batch().unwrap();
             // The four input projections read the same x and write disjoint
             // slices, so they are independent. Recorded barrier-free they fill
@@ -2155,7 +2160,10 @@ impl GdnLayer {
             // a mapped copy and still needs the wait.
             if read_syncs { bt.submit().unwrap(); } else { bt.run().unwrap(); }
         }
-        g.read_into(DENSE_OFF, out);
+        {
+            let _r = prof::start(prof::MIXER_DEV_READBACK);
+            g.read_into(DENSE_OFF, out);
+        }
         st.filled = (st.filled + 1).min(st.hist);
     }
 
@@ -2170,8 +2178,12 @@ impl GdnLayer {
             cfg.linear_num_value_heads,
         );
         let mut g = d.gpu.lock().unwrap();
-        g.write(DENSE_OFF, x);
         {
+            let _u = prof::start(prof::MIXER_DEV_UPLOAD);
+            g.write(DENSE_OFF, x);
+        }
+        {
+            let _c = prof::start(prof::MIXER_DEV_COMPUTE);
             let mut bt = g.batch().unwrap();
             bt.gemv_half_indep(d.qkv, cd, h, DENSE_OFF, DENSE_OFF + h).unwrap();
             bt.gemv_half_indep(d.z, vd, h, DENSE_OFF, DENSE_OFF + h + cd).unwrap();
@@ -2180,7 +2192,10 @@ impl GdnLayer {
             bt.barrier().unwrap();
             bt.run().unwrap();
         }
-        g.read_into(DENSE_OFF + h, buf);
+        {
+            let _r = prof::start(prof::MIXER_DEV_READBACK);
+            g.read_into(DENSE_OFF + h, buf);
+        }
     }
 
     /// One decode token. `x` is the post-conv input row of length H.
@@ -2624,8 +2639,12 @@ impl AttnLayer {
         let (h, hd, nkv) = (cfg.hidden_size, cfg.head_dim, cfg.num_key_value_heads);
         let q_out = if cfg.attn_output_gate { cfg.num_attention_heads * hd * 2 } else { cfg.num_attention_heads * hd };
         let mut g = d.gpu.lock().unwrap();
-        g.write(DENSE_OFF, x);
         {
+            let _u = prof::start(prof::MIXER_DEV_UPLOAD);
+            g.write(DENSE_OFF, x);
+        }
+        {
+            let _c = prof::start(prof::MIXER_DEV_COMPUTE);
             let mut bt = g.batch().unwrap();
             if d.q4 {
                 bt.gemv_q4_indep(d.q, d.qs[0], q_out, h, d.group, DENSE_OFF, DENSE_OFF + h).unwrap();
@@ -2641,7 +2660,10 @@ impl AttnLayer {
             bt.barrier().unwrap();
             bt.run().unwrap();
         }
-        g.read_into(DENSE_OFF + h, buf);
+        {
+            let _r = prof::start(prof::MIXER_DEV_READBACK);
+            g.read_into(DENSE_OFF + h, buf);
+        }
     }
 
     /// One decode token against the KV cache in `st`.
@@ -2682,8 +2704,12 @@ impl AttnLayer {
         match &self.dev {
             Some(d) => {
                 let mut g = d.gpu.lock().unwrap();
-                g.write(DENSE_OFF, &attn);
                 {
+                    let _u = prof::start(prof::MIXER_DEV_UPLOAD);
+                    g.write(DENSE_OFF, &attn);
+                }
+                {
+                    let _c = prof::start(prof::MIXER_DEV_COMPUTE);
                     let mut bt = g.batch().unwrap();
                     if d.q4 {
                         bt.gemv_q4(d.o, d.qs[3], h, nh * hd, d.group, DENSE_OFF, DENSE_OFF + nh * hd).unwrap();
@@ -2692,7 +2718,10 @@ impl AttnLayer {
                     }
                     bt.run().unwrap();
                 }
-                g.read_into(DENSE_OFF + nh * hd, out);
+                {
+                    let _r = prof::start(prof::MIXER_DEV_READBACK);
+                    g.read_into(DENSE_OFF + nh * hd, out);
+                }
             }
             None => {
                 let _p = prof::start(prof::MIXER_PROJ);

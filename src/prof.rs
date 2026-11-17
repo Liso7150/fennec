@@ -34,13 +34,19 @@ pub const HEAD: usize = 9;
 pub const NORM: usize = 10;
 pub const RESIDUAL: usize = 11;
 pub const MIXER_PROJ: usize = 12;
+pub const MIXER_DEV_UPLOAD: usize = 13;
+pub const MIXER_DEV_COMPUTE: usize = 14;
+pub const MIXER_DEV_READBACK: usize = 15;
 
 /// `moe submit` split in two and `moe device wait` split in two, because the
 /// lumped numbers could not say whether the cost was the blocking activation
 /// upload, the launch loop, the fence, or the readback — and those have four
 /// different fixes. `lm_head` was missing entirely: on the CPU tier it is a
 /// 248320x2048 half-precision read per token and nothing named it.
-pub const STAGES: [&str; 13] = [
+/// `mixer device` split in three for the same reason: upload, compute and
+/// readback have different bottlenecks (PCIe bandwidth, shader execution,
+/// PCIe latency) and different fixes.
+pub const STAGES: [&str; 16] = [
     "route",
     "moe upload",
     "moe record+launch",
@@ -54,11 +60,14 @@ pub const STAGES: [&str; 13] = [
     "rmsnorm",
     "residual",
     "mixer projections",
+    "mixer dev upload",
+    "mixer dev compute",
+    "mixer dev readback",
 ];
 
 static ON: AtomicBool = AtomicBool::new(false);
-static NS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
-static PROMPT_NS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
+static NS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+static PROMPT_NS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
 static PROMPT_TOKENS: AtomicU64 = AtomicU64::new(0);
 static STEPS: AtomicU64 = AtomicU64::new(0);
 /// When the decode phase began, so the wall clock in the report is the one the
@@ -87,8 +96,8 @@ pub fn reset() {
 
 /// Milliseconds per stage, in `STAGES` order — the decode steps only, once
 /// [`split`] has been called.
-pub fn millis() -> [f64; 13] {
-    let mut out = [0f64; 13];
+pub fn millis() -> [f64; 16] {
+    let mut out = [0f64; 16];
     for (i, c) in NS.iter().enumerate() {
         out[i] = c.load(Relaxed) as f64 / 1e6;
     }
@@ -134,8 +143,8 @@ pub fn decode_steps() -> usize {
 }
 
 /// Prompt-phase milliseconds per stage, and how many tokens they cover.
-pub fn prompt_millis() -> ([f64; 13], usize) {
-    let mut out = [0f64; 13];
+pub fn prompt_millis() -> ([f64; 16], usize) {
+    let mut out = [0f64; 16];
     for (i, c) in PROMPT_NS.iter().enumerate() {
         out[i] = c.load(Relaxed) as f64 / 1e6;
     }
