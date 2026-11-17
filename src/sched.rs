@@ -127,6 +127,36 @@ impl Bandwidth {
         }
     }
 
+    /// Consumer GPU target: 12GB VRAM cards (RTX 4070, RX 7800 XT, Arc B70).
+    /// This is the Strata target profile — MoE models should fit and run well
+    /// on these cards with aggressive expert placement.
+    ///
+    /// Bandwidth figures are typical for this tier:
+    /// - RTX 4070: 504 GB/s GDDR6X, but we use 360 for realistic sustained
+    /// - RX 7800 XT: 624 GB/s GDDR6
+    /// - Arc B70: ~450 GB/s GDDR6
+    ///
+    /// The key constraint is the 12GB budget: the planner must fit the model
+    /// with enough room for activations and leave head experts on device.
+    pub fn consumer_12gb() -> Bandwidth {
+        Bandwidth {
+            device_gbs: 360.0,  // Conservative sustained bandwidth for 12GB cards
+            npu_gbs: 0.0,       // Most consumer cards don't have dedicated NPU
+            host_gbs: 25.0,     // DDR5-5600 dual channel typical
+            pcie_gbs: 16.0,     // PCIe 4.0 x16 theoretical, ~16 sustained
+            disk_gbs: 3.5,      // NVMe Gen4 typical sequential
+            quant_gbs: 2.0,     // FQ4 encode rate
+        }
+    }
+
+    /// Budget in bytes for a 12GB consumer card, leaving headroom for the
+    /// driver, display output, and activation arena. Strata targets ~10GB
+    /// usable for model weights on a 12GB card.
+    pub const CONSUMER_12GB_BUDGET: usize = 10 * 1024 * 1024 * 1024; // 10 GiB
+
+    /// Budget for an 8GB laptop card (RTX 4060 Laptop), more constrained.
+    pub const LAPTOP_8GB_BUDGET: usize = 6 * 1024 * 1024 * 1024; // 6 GiB usable
+
     /// CPU-only decode: everything is read from system RAM, so the device tier
     /// is a second name for the host tier and every bandwidth is the host's.
     pub fn cpu_only() -> Bandwidth {
@@ -493,6 +523,62 @@ impl Plan {
                 self.tok_s(),
             )
         }
+    }
+
+    /// Check if this plan fits within a consumer hardware VRAM budget.
+    /// Returns true if device_bytes_used <= budget, with a note about headroom.
+    pub fn fits_consumer_budget(&self, budget_bytes: usize) -> bool {
+        self.device_bytes_used <= budget_bytes
+    }
+
+    /// How much headroom (in GiB) remains under a given budget. Negative means
+    /// the plan exceeds the budget.
+    pub fn headroom_gib(&self, budget_bytes: usize) -> f64 {
+        let used = self.device_bytes_used as i64;
+        let budget = budget_bytes as i64;
+        (budget - used) as f64 / 2f64.powi(30)
+    }
+
+    /// Build a plan optimized for a 12GB consumer GPU (RTX 4070, RX 7800 XT, Arc B70).
+    /// Uses the consumer_12gb bandwidth profile and a 10GB usable budget.
+    pub fn build_consumer_12gb(
+        cfg: &TextConfig,
+        usage: &Usage,
+        reserve: usize,
+        gpu: bool,
+    ) -> Plan {
+        Plan::build(
+            cfg,
+            usage,
+            Bandwidth::CONSUMER_12GB_BUDGET,
+            0, // No NPU on most consumer cards
+            32 * 1024 * 1024 * 1024, // 32 GiB host budget
+            reserve,
+            &Bandwidth::consumer_12gb(),
+            128, // Default group size
+            gpu,
+        )
+    }
+
+    /// Build a plan optimized for an 8GB laptop GPU (RTX 4060 Laptop).
+    /// Uses the laptop_4060 bandwidth profile and a 6GB usable budget.
+    pub fn build_laptop_8gb(
+        cfg: &TextConfig,
+        usage: &Usage,
+        reserve: usize,
+        gpu: bool,
+    ) -> Plan {
+        Plan::build(
+            cfg,
+            usage,
+            Bandwidth::LAPTOP_8GB_BUDGET,
+            0,
+            16 * 1024 * 1024 * 1024, // 16 GiB host budget
+            reserve,
+            &Bandwidth::laptop_4060(),
+            128,
+            gpu,
+        )
     }
 }
 

@@ -100,6 +100,7 @@ pub struct Device {
     /// vendor-decoded driver branch, best effort
     pub driver: String,
     pub device_local_gib: f64,
+    pub free_gib: f64,
     pub dedicated_gib: f64,
     pub host_visible_gib: f64,
     /// memoryHeaps[] as reported: (size, flags, reachable by a host-visible type)
@@ -459,6 +460,7 @@ impl Vulkan {
                     api: version_string(api),
                     driver: driver_string(vendor, driver),
                     device_local_gib: local as f64 / 2f64.powi(30),
+                    free_gib: 0.0,
                     dedicated_gib: dedicated as f64 / 2f64.powi(30),
                     host_visible_gib: visible as f64 / 2f64.powi(30),
                     heaps,
@@ -579,6 +581,7 @@ mod tests {
             api: "1.3".into(),
             driver: "0".into(),
             device_local_gib: local,
+            free_gib: 0.0,
             dedicated_gib: dedicated,
             host_visible_gib: local,
             heaps: Vec::new(),

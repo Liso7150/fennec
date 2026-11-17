@@ -21,6 +21,7 @@ pub enum DType {
     I8,
     I32,
     I64,
+    U32,
 }
 
 impl DType {
@@ -34,6 +35,7 @@ impl DType {
             "I8" => DType::I8,
             "I32" => DType::I32,
             "I64" => DType::I64,
+            "U32" => DType::U32,
             other => return Err(format!("unsupported dtype {other}")),
         })
     }
@@ -41,7 +43,7 @@ impl DType {
     pub fn size(self) -> usize {
         match self {
             DType::BF16 | DType::F16 => 2,
-            DType::F32 | DType::I32 => 4,
+            DType::F32 | DType::I32 | DType::U32 => 4,
             DType::F64 | DType::I64 => 8,
             DType::U8 | DType::I8 => 1,
         }
@@ -129,6 +131,7 @@ pub fn bits_to_f32(dtype: DType, raw: u64) -> f32 {
         DType::I8 => ((raw & 0xff) as u8) as i8 as f32,
         DType::I32 => (raw as u32) as i32 as f32,
         DType::I64 => (raw as u64) as i64 as f32,
+        DType::U32 => (raw as u32) as f32,
     }
 }
 

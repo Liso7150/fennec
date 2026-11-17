@@ -87,11 +87,19 @@ impl Opts {
         self.str("model")
             .or_else(|| self.pos.first().cloned())
             .or_else(|| env_name("FENNEC_MODEL"))
-            .unwrap_or_else(|| DEFAULT_MODEL.to_string())
+            .unwrap_or_default()
+    }
+
+    /// `dir()` with the missing-model case made explicit: without this, an
+    /// empty default would surface as a confusing per-file open error.
+    fn model_dir(&self) -> Result<String, String> {
+        let dir = self.dir();
+        if dir.is_empty() {
+            return Err("no model directory: pass --model <dir>, set FENNEC_MODEL, or set `model` in ~/.fennec/config.json".into());
+        }
+        Ok(dir)
     }
 }
-
-const DEFAULT_MODEL: &str = "D:/fennec-models/Qwen3.6-35B-A3B-bf16";
 
 /// Eight token ids from the golden fixtures - the same sequence the
 /// transformers reference stepped through, so a decode here and a golden test
@@ -196,7 +204,7 @@ fn usage() {
          \x20 --host-int2       quantise host-resident experts to int2 (50% RAM reduction, opt-in); default int4\n\
          \x20 --host-gb GiB     system-RAM host pool, default 5 (the plan trims it to what fits)\n\
          \x20 --experimental    check for updates from main branch instead of releases\n\n\
-         default model dir: {DEFAULT_MODEL}",
+         model dir: pass --model <dir>, set FENNEC_MODEL, or set `model` in ~/.fennec/config.json",
         fennec::VERSION
     );
 }
@@ -217,7 +225,7 @@ fn attach_cache(opts: &Opts, dir: &str, sh: &mut Shards) -> Result<(), String> {
 }
 
 fn open(opts: &Opts) -> Result<(Arc<TextConfig>, Arc<Shards>), String> {
-    let dir = opts.dir();
+    let dir = opts.model_dir()?;
     let mut cfg = TextConfig::from_file(&format!("{dir}/config.json"))?;
     let mut sh = Shards::open(&dir)?;
     // Nothing in config.json records the tensor prefix, so read it back off
@@ -526,7 +534,7 @@ fn setup(opts: &Opts, cfg: &Arc<TextConfig>, group: usize) -> Result<Setup, Stri
         // tiers simply stay empty.
         Usage::uniform(cfg.num_hidden_layers, 0)
     } else {
-        match find_usage(opts, &opts.dir()) {
+        match find_usage(opts, &opts.model_dir()?) {
             Some(p) => {
                 eprintln!("[fennec] router histogram: {p}");
                 let u = Usage::load(&p)?;
@@ -688,15 +696,17 @@ fn probe() {
         devs[0].usable_gib(),
         devs[0].preferred_backend().label()
     );
-    if let Ok(cfg) = TextConfig::from_file(&format!("{DEFAULT_MODEL}/config.json")) {
-        // The group belongs to the checkpoint, not to this probe: the shipped
-        // container is group 64, and assuming 32 overstates an expert by 11.1%.
-        let group = Shards::open(DEFAULT_MODEL)
-            .ok()
-            .and_then(|sh| {
-                fennec::model::packed_group(&sh, &cfg.prefix, cfg.hidden_size, cfg.moe_intermediate_size)
-            })
-            .unwrap_or(32);
+    let default_model = std::env::var("FENNEC_MODEL").unwrap_or_default();
+    if !default_model.is_empty() {
+        if let Ok(cfg) = TextConfig::from_file(&format!("{default_model}/config.json")) {
+            // The group belongs to the checkpoint, not to this probe: the shipped
+            // container is group 64, and assuming 32 overstates an expert by 11.1%.
+            let group = Shards::open(&default_model)
+                .ok()
+                .and_then(|sh| {
+                    fennec::model::packed_group(&sh, &cfg.prefix, cfg.hidden_size, cfg.moe_intermediate_size)
+                })
+                .unwrap_or(32);
         let eb = fennec::sched::expert_bytes(&cfg, group);
         for d in &devs {
             // Apple's unified memory has no dedicated heap, so sizing room from
@@ -717,6 +727,7 @@ fn probe() {
                 cfg.num_hidden_layers,
             );
         }
+        }
     }
     println!(
         "[VK] fox/llama.cpp caveat: its Vulkan gated_delta_net only runs on the GPU when every \
@@ -729,7 +740,7 @@ fn probe() {
 /// still reads `checks[].{id,status,detail}`, so Fennec speaks it too: `ok`,
 /// `warn`, `skip`, anything else renders as a failure.
 fn doctor(opts: &Opts) -> Result<(), String> {
-    let dir = opts.dir();
+    let dir = opts.model_dir()?;
     let mut checks: Vec<serde_json::Value> = Vec::new();
     fn add(checks: &mut Vec<serde_json::Value>, id: &str, status: &str, detail: String) {
         checks.push(serde_json::json!({"id": id, "status": status, "detail": detail}));
@@ -1353,7 +1364,7 @@ fn load_engine(opts: &Opts, threads: usize) -> Result<Engine, String> {
     if std::env::var("FENNEC_PROFILE").is_ok_and(|v| !v.is_empty() && v != "0") {
         fennec::prof::enable();
     }
-    let dir = opts.dir();
+    let dir = opts.model_dir()?;
     let cfg = Arc::new(TextConfig::from_file(&format!("{dir}/config.json"))?);
     let mut shards = Shards::open(&dir)?;
     attach_cache(opts, &dir, &mut shards)?;

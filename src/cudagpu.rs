@@ -16,12 +16,17 @@
 //! A batch is a list of launches rather than a recorded command buffer: the
 //! default stream is in-order, so consecutive kernels see each other's writes
 //! without the explicit barriers Vulkan needs.
+//!
+//! **CUDA graphs**: repeated dispatch patterns (e.g., one decode step) can be
+//! captured into a graph and replayed with minimal launch overhead. The graph
+//! cache stores instantiated executables keyed by their launch sequence hash.
 
 use crate::config::Result;
 use crate::cuda::{version_string, Cuda, DevPtr, Handle};
 use crate::gpu::Op;
 use crate::quant::Q4;
 use crate::vk::Device;
+use std::collections::HashMap;
 use std::ffi::c_void;
 
 const PTX: &str = include_str!("kernels/fennec.ptx");
@@ -59,6 +64,14 @@ pub struct CudaGpu {
     pub dispatches: u64,
     pub sync_ms: f64,
     pub syncs: u64,
+    /// Stream for graph capture and async operations
+    stream: Handle,
+    /// Cache of instantiated graph executables, keyed by launch sequence hash
+    graph_cache: HashMap<u64, Handle>,
+    /// Number of graph cache hits (for profiling)
+    pub graph_hits: u64,
+    /// Number of graph captures (for profiling)
+    pub graph_captures: u64,
 }
 
 // The context is current on the owning thread only; the CPU workers that run
@@ -92,6 +105,7 @@ impl CudaGpu {
             api: format!("CUDA {}.{}", d.compute.0, d.compute.1),
             driver: version_string(cu.driver_version),
             device_local_gib: d.total_gib,
+            free_gib: d.free_gib,
             dedicated_gib: d.total_gib,
             host_visible_gib: 0.0,
             heaps: vec![(bytes, 0x1, false)],
@@ -110,7 +124,13 @@ impl CudaGpu {
             dispatches: 0,
             sync_ms: 0.0,
             syncs: 0,
+            stream: std::ptr::null_mut(),
+            graph_cache: HashMap::new(),
+            graph_hits: 0,
+            graph_captures: 0,
         };
+        // Create a stream for graph capture and async operations
+        g.stream = g.cu.create_stream().unwrap_or(std::ptr::null_mut());
         // The same starting arena the Vulkan tier opens with, so a caller that
         // writes activations without naming a size behaves identically on both.
         g.reserve(crate::gpu::SCRATCH_FLOATS)?;
@@ -119,6 +139,20 @@ impl CudaGpu {
 
     pub fn name(&self) -> &str {
         &self.info.name
+    }
+
+    /// Refresh the free VRAM reading. Call after large allocations or frees to
+    /// get an accurate current figure rather than the one from device open.
+    pub fn refresh_free_vram(&mut self) -> Result<()> {
+        let free_bytes = self.cu.query_free_mem()?;
+        self.info.free_gib = free_bytes as f64 / 2f64.powi(30);
+        Ok(())
+    }
+
+    /// Current free VRAM in GiB, refreshed on demand.
+    pub fn free_vram_gib(&mut self) -> Result<f64> {
+        self.refresh_free_vram()?;
+        Ok(self.info.free_gib)
     }
 
     /// Grow the device-local activation arena. Like the Vulkan tier's `reserve`,
@@ -283,9 +317,78 @@ impl CudaGpu {
         }
     }
 
+    /// Execute a launch on a specific stream (for graph capture).
+    fn exec_on_stream(&mut self, l: Launch, stream: Handle) -> Result<()> {
+        let arena = self.arena_dev;
+        match l {
+            Launch::Axpy { n, x_off, y_off, w, set } => {
+                let (mut a, mut n, mut x, mut y, mut w, mut s) =
+                    (arena, n, x_off, y_off, w, set as u32);
+                let mut p = [arg(&mut a), arg(&mut n), arg(&mut x), arg(&mut y), arg(&mut w), arg(&mut s)];
+                self.cu.launch_on_stream(self.funcs[Op::Axpy as usize], stream, div_up(n, 256), 256, 0, &mut p)
+            }
+            Launch::SiluMul { n, a_off, b_off, y_off } => {
+                let (mut a, mut n, mut x, mut b, mut y) = (arena, n, a_off, b_off, y_off);
+                let mut p = [arg(&mut a), arg(&mut n), arg(&mut x), arg(&mut b), arg(&mut y)];
+                self.cu.launch_on_stream(self.funcs[Op::SiluMul as usize], stream, div_up(n, 256), 256, 0, &mut p)
+            }
+            Launch::RmsNorm { n, x_off, w_off, y_off, eps } => {
+                let (mut a, mut n, mut x, mut w, mut y, mut e) = (arena, n, x_off, w_off, y_off, eps);
+                let mut p = [arg(&mut a), arg(&mut n), arg(&mut x), arg(&mut w), arg(&mut y), arg(&mut e)];
+                self.cu.launch_on_stream(self.funcs[Op::RmsNorm as usize], stream, 1, 256, 0, &mut p)
+            }
+            Launch::GemvQ4 { w, s, rows, cols, group, x_off, y_off } => {
+                let (mut w, mut s, mut a, mut r, mut c, mut g, mut x, mut y, mut base) =
+                    (w, s, arena, rows, cols, group, x_off, y_off, 0u32);
+                let mut p = [
+                    arg(&mut w), arg(&mut s), arg(&mut a), arg(&mut r), arg(&mut c),
+                    arg(&mut g), arg(&mut x), arg(&mut y), arg(&mut base),
+                ];
+                self.cu.launch_on_stream(self.funcs[Op::GemvQ4 as usize], stream, rows, 64, 0, &mut p)
+            }
+            Launch::GemvHalf { w, f16, rows, cols, x_off, y_off } => {
+                let (mut w, mut a, mut r, mut c, mut x, mut y, mut base) =
+                    (w, arena, rows, cols, x_off, y_off, 0u32);
+                let mut p = [
+                    arg(&mut w), arg(&mut a), arg(&mut r), arg(&mut c),
+                    arg(&mut x), arg(&mut y), arg(&mut base),
+                ];
+                let op = if f16 { Op::GemvF16 } else { Op::GemvBf16 };
+                self.cu.launch_on_stream(self.funcs[op as usize], stream, div_up(rows, 4), 256, 0, &mut p)
+            }
+            Launch::GdnConv { w, state, base, cd, kernel, hist } => {
+                let (mut a, mut wp, mut sp, mut b, mut c, mut k, mut h) = (arena, w, state, base, cd, kernel, hist);
+                let mut p = [arg(&mut a), arg(&mut wp), arg(&mut sp), arg(&mut b), arg(&mut c), arg(&mut k), arg(&mut h)];
+                self.cu.launch_on_stream(self.funcs[Op::GdnConv as usize], stream, div_up(cd, 256), 256, 0, &mut p)
+            }
+            Launch::GdnRec { w, state, base, out_off, kd, nv, dk, dv, rep, eps } => {
+                let (mut a, mut wp, mut sp, mut b, mut o, mut k, mut n, mut dkk, mut dvv, mut r, mut e) =
+                    (arena, w, state, base, out_off, kd, nv, dk, dv, rep, eps);
+                let mut p = [
+                    arg(&mut a), arg(&mut wp), arg(&mut sp), arg(&mut b), arg(&mut o), arg(&mut k),
+                    arg(&mut n), arg(&mut dkk), arg(&mut dvv), arg(&mut r), arg(&mut e),
+                ];
+                self.cu.launch_on_stream(self.funcs[Op::GdnRec as usize], stream, nv, 512, 0, &mut p)
+            }
+        }
+    }
+
     pub fn wait(&mut self) -> Result<()> {
         let t0 = std::time::Instant::now();
         let r = self.cu.sync();
+        self.sync_ms += t0.elapsed().as_secs_f64() * 1e3;
+        self.syncs += 1;
+        r
+    }
+
+    /// Wait on the capture stream instead of the default.
+    pub fn wait_stream(&mut self) -> Result<()> {
+        let t0 = std::time::Instant::now();
+        let r = if self.stream.is_null() {
+            self.cu.sync()
+        } else {
+            self.cu.sync_stream(self.stream)
+        };
         self.sync_ms += t0.elapsed().as_secs_f64() * 1e3;
         self.syncs += 1;
         r
@@ -304,6 +407,8 @@ impl CudaGpu {
         self.dispatches = 0;
         self.sync_ms = 0.0;
         self.syncs = 0;
+        self.graph_hits = 0;
+        self.graph_captures = 0;
     }
 }
 
@@ -314,6 +419,14 @@ impl Drop for CudaGpu {
             self.cu.free(b.ptr);
         }
         self.cu.free(self.arena_dev);
+        // Clean up cached graph executables
+        for (_, exec) in self.graph_cache.drain() {
+            self.cu.destroy_graph_exec(exec);
+        }
+        // Clean up the stream
+        if !self.stream.is_null() {
+            self.cu.destroy_stream(self.stream);
+        }
     }
 }
 
@@ -389,6 +502,90 @@ impl<'a> CudaBatch<'a> {
     pub fn run(&mut self) -> Result<()> {
         self.submit()?;
         self.gpu.wait()
+    }
+
+    /// Compute a hash of the launch queue for graph cache lookup.
+    fn queue_hash(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.queue.len().hash(&mut hasher);
+        for l in &self.queue {
+            // Hash the launch shape (op type and key parameters)
+            match *l {
+                Launch::Axpy { n, set, .. } => { (0u8, n, set as u8).hash(&mut hasher) }
+                Launch::SiluMul { n, .. } => { (1u8, n).hash(&mut hasher) }
+                Launch::RmsNorm { n, eps, .. } => { (2u8, n, eps.to_bits()).hash(&mut hasher) }
+                Launch::GemvQ4 { rows, cols, group, .. } => { (3u8, rows, cols, group).hash(&mut hasher) }
+                Launch::GemvHalf { f16, rows, cols, .. } => { (4u8, f16 as u8, rows, cols).hash(&mut hasher) }
+                Launch::GdnConv { base, cd, kernel, hist, .. } => { (5u8, base, cd, kernel, hist).hash(&mut hasher) }
+                Launch::GdnRec { base, kd, nv, dk, dv, rep, eps, .. } => {
+                    (6u8, base, kd, nv, dk, dv, rep, eps.to_bits()).hash(&mut hasher)
+                }
+            }
+        }
+        hasher.finish()
+    }
+
+    /// Submit the batch using a cached CUDA graph if available, or capture and
+    /// cache it on first use. Graph replay avoids per-launch driver overhead.
+    pub fn submit_graph(&mut self) -> Result<()> {
+        if !self.live {
+            return Err("batch already submitted".into());
+        }
+        self.live = false;
+
+        // Check if we have a cached graph for this launch pattern
+        let hash = self.queue_hash();
+        if let Some(&exec) = self.gpu.graph_cache.get(&hash) {
+            // Replay the cached graph
+            self.gpu.cu.launch_graph(exec, self.gpu.stream)?;
+            self.gpu.graph_hits += 1;
+            self.gpu.submitted += 1;
+            self.gpu.dispatches += self.queue.len() as u64;
+            self.queue.clear();
+            return Ok(());
+        }
+
+        // First time seeing this pattern: capture it into a graph
+        if self.gpu.stream.is_null() {
+            // Fall back to normal submit if stream creation failed
+            return self.submit();
+        }
+
+        // Begin capture on the stream
+        self.gpu.cu.begin_capture(self.gpu.stream)?;
+
+        // Execute the launches on the capture stream (they are recorded, not run)
+        let q = std::mem::take(&mut self.queue);
+        for l in &q {
+            self.gpu.exec_on_stream(*l, self.gpu.stream)?;
+            self.gpu.dispatches += 1;
+        }
+
+        // End capture and get the graph
+        let graph = self.gpu.cu.end_capture(self.gpu.stream)?;
+
+        // Instantiate the graph into an executable
+        let exec = self.gpu.cu.instantiate_graph(graph)?;
+
+        // Cache the executable (we keep the graph alive via the exec)
+        self.gpu.graph_cache.insert(hash, exec);
+        self.gpu.graph_captures += 1;
+        self.gpu.submitted += 1;
+
+        // Clean up the graph (the exec holds a reference)
+        self.gpu.cu.destroy_graph(graph);
+
+        // Now launch the graph for real
+        self.gpu.cu.launch_graph(exec, self.gpu.stream)?;
+
+        Ok(())
+    }
+
+    /// Submit and wait using graph capture/replay.
+    pub fn run_graph(&mut self) -> Result<()> {
+        self.submit_graph()?;
+        self.gpu.wait_stream()
     }
 }
 

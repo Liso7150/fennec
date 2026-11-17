@@ -439,6 +439,7 @@ mod tests {
             api: String::new(),
             driver: String::new(),
             device_local_gib: 8.0,
+            free_gib: 0.0,
             dedicated_gib: 8.0,
             host_visible_gib: 0.0,
             heaps: vec![],

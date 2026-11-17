@@ -39,6 +39,9 @@ const CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES: c_int = 4;
 const CU_JIT_ERROR_LOG_BUFFER: c_int = 5;
 const CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES: c_int = 6;
 
+// CUDA graph capture flags
+const CU_STREAM_CAPTURE_MODE_RELAXED: c_uint = 2;
+
 /// The driver entry points this backend uses. Resolved once at load, so a
 /// launch is a direct call through a function pointer, same as the Vulkan api.
 struct Api {
@@ -60,6 +63,7 @@ struct Api {
     module_get_function: unsafe extern "system" fn(*mut Handle, Handle, *const c_char) -> c_int,
     mem_alloc: unsafe extern "system" fn(*mut DevPtr, usize) -> c_int,
     mem_free: unsafe extern "system" fn(DevPtr) -> c_int,
+    mem_get_info: unsafe extern "system" fn(*mut usize, *mut usize) -> c_int,
     memcpy_htod: unsafe extern "system" fn(DevPtr, *const c_void, usize) -> c_int,
     memcpy_dtoh: unsafe extern "system" fn(*mut c_void, DevPtr, usize) -> c_int,
     launch_kernel: unsafe extern "system" fn(
@@ -67,6 +71,16 @@ struct Api {
         *mut *mut c_void, *mut *mut c_void,
     ) -> c_int,
     get_error_string: unsafe extern "system" fn(c_int, *mut *const c_char) -> c_int,
+    // Stream and graph APIs for command buffer reuse
+    stream_create: unsafe extern "system" fn(*mut Handle) -> c_int,
+    stream_destroy: unsafe extern "system" fn(Handle) -> c_int,
+    stream_synchronize: unsafe extern "system" fn(Handle) -> c_int,
+    stream_begin_capture: unsafe extern "system" fn(Handle, c_uint) -> c_int,
+    stream_end_capture: unsafe extern "system" fn(Handle, *mut Handle) -> c_int,
+    graph_instantiate: unsafe extern "system" fn(*mut Handle, Handle, *mut c_void, *mut c_char, usize) -> c_int,
+    graph_launch: unsafe extern "system" fn(Handle, Handle) -> c_int,
+    graph_destroy: unsafe extern "system" fn(Handle) -> c_int,
+    graph_exec_destroy: unsafe extern "system" fn(Handle) -> c_int,
 }
 
 macro_rules! resolve {
@@ -81,6 +95,7 @@ pub struct CudaDevice {
     pub index: usize,
     pub name: String,
     pub total_gib: f64,
+    pub free_gib: f64,
     pub compute: (i32, i32),
 }
 
@@ -134,10 +149,20 @@ impl Cuda {
                 module_get_function: resolve!(lib, "cuModuleGetFunction", unsafe extern "system" fn(*mut Handle, Handle, *const c_char) -> c_int),
                 mem_alloc: resolve!(lib, "cuMemAlloc_v2", unsafe extern "system" fn(*mut DevPtr, usize) -> c_int),
                 mem_free: resolve!(lib, "cuMemFree_v2", unsafe extern "system" fn(DevPtr) -> c_int),
+                mem_get_info: resolve!(lib, "cuMemGetInfo_v2", unsafe extern "system" fn(*mut usize, *mut usize) -> c_int),
                 memcpy_htod: resolve!(lib, "cuMemcpyHtoD_v2", unsafe extern "system" fn(DevPtr, *const c_void, usize) -> c_int),
                 memcpy_dtoh: resolve!(lib, "cuMemcpyDtoH_v2", unsafe extern "system" fn(*mut c_void, DevPtr, usize) -> c_int),
                 launch_kernel: resolve!(lib, "cuLaunchKernel", unsafe extern "system" fn(Handle, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, Handle, *mut *mut c_void, *mut *mut c_void) -> c_int),
                 get_error_string: resolve!(lib, "cuGetErrorString", unsafe extern "system" fn(c_int, *mut *const c_char) -> c_int),
+                stream_create: resolve!(lib, "cuStreamCreate", unsafe extern "system" fn(*mut Handle) -> c_int),
+                stream_destroy: resolve!(lib, "cuStreamDestroy_v2", unsafe extern "system" fn(Handle) -> c_int),
+                stream_synchronize: resolve!(lib, "cuStreamSynchronize", unsafe extern "system" fn(Handle) -> c_int),
+                stream_begin_capture: resolve!(lib, "cuStreamBeginCapture_v2", unsafe extern "system" fn(Handle, c_uint) -> c_int),
+                stream_end_capture: resolve!(lib, "cuStreamEndCapture", unsafe extern "system" fn(Handle, *mut Handle) -> c_int),
+                graph_instantiate: resolve!(lib, "cuGraphInstantiate_v2", unsafe extern "system" fn(*mut Handle, Handle, *mut c_void, *mut c_char, usize) -> c_int),
+                graph_launch: resolve!(lib, "cuGraphLaunch", unsafe extern "system" fn(Handle, Handle) -> c_int),
+                graph_destroy: resolve!(lib, "cuGraphDestroy", unsafe extern "system" fn(Handle) -> c_int),
+                graph_exec_destroy: resolve!(lib, "cuGraphExecDestroy", unsafe extern "system" fn(Handle) -> c_int),
             }
         };
         let mut cuda = Cuda {
@@ -209,14 +234,31 @@ impl Cuda {
                 (self.api.device_get_attribute)(&mut major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev);
                 (self.api.device_get_attribute)(&mut minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev);
             }
+            // Query free memory on this device's context
+            let free_bytes = self.query_free_mem()?;
             out.push(CudaDevice {
                 index: i as usize,
                 name: String::from_utf8_lossy(&name).into_owned(),
                 total_gib: bytes as f64 / 2f64.powi(30),
+                free_gib: free_bytes as f64 / 2f64.powi(30),
                 compute: (major, minor),
             });
         }
         Ok(out)
+    }
+
+    /// Query free memory on the current context. Returns bytes available for allocation.
+    pub fn query_free_mem(&self) -> Result<usize> {
+        if self.ctx.is_null() {
+            return Ok(0);
+        }
+        let mut free: usize = 0;
+        let mut total: usize = 0;
+        self.check(
+            unsafe { (self.api.mem_get_info)(&mut free, &mut total) },
+            "cuMemGetInfo",
+        )?;
+        Ok(free)
     }
 
     /// Create a context on `index` and JIT the checked-in PTX. SCHED_SPIN makes
@@ -354,6 +396,125 @@ impl Cuda {
     pub fn sync(&mut self) -> Result<()> {
         self.bind();
         self.check(unsafe { (self.api.ctx_synchronize)() }, "cuCtxSynchronize")
+    }
+
+    /// Create a CUDA stream for async operations and graph capture.
+    pub fn create_stream(&mut self) -> Result<Handle> {
+        self.bind();
+        let mut stream: Handle = std::ptr::null_mut();
+        self.check(
+            unsafe { (self.api.stream_create)(&mut stream) },
+            "cuStreamCreate",
+        )?;
+        Ok(stream)
+    }
+
+    /// Destroy a stream created with create_stream.
+    pub fn destroy_stream(&mut self, stream: Handle) {
+        if stream.is_null() {
+            return;
+        }
+        self.bind();
+        unsafe { (self.api.stream_destroy)(stream) };
+    }
+
+    /// Begin capturing kernel launches on a stream. Returns when capture is active;
+    /// subsequent launches on this stream are recorded, not executed.
+    pub fn begin_capture(&mut self, stream: Handle) -> Result<()> {
+        self.bind();
+        self.check(
+            unsafe { (self.api.stream_begin_capture)(stream, CU_STREAM_CAPTURE_MODE_RELAXED) },
+            "cuStreamBeginCapture",
+        )
+    }
+
+    /// End capture and return the recorded graph. The stream reverts to normal mode.
+    pub fn end_capture(&mut self, stream: Handle) -> Result<Handle> {
+        self.bind();
+        let mut graph: Handle = std::ptr::null_mut();
+        self.check(
+            unsafe { (self.api.stream_end_capture)(stream, &mut graph) },
+            "cuStreamEndCapture",
+        )?;
+        Ok(graph)
+    }
+
+    /// Instantiate a graph into an executable that can be launched.
+    pub fn instantiate_graph(&mut self, graph: Handle) -> Result<Handle> {
+        self.bind();
+        let mut exec: Handle = std::ptr::null_mut();
+        let mut log_buf = vec![0u8; 1024];
+        self.check(
+            unsafe {
+                (self.api.graph_instantiate)(
+                    &mut exec,
+                    graph,
+                    std::ptr::null_mut(),
+                    log_buf.as_mut_ptr() as *mut c_char,
+                    log_buf.len(),
+                )
+            },
+            "cuGraphInstantiate",
+        )?;
+        Ok(exec)
+    }
+
+    /// Launch an instantiated graph on a stream.
+    pub fn launch_graph(&mut self, exec: Handle, stream: Handle) -> Result<()> {
+        self.bind();
+        self.check(
+            unsafe { (self.api.graph_launch)(exec, stream) },
+            "cuGraphLaunch",
+        )
+    }
+
+    /// Destroy a graph created with end_capture.
+    pub fn destroy_graph(&mut self, graph: Handle) {
+        if graph.is_null() {
+            return;
+        }
+        self.bind();
+        unsafe { (self.api.graph_destroy)(graph) };
+    }
+
+    /// Destroy an instantiated graph executable.
+    pub fn destroy_graph_exec(&mut self, exec: Handle) {
+        if exec.is_null() {
+            return;
+        }
+        self.bind();
+        unsafe { (self.api.graph_exec_destroy)(exec) };
+    }
+
+    /// Synchronize a specific stream (wait for all work on it to complete).
+    pub fn sync_stream(&mut self, stream: Handle) -> Result<()> {
+        self.bind();
+        self.check(
+            unsafe { (self.api.stream_synchronize)(stream) },
+            "cuStreamSynchronize",
+        )
+    }
+
+    /// Launch a kernel on a specific stream instead of the default.
+    pub fn launch_on_stream(
+        &mut self,
+        f: Handle,
+        stream: Handle,
+        grid: u32,
+        block: u32,
+        shared: u32,
+        params: &mut [*mut c_void],
+    ) -> Result<()> {
+        self.bind();
+        self.check(
+            unsafe {
+                (self.api.launch_kernel)(
+                    f, grid, 1, 1, block, 1, 1, shared, stream,
+                    params.as_mut_ptr(), std::ptr::null_mut(),
+                )
+            },
+            "cuLaunchKernel",
+        )
     }
 }
 
