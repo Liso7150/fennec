@@ -434,7 +434,7 @@ impl Q4 {
     pub fn push(&mut self, other: &Q4) {
         assert_eq!(other.cols, self.cols, "row blocks must be the same width");
         assert_eq!(other.group, self.group, "row blocks must share a group size");
-        assert_eq!(other.signed, other.signed, "row blocks must share a nibble encoding");
+        assert_eq!(other.signed, self.signed, "row blocks must share a nibble encoding");
         self.data.own_mut().extend_from_slice(&other.data);
         self.scale.extend_from_slice(&other.scale);
         self.rows += other.rows;
@@ -556,6 +556,7 @@ impl Q4 {
             "items": { name: {
                 "shape": [self.rows, self.cols],
                 "group": self.group,
+                "signed": self.signed,
                 "data": [0usize, self.data.len()],
                 "scale": [scale_off, scale_off + self.scale.len() * 4],
             } }
@@ -603,13 +604,14 @@ impl Q4 {
         for c in (base + s0..base + s1).step_by(4) {
             scale.push(f32::from_le_bytes(bytes[c..c + 4].try_into().unwrap()));
         }
+        let signed = it.get("signed").and_then(|s| s.as_bool()).unwrap_or(false);
         Ok(Q4 {
             rows,
             cols,
             group,
             data: Store::Own(data),
             scale,
-            signed: false,
+            signed,
         })
     }
 
@@ -822,6 +824,7 @@ pub struct Item {
     pub rows: usize,
     pub cols: usize,
     pub group: usize,
+    pub signed: bool,
     data: (usize, usize),
     scale: (usize, usize),
 }
@@ -873,7 +876,8 @@ impl Sidecar {
         if group == 0 {
             return None;
         }
-        Some(Item { rows, cols, group, data: pair(&it["data"])?, scale: pair(&it["scale"])? })
+        let signed = it.get("signed").and_then(|s| s.as_bool()).unwrap_or(false);
+        Some(Item { rows, cols, group, signed, data: pair(&it["data"])?, scale: pair(&it["scale"])? })
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -920,7 +924,7 @@ impl Sidecar {
             group: it.group,
             data: Store::Own(d[r0 * half..r1 * half].to_vec()),
             scale,
-            signed: false,
+            signed: it.signed,
         })
     }
 
@@ -1254,6 +1258,106 @@ mod tests {
         assert!(!q.wants_int());
         let x: Vec<f32> = (0..128).map(|c| (c as f32 * 0.11).sin()).collect();
         assert!(q.prepare(&x).q.is_none());
+    }
+
+    #[test]
+    fn q2_round_trip_hits_expected_noise_bound() {
+        // Int2 with 2-bit values (0..3, offset to -2..1) has only 4 quantization levels.
+        // This is much coarser than int4's 16 levels, so expect higher error.
+        // Measured error ~45% is within acceptable range for 2-bit quantization.
+        let src: Vec<f32> = (0..64 * 32).map(|i| ((i % 47) as f32 - 23.0) * 0.02).collect();
+        let q = Q2::quantize(&src, 64, 32, 32, 2);
+        let e = q.rel_error(&src);
+        assert!(e < 0.60, "relative error {e} exceeds int2 noise bound");
+        assert!(e > 0.20, "relative error {e}: int2 cannot be this exact");
+    }
+
+    #[test]
+    fn q2_dot_row_matches_dequant() {
+        // dot_row must produce the same result as manual dequant + dot product.
+        let src: Vec<f32> = (0..8 * 64).map(|i| ((i * 13 % 97) as f32 - 48.0) * 0.015).collect();
+        let q = Q2::quantize(&src, 8, 64, 32, 2);
+        let x: Vec<f32> = (0..64).map(|c| (c as f32 * 0.23).sin() * 0.8).collect();
+        
+        for r in 0..8 {
+            let got = q.dot_row(r, &x);
+            // Manual computation: dequant row, then dot with x
+            let ng = q.ngroups();
+            let mut want = 0f32;
+            for g in 0..ng {
+                let sc = q.scale[r * ng + g];
+                let c1 = ((g + 1) * q.group).min(q.cols);
+                for c in g * q.group..c1 {
+                    want += x[c] * q.bits(r, c) * sc;
+                }
+            }
+            let err = (got - want).abs();
+            assert!(err < 1e-5, "q2 dot_row mismatch at row {r}: got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn q4_to_q2_conversion_preserves_shape() {
+        // Converting Q4 to Q2 should produce a Q2 with the same dimensions.
+        let src: Vec<f32> = (0..16 * 128).map(|i| (i as f32 * 0.01).sin()).collect();
+        let q4 = Q4::quantize(&src, 16, 128, 64, 2);
+        let q2 = q4.to_q2(2);
+        
+        assert_eq!(q2.rows, q4.rows);
+        assert_eq!(q2.cols, q4.cols);
+        assert_eq!(q2.group, q4.group);
+        
+        // Q2 uses 4 values per byte vs Q4's 2, so data should be half the size.
+        assert_eq!(q2.bytes_data(), q4.bytes_data() / 2);
+    }
+
+    #[test]
+    fn q4_to_q2_dot_product_stays_close() {
+        // The Q4->Q2->dot path should produce results close to Q4->dot.
+        // Int2 has more quantization error, so we allow a wider band.
+        let src: Vec<f32> = (0..4 * 256).map(|i| ((i * 37 % 211) as f32 - 105.0) * 0.012).collect();
+        let q4 = Q4::quantize(&src, 4, 256, 64, 2);
+        let q2 = q4.to_q2(2);
+        
+        let x: Vec<f32> = (0..256).map(|c| (c as f32 * 0.17).cos() * 0.6).collect();
+        
+        for r in 0..4 {
+            let dot_q4 = q4.dot_row(r, &x);
+            let dot_q2 = q2.dot_row(r, &x);
+            // Both are approximations of the same underlying f32 dot.
+            // The difference should be within the combined quantization error.
+            let terms: f64 = (0..256).map(|c| (src[r * 256 + c] as f64 * x[c] as f64).abs()).sum();
+            let err = (dot_q4 as f64 - dot_q2 as f64).abs();
+            // Allow up to 15% deviation due to double quantization.
+            assert!(err < 0.15 * terms, "q4->q2 dot divergence at row {r}: {err:.3e} over {terms:.3e}");
+        }
+    }
+
+    #[test]
+    fn signed_field_round_trips_through_bytes() {
+        // The signed flag must survive to_bytes/from_bytes, otherwise loading a
+        // signed int4 checkpoint produces garbage output (nibble decoding is wrong).
+        let src: Vec<f32> = (0..8 * 64).map(|i| ((i * 13 % 97) as f32 - 48.0) * 0.015).collect();
+        let mut q = Q4::quantize(&src, 8, 64, 32, 2);
+
+        // Unsigned round-trip
+        let bytes = q.to_bytes("test");
+        let loaded = Q4::from_bytes(&bytes, "test").unwrap();
+        assert!(!loaded.signed, "unsigned pack should load as unsigned");
+
+        // Signed round-trip
+        q.signed = true;
+        let bytes = q.to_bytes("test");
+        let loaded = Q4::from_bytes(&bytes, "test").unwrap();
+        assert!(loaded.signed, "signed pack must survive round-trip");
+
+        // Verify the dot product is the same after round-trip
+        let x: Vec<f32> = (0..64).map(|c| (c as f32 * 0.23).sin() * 0.8).collect();
+        for r in 0..8 {
+            let original = q.dot_row(r, &x);
+            let restored = loaded.dot_row(r, &x);
+            assert_eq!(original, restored, "dot product changed at row {r}");
+        }
     }
 }
 

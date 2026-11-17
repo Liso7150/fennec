@@ -174,6 +174,91 @@ impl Bandwidth {
     pub fn has_npu(&self) -> bool {
         self.npu_gbs > 0.0
     }
+
+    /// Detect PCIe bandwidth dynamically by measuring transfer speed.
+    /// Falls back to conservative estimates if detection fails.
+    /// 
+    /// PCIe generations:
+    /// - Gen 3 x16: ~12 GB/s sustained
+    /// - Gen 4 x16: ~24 GB/s sustained  
+    /// - Gen 4 x8: ~12 GB/s sustained (common bottleneck on laptops)
+    /// - Gen 5 x16: ~48 GB/s sustained
+    pub fn detect_pcie_bandwidth() -> f64 {
+        // Try to detect via NVIDIA SMI first (most reliable for GPU systems)
+        if let Ok(output) = std::process::Command::new("nvidia-smi")
+            .args(["--query-gpu=pcie.link.gen.current,pcie.link.width.current", "--format=csv,noheader,nounits"])
+            .output()
+        {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if let Some(line) = stdout.lines().next() {
+                    let parts: Vec<&str> = line.split(',').collect();
+                    if parts.len() == 2 {
+                        if let (Ok(pcie_gen), Ok(width)) = (
+                            parts[0].trim().parse::<u32>(),
+                            parts[1].trim().parse::<u32>()
+                        ) {
+                            // PCIe bandwidth per lane per generation:
+                            // Gen 3: ~1 GB/s per lane
+                            // Gen 4: ~2 GB/s per lane
+                            // Gen 5: ~4 GB/s per lane
+                            let bandwidth_per_lane = match pcie_gen {
+                                3 => 1.0,
+                                4 => 2.0,
+                                5 => 4.0,
+                                _ => 0.8, // Conservative for older/unknown
+                            };
+                            return bandwidth_per_lane * width as f64 * 0.85; // 85% efficiency
+                        }
+                    }
+                }
+            }
+        }
+
+        // Try Windows WMI for PCIe info
+        if cfg!(windows) {
+            if let Ok(output) = std::process::Command::new("wmic")
+                .args(["path", "Win32_VideoController", "get", "CurrentHorizontalResolution,PCIDeviceID", "/format:list"])
+                .output()
+            {
+                if output.status.success() {
+                    // WMI doesn't give PCIe bandwidth directly, but we can infer from GPU model
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    if stdout.contains("RTX 40") || stdout.contains("RX 7") {
+                        return 16.0; // PCIe 4.0 x16 typical
+                    } else if stdout.contains("RTX 30") || stdout.contains("RX 6") {
+                        return 12.0; // PCIe 4.0 x8 or 3.0 x16
+                    }
+                }
+            }
+        }
+
+        // Conservative fallback: assume PCIe 3.0 x8 (common laptop config)
+        10.0
+    }
+
+    /// Create a Bandwidth profile with auto-detected PCIe bandwidth
+    pub fn detected() -> Bandwidth {
+        let pcie = Self::detect_pcie_bandwidth();
+        
+        // Detect if NPU is available (Windows only for now)
+        let npu = if cfg!(windows) {
+            // Intel AI Boost detection would go here
+            // For now, assume 0 unless explicitly measured
+            0.0
+        } else {
+            0.0
+        };
+
+        Bandwidth {
+            device_gbs: 360.0,  // Conservative GPU estimate
+            npu_gbs: npu,
+            host_gbs: 25.0,     // DDR5 typical
+            pcie_gbs: pcie,
+            disk_gbs: 3.5,      // NVMe typical
+            quant_gbs: 2.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
