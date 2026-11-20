@@ -188,7 +188,7 @@ fennec serve --backend ort --model <model-dir>
 ## Testing
 
 ```bash
-# Run all tests (119 passing)
+# Run all tests (195 passing)
 cargo test --release --offline
 
 # Backend-specific tests
@@ -202,14 +202,16 @@ FENNEC_GOLDEN_MODEL=<model-dir> cargo test --release --offline --test golden
 python tools/smoke_serve.py  # 30 checks against running server
 ```
 
-**Test coverage**: 119 tests total
-- 79 unit tests (quantizer, kernels, auth, sampler, device discovery, memory)
-- 14 golden tests against transformers 5.22.2 reference
-- 9 device-vs-CPU integration tests
-- 6 tokenizer tests
-- 5 dense-lane tests (4 batched-prefill/dense-checkpoint, 1 int8 trunk quality)
-- 2 binary tests (CLI option parsing)
-- 1 Edge0 benchmark-harness test, 1 doctest
+**Test coverage**: 195 passed, 0 failed, 4 ignored across 9 suites
+- `src/` unit tests: quantizer, kernels, auth, samplers, device discovery, memory
+- golden tests against the pinned transformers 5.22.2 reference (`tests/golden.rs`)
+- device-vs-CPU integration tests (`tests/gpu.rs`, run once per backend)
+- tokenizer, dense-lane and Edge0-harness tests (`tests/tokenizer.rs`, `tests/dense.rs`,
+  `tests/dense_i8.rs`, `tests/edge0_bench.rs`)
+
+The per-suite split is whatever the run above prints; the total, the ignored count and
+the suite count come from `benchmarks/results/RESULTS.json` in the suite checkout, and
+`python benchmarks/results.py sync` rewrites the line above from it.
 
 CI runs the whole suite on Windows, macOS (ARM64) and Ubuntu x86_64. The golden
 bands follow the kernel that produced them: `kernel::dot` reduces in 8 AVX2 lanes

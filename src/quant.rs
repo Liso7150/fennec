@@ -40,11 +40,18 @@ impl Store {
         }
     }
 
-    /// Allocator capacity, which for a mapping is just its length.
+    /// Bytes this process committed, as opposed to bytes it reads.
+    ///
+    /// A mapping counts as nothing: the pages are the file cache, shared with
+    /// every other holder of the same `Arc` and handed back to the OS without a
+    /// write when it needs the room. Reporting a borrowed pack's length as though
+    /// it were a copy would say the streamed ring holds 1.7 MiB per expert when
+    /// all it holds is the scales, which is the number the memory report exists
+    /// to steer. `bytes_total` stays the size of the matrix itself.
     pub fn held(&self) -> usize {
         match self {
             Store::Own(v) => v.capacity(),
-            Store::Map(_, _, len) => *len,
+            Store::Map(..) => 0,
         }
     }
 
@@ -93,6 +100,22 @@ pub struct Q4 {
     /// container stores them that way; reading it in place saves the copy and
     /// the XOR pass, and costs the kernel one vector XOR per 32 columns.
     pub signed: bool,
+}
+
+impl Q4 {
+    /// An empty matrix, holding nothing. This is what a ring slot looks like
+    /// while its real buffers are out being refilled, and the destination
+    /// `Sidecar::rows_into` grows on first use.
+    pub fn blank() -> Q4 {
+        Q4 {
+            rows: 0,
+            cols: 0,
+            group: 1,
+            data: Store::Own(Vec::new()),
+            scale: Vec::new(),
+            signed: false,
+        }
+    }
 }
 
 /// Int2 grouped weights: 4 values per byte, one f32 scale per `group` columns.
@@ -837,7 +860,9 @@ pub struct Item {
 /// bf16, and the resident set costs a memcpy per expert rather than a
 /// read-convert-pack pass over the source shard.
 pub struct Sidecar {
-    map: Mmap,
+    /// Shared with every pack `rows_borrowed` hands out, so a streamed expert can
+    /// hold the file open by itself and the ring needs no buffer of its own.
+    map: Arc<Mmap>,
     base: usize,
     items: serde_json::Value,
 }
@@ -847,7 +872,9 @@ impl Sidecar {
         let path = path.as_ref();
         let show = || path.display().to_string();
         let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", show()))?;
-        let map = unsafe { Mmap::map(&file) }.map_err(|e| format!("{} mmap: {e}", show()))?;
+        let map = unsafe { Mmap::map(&file) }
+            .map(Arc::new)
+            .map_err(|e| format!("{} mmap: {e}", show()))?;
         if map.len() < 16 || &map[..8] != &MAGIC[..] {
             return Err(format!("{}: not an FNN1Q4 sidecar", show()));
         }
@@ -904,6 +931,19 @@ impl Sidecar {
 
     /// Rows `[r0, r1)` of one matrix, copied out of the map.
     pub fn rows(&self, it: &Item, r0: usize, r1: usize) -> Result<Q4> {
+        let mut q = Q4::blank();
+        self.rows_into(it, r0, r1, &mut q)?;
+        Ok(q)
+    }
+
+    /// The same copy, written into a matrix that already owns its buffers.
+    ///
+    /// The streamed tier replaces a ring slot every few tokens. Rebuilding the
+    /// destination means every replacement pays for 1.7 MiB of fresh pages -
+    /// commit, zeroing, first-touch faults - for bytes the ring already had a
+    /// home for. Writing in place keeps the steady-state streamed tier at zero
+    /// allocations, which is also what keeps its commit count flat.
+    pub fn rows_into(&self, it: &Item, r0: usize, r1: usize, dst: &mut Q4) -> Result<()> {
         if r0 > r1 || r1 > it.rows {
             return Err(format!("row range {r0}..{r1} outside {} rows", it.rows));
         }
@@ -914,28 +954,61 @@ impl Sidecar {
         if d.len() != it.rows * half || s.len() != it.rows * ng * 4 {
             return Err("sidecar payload does not match its declared shape".into());
         }
-        let mut scale = Vec::with_capacity((r1 - r0) * ng);
+        dst.rows = r1 - r0;
+        dst.cols = it.cols;
+        dst.group = it.group;
+        dst.signed = it.signed;
+        let own = dst.data.own_mut();
+        own.clear();
+        own.extend_from_slice(&d[r0 * half..r1 * half]);
+        dst.scale.clear();
         for c in (r0 * ng * 4..r1 * ng * 4).step_by(4) {
-            scale.push(f32::from_le_bytes(s[c..c + 4].try_into().unwrap()));
+            dst.scale.push(f32::from_le_bytes(s[c..c + 4].try_into().unwrap()));
         }
-        Ok(Q4 {
-            rows: r1 - r0,
-            cols: it.cols,
-            group: it.group,
-            data: Store::Own(d[r0 * half..r1 * half].to_vec()),
-            scale,
-            signed: it.signed,
-        })
+        Ok(())
     }
 
     fn payload(&self, span: (usize, usize)) -> Result<&[u8]> {
+        let (lo, hi) = self.span(span)?;
+        Ok(&self.map[lo..hi])
+    }
+
+    /// Rows `[r0, r1)` of one matrix, borrowed from the mapping instead of copied
+    /// out of it.
+    ///
+    /// The copied form made the streamed tier move each expert twice: once when
+    /// the kernel faulted the sidecar's pages in, once again into the ring slot
+    /// that held them. Borrowing leaves the nibbles in the file's page cache,
+    /// where two rings asking for the same block share one copy and the OS can
+    /// reclaim it without writing anything, and the only bytes this tier still
+    /// copies are the scales - a ninth of the pack.
+    pub fn rows_borrowed(&self, it: &Item, r0: usize, r1: usize) -> Result<Q4> {
+        if r0 > r1 || r1 > it.rows {
+            return Err(format!("row range {r0}..{r1} outside {} rows", it.rows));
+        }
+        let half = it.cols.div_ceil(2);
+        let ng = it.cols.div_ceil(it.group);
+        let (dlo, dhi) = self.span(it.data)?;
+        let (slo, shi) = self.span(it.scale)?;
+        if dhi - dlo != it.rows * half || shi - slo != it.rows * ng * 4 {
+            return Err("sidecar payload does not match its declared shape".into());
+        }
+        let mut qs = Vec::with_capacity((r1 - r0) * ng);
+        for c in (slo + r0 * ng * 4..slo + r1 * ng * 4).step_by(4) {
+            qs.push(f32::from_le_bytes(self.map[c..c + 4].try_into().unwrap()));
+        }
+        Ok(Q4::mapped(self.map.clone(), dlo + r0 * half, r1 - r0, it.cols, it.group, qs, it.signed))
+    }
+
+    /// Absolute `[lo, hi)` of one payload inside the mapping.
+    fn span(&self, span: (usize, usize)) -> Result<(usize, usize)> {
         let (a, b) = span;
         let lo = self.base.checked_add(a).ok_or("sidecar offset overflow")?;
         let hi = self.base.checked_add(b).ok_or("sidecar offset overflow")?;
         if a > b || hi > self.map.len() {
             return Err("sidecar payload runs past the file".into());
         }
-        Ok(&self.map[lo..hi])
+        Ok((lo, hi))
     }
 }
 
@@ -1170,6 +1243,78 @@ mod tests {
         assert!(sc.rows(&it, 0, 65).is_err());
         assert!(sc.rows(&it, 9, 4).is_err());
         assert!(sc.item("blk.9.ffn.gate_up_exps").is_none());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The streamed ring now borrows instead of copying, so `rows_borrowed` has
+    /// to hand back exactly the matrix `rows` does. An off-by-one in the data
+    /// offset is a wrong pack; one in the scale offset is the right pack with
+    /// the wrong scales, which the kernel only reports as subtly bad output.
+    #[test]
+    fn a_borrowed_row_range_is_the_copy_without_the_copy() {
+        let src: Vec<f32> = (0..64 * 32).map(|i| (i as f32 * 0.9).sin() * 0.7).collect();
+        let q = Q4::quantize(&src, 64, 32, 16, 4);
+        let p = tmp("rows-borrowed");
+        write_sc(&p, &[("blk.0.ffn.gate_up_exps", &q)], (4096, 7));
+        let sc = Sidecar::open(&p).unwrap();
+        let it = sc.item("blk.0.ffn.gate_up_exps").unwrap();
+        for (r0, r1) in [(0, 64), (8, 24), (63, 64), (0, 1), (17, 61)] {
+            let got = sc.rows_borrowed(&it, r0, r1).unwrap();
+            let want = sc.rows(&it, r0, r1).unwrap();
+            assert_eq!(got.data, want.data, "rows {r0}..{r1} data");
+            assert_eq!(got.scale, want.scale, "rows {r0}..{r1} scales");
+            assert_eq!(
+                (got.rows, got.cols, got.group, got.signed),
+                (want.rows, want.cols, want.group, want.signed),
+                "rows {r0}..{r1} shape"
+            );
+            assert_eq!(got.bytes_total(), want.bytes_total(), "rows {r0}..{r1} size");
+            assert!(got.is_mapped(), "a borrowed pack copied itself");
+            assert!(!want.is_mapped(), "rows() stopped copying");
+            // The memory this path exists to give back: a borrowed pack commits
+            // its scales and nothing else, a copied one commits the whole thing.
+            assert_eq!(got.bytes_held(), got.bytes_scale(), "rows {r0}..{r1} held");
+            assert!(want.bytes_held() >= want.bytes_total(), "the copy holds less");
+        }
+        assert!(sc.rows_borrowed(&it, 0, 65).is_err());
+        assert!(sc.rows_borrowed(&it, 9, 4).is_err());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The ring writes each streamed expert over the buffers the evicted one left
+    /// behind, so `rows_into` has to produce exactly what `rows` would from a
+    /// destination of *any* previous size - and leave none of the old expert
+    /// reachable. A missing `clear` here is a silently mixed two-expert matrix.
+    #[test]
+    fn rows_into_reuses_a_dirty_destination() {
+        let src: Vec<f32> = (0..64 * 32).map(|i| (i as f32 * 1.7).cos() * 0.9).collect();
+        let q = Q4::quantize(&src, 64, 32, 16, 4);
+        let p = tmp("rows-into");
+        write_sc(&p, &[("blk.0.ffn.down_exps", &q)], (4096, 7));
+        let sc = Sidecar::open(&p).unwrap();
+        let it = sc.item("blk.0.ffn.down_exps").unwrap();
+
+        for (r0, r1) in [(0, 64), (8, 24), (40, 41), (16, 56)] {
+            let mut dst = Q4::blank();
+            sc.rows_into(&it, r0, r1, &mut dst).unwrap();
+            let want = q.slice_rows(r0, r1);
+            assert_eq!(dst.data, want.data, "blank dst, rows {r0}..{r1}");
+            assert_eq!(dst.scale, want.scale, "blank dst, rows {r0}..{r1} scale");
+            assert_eq!((dst.rows, dst.cols, dst.group, dst.signed), (r1 - r0, it.cols, it.group, it.signed));
+            let fresh = sc.rows(&it, r0, r1).unwrap();
+            assert_eq!(dst.data, fresh.data, "rows_into disagrees with rows");
+            assert_eq!(dst.scale, fresh.scale, "rows_into disagrees with rows, scales");
+
+            // Now the same write into a destination still holding another expert.
+            let mut reused = sc.rows(&it, 0, 64).unwrap();
+            sc.rows_into(&it, r0, r1, &mut reused).unwrap();
+            assert_eq!(reused.data, want.data, "dirty dst, rows {r0}..{r1}");
+            assert_eq!(reused.scale, want.scale, "dirty dst, rows {r0}..{r1} scale");
+            assert_eq!(reused.rows, r1 - r0, "a reused slot kept the old row count");
+            assert_eq!(reused.bytes_total(), want.bytes_total(), "a reused slot kept the old size");
+        }
+        assert!(sc.rows_into(&it, 9, 4, &mut Q4::blank()).is_err());
+        assert!(sc.rows_into(&it, 0, 65, &mut Q4::blank()).is_err());
         let _ = std::fs::remove_file(&p);
     }
 

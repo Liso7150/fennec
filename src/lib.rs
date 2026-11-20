@@ -20,7 +20,6 @@
 //! time - the SPIR-V and the PTX are both checked in.
 
 pub mod backend;
-pub mod bandwidth;
 pub mod config;
 pub mod cuda;
 pub mod cudagpu;

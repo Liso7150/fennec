@@ -200,11 +200,12 @@ def main() -> int:
     # The real contract: drive fennec-core's own client at the running engine.
     try:
         sys.path.insert(0, "D:/Fennec-Suite/fennec-core")
-        from fennec_core import engine as eng
-        from fennec_core.config import load_config
+        # The core's modules sit at the checkout root, which is on sys.path above.
+        from engine import Engine
+        from config import load_config
         from dataclasses import replace
         cfg = replace(load_config(), engine_url=BASE, api_key=KEY)
-        client = eng.Engine(cfg)
+        client = Engine(cfg)
         check("core client sees the engine running", client.is_running())
         check("core client model_id matches", client.model_id() == model,
               f"{client.model_id()} != {model}")

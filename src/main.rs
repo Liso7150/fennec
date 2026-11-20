@@ -2,6 +2,11 @@
 //! can it read the checkpoint, where do the experts have to live, and how fast
 //! is the int4 CPU path on real weights.
 
+// `decode --json` is one flat object of every metric this command can measure,
+// and `json!` spends several macro frames per key, so the reported depth grows
+// with the report rather than with the nesting of the code.
+#![recursion_limit = "256"]
+
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -15,7 +20,7 @@ use fennec::kernel;
 use fennec::model::{Model, MoeLayer};
 use fennec::quant::Q4;
 use fennec::safetensors::Shards;
-use fennec::sched::{Bandwidth, Plan, Usage};
+use fennec::sched::{Bandwidth, Measured, Plan, Usage};
 use fennec::vk::Vulkan;
 
 struct Opts {
@@ -179,11 +184,11 @@ fn usage() {
          \x20 --group 32        quant group width (32 is the AVX2 path)\n\
          \x20 --threads N       default: one worker per physical core\n\
          \x20 --device GiB      GPU budget (default: the whole card)  --reserve 0.5 stays for KV and drivers\n\
-         \x20 --host 18.0       system-RAM pool in GiB\n\
+         \x20 --host 18.0       system-RAM pool, GiB of placed matrices (default 8.0; under run/serve `--host` is the bind address)\n\
          \x20 --cpu             price the plan with no GPU at all\n\
          \x20 --gpu [N]         device tier in VRAM: dense, experts + lm_head on ranked device N (default 0)\n\
          \x20 --backend NAME    cuda | vulkan | metal | cpu | ort (default: NVIDIA=cuda, Apple=metal, else vulkan; ort=ONNX Runtime dense)\n\
-         \x20 --usage PATH      .coli_usage router histogram (default: found next to the model)\n\
+         \x20 --usage PATH      router histogram to rank the plan by (default: .fennec_usage, else .coli_usage, next to the model)\n\
          \x20 --layers 0,3,39   which layers to quantise, or `all`\n\
          \x20 --out PATH        sidecar path for `quant`\n\
          \x20 --fq4 PATH        FQ4 expert cache to load instead of re-quantising (or FENNEC_FQ4)\n\
@@ -195,14 +200,13 @@ fn usage() {
          \x20 --prompt IDS      comma-separated token ids (default: the fixture trace)\n\
          \x20 --verbose         per-layer placement table\n\
          \x20 --json            one machine-readable line as well\n\
-         \x20 --host-gb 5.0     system-RAM pool for `run`/`serve` (`--host` there is the bind address)\n\
+         \x20 --host-gb 4.0     the RAM pool under `run`/`serve`, where `--host` is the bind address; the plan trims it to what fits\n\
          \x20 --allow-remote    permit a non-loopback bind (no TLS, model in RAM)\n\
          \x20 --ctx 32768       context window `run`/`serve` allocates state for\n\
          \x20 --ngen 4096       generation ceiling per request\n\
          \x20 --auto-tier       turn the device tier on without spelling out --gpu\n\
          \x20 --dense-i8        one byte per weight for the host dense projections; on by default, --no-dense-i8 restores the exact bf16/f16 dot\n\
-         \x20 --host-int2       quantise host-resident experts to int2 (50% RAM reduction, opt-in); default int4\n\
-         \x20 --host-gb GiB     system-RAM host pool, default 5 (the plan trims it to what fits)\n\
+         \x20 --host-int2       quantise host-resident experts to int2: 40% of the tier's bytes for ~3% slower decode, opt-in, and a no-op when the tier borrows the file mapping\n\
          \x20 --experimental    check for updates from main branch instead of releases\n\n\
          model dir: pass --model <dir>, set FENNEC_MODEL, or set `model` in ~/.fennec/config.json",
         fennec::VERSION
@@ -347,13 +351,63 @@ fn find_usage(opts: &Opts, dir: &str) -> Option<String> {
     if let Some(p) = opts.str("usage") {
         return Some(p);
     }
-    let cand = format!("{dir}/.coli_usage");
-    Path::new(&cand).is_file().then_some(cand)
+    // Fennec's own history first, then Colibri's. Reading `.coli_usage` is what
+    // lets a checkpoint Fennec has never run place itself by real routing rather
+    // than index order, and it is read-only: Colibri starts from that file to
+    // decide what to AUTOPIN, so Fennec's counts must never be able to change
+    // what Colibri does. `usage_store` below is where Fennec writes.
+    let fen = format!("{dir}/.fennec_usage");
+    if Path::new(&fen).is_file() {
+        return Some(fen);
+    }
+    let coli = format!("{dir}/.coli_usage");
+    Path::new(&coli).is_file().then_some(coli)
+}
+
+/// The file this run folds its router picks into. Always Fennec's own: even a
+/// plan seeded from `.coli_usage` writes back to `.fennec_usage`, so the
+/// read-only rule above cannot be broken by accident - including by somebody
+/// pointing `--usage` at Colibri's file.
+fn usage_store(opts: &Opts, dir: &str) -> String {
+    let own = format!("{dir}/.fennec_usage");
+    match opts.str("usage") {
+        Some(p) if Path::new(&p).file_name().map(|s| s.to_string_lossy() != ".coli_usage") == Some(true) => p,
+        _ => own,
+    }
+}
+
+/// The file this run folds the bandwidth it measured into.
+///
+/// There is no Colibri equivalent to read: `.coli_usage` is a routing histogram,
+/// while a rate belongs to the box more than to the model, and Fennec has never
+/// seen Colibri's disk lane. So this is write-once, read-own - and it stays out of
+/// anything Colibri reads, same rule as `usage_store`.
+fn rates_store(opts: &Opts, dir: &str) -> String {
+    match opts.str("rates") {
+        Some(p) if Path::new(&p).file_name().map(|s| s.to_string_lossy() != ".coli_usage") == Some(true) => p,
+        _ => format!("{dir}/.fennec_rates"),
+    }
 }
 
 /// The RAM pool budget, resolved the same way for every command. `serve` spells
 /// it `--host-gb` because `--host` there is the bind address. An explicit flag
 /// wins over `*_VK_TIER_HOST_GB`, so `plan` prices the pool `serve` will use.
+///
+/// The number is denominated in *matrix* bytes - expert weights placed in the
+/// tier - not in what the tier costs the machine. Since #433 the resident tier
+/// borrows its experts out of the file mapping whenever the checkpoint has a
+/// pre-quantised form, so 13.0 GiB of placed experts held 1.52 GiB of private
+/// bytes over the same arm with no RAM tier at all (r18: 10.00 against 8.48).
+/// It stays in matrix bytes because r13 measured the alternative spend
+/// and it lost: the same coverage handed to the streamed tier instead was 14.7%
+/// faster as well as 0.6 GiB cheaper. Widening this budget is therefore not a way
+/// to lower RAM usage, only a way to place more experts - and r18 measured that
+/// placing them buys nothing: from 2.0 GiB up the served rate is flat to within
+/// the 4-24% two identical binaries show each other, while the last 20.8% of
+/// streamed picks costs 11 GiB of budget and 1.33 GiB of private bytes. So the
+/// default is the smallest tier that was not measurably below the old 8.0 in
+/// either of two alternating passes, which is also the min-RAM answer the brief
+/// asks for. `--solve-ram` finds the same kind of point from the price model.
 fn host_gb(opts: &Opts) -> f64 {
     if let Some(v) = opts.str("host-gb").and_then(|v| v.parse::<f64>().ok()) {
         return v;
@@ -366,7 +420,7 @@ fn host_gb(opts: &Opts) -> f64 {
     }
     env_name("FENNEC_VK_TIER_HOST_GB")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(8.0)  // Increased from 5.0 to balance memory and performance
+        .unwrap_or(4.0)
 }
 
 /// `--gpu` turns the device tier into real VRAM; `--gpu N` picks the ranked
@@ -455,42 +509,81 @@ struct Setup {
     plan: Plan,
     bw: Bandwidth,
     usage: Usage,
+    /// Where a run folds the router picks it observed, so the next plan is
+    /// ranked by measured routing instead of index order. `None` for a dense
+    /// stack, which routes nothing and so has nothing to record.
+    store: Option<String>,
+    /// Where a run folds the bandwidth it measured, so the next plan is priced
+    /// with this box's rates instead of the profile it was compiled with. Same
+    /// `None` rule: a dense stack streams no experts, so it measures no lane.
+    rates: Option<String>,
+    /// What the last run of this model earned, folded into `bw` already. Kept so
+    /// `plan` can print which numbers were assumed and which were measured.
+    measured: Measured,
+    /// Whether the streamed tier found a pre-quantised form to borrow in this
+    /// checkpoint. The plan prices on it, and a run has to record it beside the
+    /// rate it measured or the next start cannot tell a 17 GB/s disk lane from a
+    /// 17 GB/s encode-bound copy.
+    borrows: bool,
 }
 
-/// The GPU budget when `--device` is not given: the whole card, read off the
-/// device rather than assumed. A flat 8.0 GiB both over-committed an 8 GiB
-/// laptop card and under-used anything larger.
+/// The share of the card the plan may claim when `--device` is not given.
 ///
-/// Over-committing is not free even when the head is protected. WDDM puts the
-/// allocation that exceeds the process budget in system memory, and whichever
-/// buffer went up last loses; `load_plan` uploads the head first so an expert
-/// buffer absorbs it, but every pick of a demoted expert still crosses PCIe.
-/// Measured at 8.0 against 7.77 GiB on the same card: 25.8 ms/token on CUDA,
-/// 11.1 on Vulkan.
+/// Weights are not the only device allocation. The KV cache, the activation
+/// arena and the staging buffers ask for room in the same budget, and on WDDM
+/// whichever allocation crosses the process budget is placed in system memory -
+/// paid for on every pick of whatever landed there, whatever the plan's own
+/// numbers looked like. The same card measured 25.8 ms/token when the plan
+/// filled it and 11.1 when it left room, and `--vulkan-devices` has priced its
+/// "usable" figure at 85% since it was written. Planning from 100% contradicted
+/// the engine's own probe.
+const DEVICE_RESERVE: f64 = 0.85;
+
+/// The GPU budget when `--device` is not given: a fixed share of what this card
+/// has, read off the device instead of assumed. A flat 8.0 GiB both
+/// over-committed an 8 GiB laptop card and under-used anything larger.
+///
+/// This is deliberately a share of the *total*, not of the free figure, because
+/// no API here can answer "free" at plan time: Vulkan reports it only through
+/// `VK_EXT_memory_budget`, which this engine does not request, and `cuMemGetInfo`
+/// needs a context, which `Cuda::open` creates after the plan has already sized
+/// the tier. Free VRAM does become knowable at runtime, and `CudaGpu::
+/// free_vram_gib` reads it there; the plan cannot wait for that, so it reserves.
+///
+/// Two paired ABBA sessions on a 7.77 GiB RTX 4060 Laptop set the share. Against
+/// the flat 8.0 GiB default - which asks an 8 GiB card for more than it has - a
+/// 6.60 GiB tier won 4 of 4 visits by a median 9.667 ms/token (engine-bench/logs/
+/// abba-device-budget.log). Against the whole card (`--device 7.77`), 6.60 GiB won
+/// 4 of 4 by a median 7.444 ms/token (abba-budget-postfix.log). Both orders agreed
+/// in both sessions, and 0.85 x 7.77 = 6.60 lands the reserve on the figure those
+/// two experiments chose rather than on a number this function invents.
 fn default_device_gib(opts: &Opts) -> f64 {
     if !gpu_wanted(opts) {
         return 8.0;
     }
+    let index = opts.usize_at("gpu", 0);
     let devs = Vulkan::load().devices();
-    match devs.get(opts.usize_at("gpu", 0)) {
-        Some(d) if d.usable_gib() > 0.0 => d.usable_gib(),
+    let Some(d) = devs.get(index) else {
         // No loader to ask. Keeping the old flat budget is the honest fallback:
         // guessing a smaller one would shrink the tier on a card we cannot see.
-        _ => 8.0,
+        return 8.0;
+    };
+    let total = d.usable_gib();
+    if total <= 0.0 {
+        return 8.0;
     }
+    let budget = (total * DEVICE_RESERVE).max(0.5);
+    eprintln!(
+        "[fennec] device budget {:.2} GiB of {:.2} GiB on {} ({:.0}% reserve for KV, activations and staging)",
+        budget,
+        total,
+        d.name,
+        DEVICE_RESERVE * 100.0,
+    );
+    budget
 }
 
-/// The NPU budget: dedicated ML accelerator memory (Intel AI Boost ~4 GiB).
-/// Returns 0 if NPU is not available or not wanted.
-fn npu_gib(opts: &Opts, bw: &Bandwidth) -> f64 {
-    if !bw.has_npu() {
-        return 0.0;
-    }
-    // Default NPU budget: 4 GiB for Intel AI Boost class devices
-    opts.num("npu", 4.0)
-}
-
-fn setup(opts: &Opts, cfg: &Arc<TextConfig>, group: usize) -> Result<Setup, String> {
+fn setup(opts: &Opts, cfg: &Arc<TextConfig>, sh: Option<&Shards>, group: usize) -> Result<Setup, String> {
     let gpu = gpu_wanted(opts);
     let device_gib = if opts.has("device") { opts.num("device", 8.0) } else { default_device_gib(opts) };
     let device = (device_gib * 2f64.powi(30)) as usize;
@@ -522,19 +615,48 @@ fn setup(opts: &Opts, cfg: &Arc<TextConfig>, group: usize) -> Result<Setup, Stri
         let head = cfg.vocab_size * cfg.hidden_size * 2;
         reserve = reserve.max(head + (128 << 20));
     }
-    let bw = if opts.has("cpu") {
+    let mut bw = if opts.has("cpu") {
         Bandwidth::cpu_only()
     } else {
         Bandwidth::laptop_4060()
     };
-    let npu = (npu_gib(opts, &bw) * 2f64.powi(30)) as usize;
+    // A dense stack routes nothing, so there is no histogram to grow and no
+    // streamed lane to time: both learned files stay `None` and the plan keeps
+    // the compiled-in rates, which is what they are for until a run contradicts
+    // them. They live in the model directory because the rates belong to a
+    // checkpoint as much as the routing does - an FQ4 sidecar model and a bf16
+    // one measure different streamed tiers on the same disk.
+    let dir = opts.model_dir()?;
+    let (store, rates) = match cfg.is_moe() {
+        true => (
+            Some(usage_store(opts, &dir)),
+            Some(rates_store(opts, &dir)),
+        ),
+        false => (None, None),
+    };
+    let measured = match rates.as_deref() {
+        Some(p) if Path::new(p).is_file() => match Measured::load(p) {
+            Ok(m) => {
+                eprintln!("[fennec] measured rates: {p}");
+                bw.apply(&m);
+                m
+            }
+            // A half-written or foreign file is a reason to fall back on the
+            // profile, not a reason to refuse to start.
+            Err(e) => {
+                eprintln!("[fennec] ignoring rates file {p}: {e}");
+                Measured::default()
+            }
+        },
+        _ => Measured::default(),
+    };
     let usage = if !cfg.is_moe() {
         // A dense checkpoint routes nothing, so there is no histogram to look
         // for and nothing to warn about when none is found: the plan's expert
         // tiers simply stay empty.
         Usage::uniform(cfg.num_hidden_layers, 0)
     } else {
-        match find_usage(opts, &opts.model_dir()?) {
+        match find_usage(opts, &dir) {
             Some(p) => {
                 eprintln!("[fennec] router histogram: {p}");
                 let u = Usage::load(&p)?;
@@ -554,29 +676,179 @@ fn setup(opts: &Opts, cfg: &Arc<TextConfig>, group: usize) -> Result<Setup, Stri
             }
         }
     };
-    let plan = Plan::build(cfg, &usage, device, npu, host, reserve, &bw, group, gpu);
-    Ok(Setup { plan, bw, usage })
+    // Does this checkpoint have a pre-quantised form the streamed tier can read
+    // straight out of the mapping? Ask the function the ring calls at runtime, on
+    // two real experts, rather than inferring it from a file name: the answer
+    // changes both how many bytes a streamed pick moves and whether the plan
+    // charges it an encode pass it will never run. No shards to ask (a `doctor`
+    // run before a model opened) keeps the expensive shape, which is the
+    // assumption that was already in force.
+    let borrows = match sh {
+        Some(sh) if cfg.is_moe() => [0usize, cfg.num_experts / 2].iter().any(|id| {
+            matches!(
+                fennec::model::borrow_expert(
+                    sh,
+                    &cfg.prefix,
+                    0,
+                    *id,
+                    cfg.hidden_size,
+                    cfg.moe_intermediate_size,
+                    group,
+                ),
+                Some(Ok(_))
+            )
+        }),
+        _ => false,
+    };
+    let solve = if opts.has("solve-ram") {
+        Some(solve_ram(cfg, &usage, device, host, reserve, &bw, group, gpu, borrows))
+    } else {
+        None
+    };
+    let plan = match solve {
+        Some(host_budget) => {
+            eprintln!(
+                "[fennec] --solve-ram: {:.2} GiB of the {:.2} GiB budget leaves the decode as fast as it gets",
+                Plan::gib(host_budget),
+                Plan::gib(host)
+            );
+            Plan::build(cfg, &usage, device, host_budget, reserve, &bw, group, gpu, borrows)
+        }
+        None => Plan::build(cfg, &usage, device, host, reserve, &bw, group, gpu, borrows),
+    };
+    Ok(Setup {
+        plan,
+        bw,
+        usage,
+        store,
+        rates,
+        measured,
+        borrows,
+    })
+}
+
+/// The smallest RAM tier that still decodes as fast as this placement can.
+///
+/// The brief is "minimum RAM for maximum speed", and before a run starts the only
+/// thing that can answer it is the plan's own price model: widening the host tier
+/// moves the next coldest expert off the streamed lane and onto the resident one,
+/// and once the histogram has no expert left worth pinning the curve goes flat -
+/// every GiB past that point is RAM bought for nothing. The knee is the answer, so
+/// this searches the model rather than the stopwatch; a stopwatch answer would
+/// need a serve per step.
+///
+/// It scans from zero rather than bisecting because the price is not guaranteed
+/// monotone in the budget: with a measured streamed rate at or above the host rate
+/// - which is what the borrowed shape costs on a warm page cache - placing an
+/// expert in RAM can price *higher* than streaming it. A scan finds the smallest
+/// budget within epsilon of the best whatever the curve does; a bisection would
+/// assume a shape the model does not have.
+///
+/// Two honest limits, which are why this is a flag and not a default. It is only
+/// as right as the price model, and the model still leaves out whole stages of a
+/// token: before #431 fixed the streamed price it promised 63.88 ms/token for a
+/// tier that served 112. And the budget it minimises is matrix bytes placed in the
+/// tier, not the committed bytes the machine pays - after #433 the tier borrows
+/// about 9 bytes of matrix per byte it commits, so the two currencies come apart,
+/// and r13 measured that buying coverage in the first one loses speed. What a
+/// budget from this function has to be read as is "the smallest placement the
+/// model can't beat", pending a served run that says so.
+fn solve_ram(
+    cfg: &TextConfig,
+    usage: &Usage,
+    device: usize,
+    host: usize,
+    reserve: usize,
+    bw: &Bandwidth,
+    group: usize,
+    gpu: bool,
+    borrows: bool,
+) -> usize {
+    // 1% of the fastest predicted rate. Anything smaller is inside the drift two
+    // identical binaries on this box have shown each other (4-19% across sessions),
+    // so paying RAM to buy it would be paying for noise.
+    const EPS: f64 = 0.01;
+    let best =
+        Plan::build(cfg, usage, device, host, reserve, bw, group, gpu, borrows).ms_per_token;
+    // 0.25 GiB steps: finer than the smallest tier worth asking for, coarse enough
+    // that a whole-tier search costs microseconds per placement.
+    let step = 256usize << 20;
+    let mut b = 0usize;
+    while b < host {
+        let p = Plan::build(cfg, usage, device, b, reserve, bw, group, gpu, borrows);
+        if p.ms_per_token <= best * (1.0 + EPS) {
+            return b;
+        }
+        b += step;
+    }
+    host
 }
 
 fn plan(opts: &Opts) -> Result<(), String> {
     let (cfg, sh) = open(opts)?;
     let group = group_for(opts, &sh, &cfg);
-    let s = setup(opts, &cfg, group)?;
+    let s = setup(opts, &cfg, Some(sh.as_ref()), group)?;
     let (plan, bw, usage) = (s.plan, s.bw, s.usage);
-    let host = (host_gb(opts) * 2f64.powi(30)) as usize;
-    let npu = (npu_gib(opts, &bw) * 2f64.powi(30)) as usize;
+    let (measured, borrows) = (s.measured, s.borrows);
     println!("{}", plan.report(&cfg));
+    // Which of these rates came off this box and which are still profile
+    // constants. A prediction is only worth the numbers priced into it, and the
+    // reader has to be able to tell a plan built on a measured 17.4 GB/s disk lane
+    // from one built on the 3.2 GB/s some other machine once managed. `*` is
+    // earned, `?` is assumed.
+    let rate = |got: Option<f64>, now: f64| format!("{:.1}{}", now, if got.is_some() { "*" } else { "?" });
+    // Nothing times the device's own reads or the load-time upload per byte, so
+    // these two stay profile constants for as long as the plan is printed.
+    let assumed = |v: f64| format!("{v:.1}?");
     println!(
-        "  dense {:.1} MiB/layer | FQ4 expert {:.1} MiB | lm_head {:.2} ms | tiers device {:.1} / NPU {:.1} / PCIe {:.1} / disk {:.1} GB/s",
+        "  dense {:.1} MiB/layer | FQ4 expert {:.1} MiB | lm_head {:.2} ms | tiers device {} / PCIe {} / host {} / disk {} / quant {} GB/s",
         mib(plan.dense_bytes_layer),
         mib(plan.expert_bytes),
         plan.lm_head_ms,
-        bw.device_gbs,
-        bw.npu_gbs,
-        bw.pcie_gbs,
-        bw.disk_gbs
+        assumed(bw.device_gbs),
+        assumed(bw.pcie_gbs),
+        rate(measured.host_gbs, bw.host_gbs),
+        rate(measured.disk_gbs, bw.disk_gbs),
+        rate(measured.quant_gbs, bw.quant_gbs)
     );
-    let ideal = Plan::build(&cfg, &usage, usize::MAX / 8, npu, host, 0, &bw, group, gpu_wanted(opts));
+    // The streamed shape the price was charged for, and the one thing about it a
+    // rate cannot say: the same GB/s means opposite things depending on whether
+    // the tier copies.
+    let held = measured
+        .held_ratio
+        .map(|r| format!(", {:.1}x matrix held per byte committed", r))
+        .unwrap_or_default();
+    // Naming the file the rates came from is only honest when a file was read.
+    // On a first start the path exists as a promise, not a source, and a plan
+    // priced entirely off the compiled-in profile has to say so. `is_empty` is
+    // not the question: a run that never filled a lane can still record the
+    // held ratio it observed, and a plan carrying only that has no measured
+    // bandwidth in it.
+    let earned = measured.host_gbs.is_some()
+        || measured.disk_gbs.is_some()
+        || measured.quant_gbs.is_some();
+    let rates_note = match (&s.rates, earned) {
+        (Some(p), true) => format!("{p} (measured on this box)"),
+        (Some(p), false) => format!("none yet, priced on the compiled-in profile (runs write {p})"),
+        (None, _) => "dense stack: no lane to time".into(),
+    };
+    println!(
+        "  streamed picks: {}{} | rates {}",
+        if borrows {
+            "borrowed (pack pages out of the mapping, no encode)"
+        } else {
+            "copied (whole source read, then quantised)"
+        },
+        held,
+        rates_note
+    );
+    // "Every expert resident" means the fastest tier this box actually has. On
+    // the GPU lane that is VRAM, but `Plan::build` zeroes the device tier in CPU
+    // mode, so lifting only the device budget rebuilds the same plan and prints
+    // its own number back as a ceiling. RAM has to be lifted too, or the CPU lane
+    // reports no headroom at all and the gap this line exists to show is hidden.
+    let unlimited = usize::MAX / 8;
+    let ideal = Plan::build(&cfg, &usage, unlimited, unlimited, 0, &bw, group, gpu_wanted(opts), borrows);
     println!(
         "  upper bound, every expert resident: {:.2} tok/s | histogram: {} selections over {} layers x {}",
         ideal.tok_s(),
@@ -609,9 +881,13 @@ fn plan(opts: &Opts) -> Result<(), String> {
             "{}",
             serde_json::json!({
                 "cmd": "plan", "device_gib": gib(plan.device_bytes_budget), "host_gib": host_gb(opts),
+                "host_placed_gib": gib(plan.host_bytes_used),
+                "host_dense_gib": gib(plan.host_dense_bytes),
                 "cpu": opts.has("cpu"), "group": group, "ms_per_token": plan.ms_per_token,
                 "tok_s": plan.tok_s(), "device_hit": plan.device_hit_rate,
                 "host_hit": plan.host_hit_rate, "disk_hit": plan.disk_rate,
+                "moe_device_ms": plan.moe_device_ms, "moe_host_ms": plan.moe_host_ms,
+                "overlap_credit_ms": plan.overlap_credit_ms,
                 "resident_slots": plan.layers.iter().map(|l| l.resident.len()).sum::<usize>(),
                 "pooled_slots": plan.layers.iter().map(|l| l.pooled.len()).sum::<usize>(),
             })
@@ -832,7 +1108,7 @@ fn doctor(opts: &Opts) -> Result<(), String> {
 
     if let Some(c) = cfg.as_ref() {
         // A planner failure is a check result, not a reason to swallow the report.
-        match setup(opts, c, packed.unwrap_or_else(|| opts.usize_at("group", 32))) {
+        match setup(opts, c, shards.as_ref(), packed.unwrap_or_else(|| opts.usize_at("group", 32))) {
             Ok(s) => {
                 let dev: usize = s.plan.layers.iter().map(|l| l.resident.len()).sum();
                 let host: usize = s.plan.layers.iter().map(|l| l.pooled.len()).sum();
@@ -888,21 +1164,49 @@ fn quant(opts: &Opts, threads: usize) -> Result<(), String> {
     let mut w = SidecarWriter::new(&out)?;
     let mut total = 0usize;
     for l in layers_of(opts, cfg.num_hidden_layers)? {
-        let p = format!("{}.layers.{l}.mlp", cfg.prefix);
-        let gu_src = sh.tensor_f32(&format!("{p}.experts.gate_up_proj"))?;
-        let dn_src = sh.tensor_f32(&format!("{p}.experts.down_proj"))?;
         let t0 = Instant::now();
-        let gu = Q4::quantize(&gu_src, e * 2 * i, h, group, threads);
-        let dn = Q4::quantize(&dn_src, e * h, i, group, threads);
+        let p = format!("{}.layers.{l}.mlp", cfg.prefix);
+        let (gu_full, dn_full) = if sh.contains(&format!("{p}.experts.gate_up_proj")) {
+            (sh.tensor_f32(&format!("{p}.experts.gate_up_proj"))?, sh.tensor_f32(&format!("{p}.experts.down_proj"))?)
+        } else {
+            let p2 = format!("{p}.switch_mlp");
+            let eg = format!("{p2}.gate_proj.weight");
+            let eu = format!("{p2}.up_proj.weight");
+            let ed = format!("{p2}.down_proj.weight");
+            if sh.contains(&eg) {
+                let gate = sh.tensor_f32(&eg)?;
+                let up = sh.tensor_f32(&eu)?;
+                let dn = sh.tensor_f32(&ed)?;
+                let mut gu = Vec::with_capacity(gate.len() + up.len());
+                // Interleave per-expert: gate[e*I..(e+1)*I] + up[e*I..(e+1)*I] for each expert e
+                for e in 0..e {
+                    gu.extend_from_slice(&gate[e*i*h..(e+1)*i*h]);
+                    gu.extend_from_slice(&up[e*i*h..(e+1)*i*h]);
+                }
+                (gu, dn)
+            } else {
+                let gate = sh.tensor_f32(&format!("{p}.experts.gate_proj"))?;
+                let up = sh.tensor_f32(&format!("{p}.experts.up_proj"))?;
+                let dn = sh.tensor_f32(&format!("{p}.experts.down_proj"))?;
+                let mut gu = Vec::with_capacity(gate.len() + up.len());
+                for e in 0..e {
+                    gu.extend_from_slice(&gate[e*i*h..(e+1)*i*h]);
+                    gu.extend_from_slice(&up[e*i*h..(e+1)*i*h]);
+                }
+                (gu, dn)
+            }
+        };
+        let gu = Q4::quantize(&gu_full, e * 2 * i, h, group, threads);
+        let dn = Q4::quantize(&dn_full, e * h, i, group, threads);
         let s = t0.elapsed().as_secs_f64();
-        let src_bytes = gu_src.len() * 4 + dn_src.len() * 4;
+        let src_bytes = gu_full.len() * 4 + dn_full.len() * 4;
         println!(
             "layer {l}: {:.2} GiB f32 -> {:.2} GiB FQ4 in {s:.1}s ({:.2} GiB/s, {threads} threads) | rel err gate_up {:.5} down {:.5}",
             gib(src_bytes),
             gib(gu.bytes_total() + dn.bytes_total()),
             gib(src_bytes) / s,
-            gu.rel_error(&gu_src),
-            dn.rel_error(&dn_src)
+            gu.rel_error(&gu_full),
+            dn.rel_error(&dn_full)
         );
         total += gu.bytes_total() + dn.bytes_total();
         w.push(&format!("blk.{l}.ffn.gate_up_exps"), &gu)?;
@@ -1084,7 +1388,7 @@ fn bench(opts: &Opts, threads: usize) -> Result<(), String> {
 fn decode(opts: &Opts, threads: usize) -> Result<(), String> {
     let (cfg, sh) = open(opts)?;
     let group = group_for(opts, &sh, &cfg);
-    let s = setup(opts, &cfg, group)?;
+    let s = setup(opts, &cfg, Some(sh.as_ref()), group)?;
     let first = opts.usize_at("first", 0);
     if first >= cfg.num_hidden_layers {
         return Err(format!("--first {first} is past the last layer"));
@@ -1235,26 +1539,23 @@ fn decode(opts: &Opts, threads: usize) -> Result<(), String> {
          | total {total_latency_ms:.1} ms = TTFT + TPOT x {n_new} output tokens | measured wall {wall_ms:.1} ms"
     );
 
-    let (mut hits, mut misses, mut ring_bytes, mut read_ms, mut quant_ms) = (0u64, 0u64, 0usize, 0f64, 0f64);
-    for l in &m.layers {
-        if let Some(pool) = l.moe.as_ref().and_then(|m| m.stream.as_ref()) {
-            let st = pool.lock().unwrap();
-            hits += st.hits;
-            misses += st.misses;
-            ring_bytes += st.bytes();
-            read_ms += st.read_ms;
-            quant_ms += st.quant_ms;
-        }
-    }
+    let st = m.stream_totals();
+    let (hits, misses) = (st.hits, st.misses);
     let picks = (hits + misses) as f64;
     println!(
-        "  streamed picks {hits} of {picks:.0} ({:.1}%) | {:.2} GiB in {} rings, \
-         {:.0} ms shard reads {:.0} ms quantise",
+        "  streamed picks {hits} of {picks:.0} ({:.1}%) | {:.2} GiB in {} rings \
+         ({}/{} refills borrowed, {:.2} GiB had it copied), \
+         {:.0} ms reads at {:.1} GB/s, {:.0} ms quantise at {:.1} GB/s",
         100.0 * hits as f64 / picks.max(1.0),
-        gib(ring_bytes),
-        m.layers.iter().filter(|l| l.moe.as_ref().and_then(|m| m.stream.as_ref()).is_some()).count(),
-        read_ms,
-        quant_ms,
+        gib(st.ring_bytes),
+        st.rings,
+        st.borrowed,
+        st.warmed + st.misses,
+        gib(st.ring_bytes_full),
+        st.read_ms,
+        st.read_gbs(),
+        st.quant_ms,
+        st.quant_gbs(),
     );
     let (dev_hits, host_hits, disk_hits, overlap_ns) = m.layers.iter().fold(
         (0u64, 0u64, 0u64, 0u64),
@@ -1268,6 +1569,17 @@ fn decode(opts: &Opts, threads: usize) -> Result<(), String> {
         },
     );
     let routed = (dev_hits + host_hits + disk_hits).max(1);
+    // The prefetcher's ledger: a hit is a disk read that landed during another
+    // layer's compute instead of in front of the token that needed it.
+    let pf = m.prefetcher.as_ref().map(|pf| pf.stats());
+    if let Some((p_hits, p_misses, p_loaded, held)) = pf {
+        let asked = p_hits + p_misses;
+        println!(
+            "  prefetch: {p_loaded} experts read ahead, {p_hits}/{asked} hits ({:.1}%), \
+             {p_misses} fell through to the pool, {held} MiB held",
+            100.0 * p_hits as f64 / asked.max(1) as f64
+        );
+    }
     if let Some(g) = &gpu {
         let g = g.lock().unwrap();
         println!(
@@ -1308,6 +1620,29 @@ fn decode(opts: &Opts, threads: usize) -> Result<(), String> {
             "accounted", sum / steps, stack_mean, stack_mean - sum / steps
         );
     }
+    if let Some(p) = &s.store {
+        if let Some(n) = m.save_picks(p) {
+            println!("  usage: {n} router picks folded into {p}");
+        }
+    }
+    // The rates go out with the picks: both are this run telling the next one
+    // what the box was actually doing, and neither is worth keeping separate.
+    // The numbers are what the file holds after the merge, which is exactly what
+    // the next start will price with, and the window is what this run read to
+    // earn them.
+    if let Some(p) = &s.rates {
+        if let Some((r, window)) = m.save_rates(p, s.borrows) {
+            let g = |v: Option<f64>| v.map(|x| format!("{x:.1}")).unwrap_or_else(|| "-".into());
+            println!(
+                "  rates file {p} now holds: host {} GB/s, disk {}, quant {}, held {}x matrix per byte committed | this run {}",
+                g(r.host_gbs),
+                g(r.disk_gbs),
+                g(r.quant_gbs),
+                g(r.held_ratio),
+                window
+            );
+        }
+    }
     if opts.has("json") {
         println!(
             "{}",
@@ -1318,10 +1653,18 @@ fn decode(opts: &Opts, threads: usize) -> Result<(), String> {
                 "projected_ms_full": full, "projected_tok_s_full": 1000.0 / full,
                 "planned_ms_per_token": s.plan.ms_per_token,
                 "resident": resident + pooled, "stream_hits": hits, "stream_misses": misses,
-                "fq4_gib": gib(fq4), "ring_gib": gib(ring_bytes),
+                "fq4_gib": gib(fq4), "ring_gib": gib(st.ring_bytes),
+                "ring_gib_copied": gib(st.ring_bytes_full), "stream_borrowed": st.borrowed,
+                "stream_read_gbs": st.read_gbs(), "stream_quant_gbs": st.quant_gbs(),
+                "stream_read_s": st.read_ms / 1e3,
+                "usage_store": s.store,
                 "gpu": gpu.is_some(), "device_experts": on_dev,
                 "dev_hits": dev_hits, "host_hits": host_hits, "disk_hits": disk_hits,
                 "cpu_overlap_ms": overlap_ns as f64 / 1e6,
+                "prefetch_hits": pf.map_or(0, |s| s.0),
+                "prefetch_misses": pf.map_or(0, |s| s.1),
+                "prefetch_loaded": pf.map_or(0, |s| s.2),
+                "prefetch_mib": pf.map_or(0, |s| s.3),
                 "prompt_tokens": prompt_len, "output_tokens": n_new,
                 "ttft_ms": ttft_ms, "tpot_ms": tpot_ms,
                 "total_latency_ms": total_latency_ms, "wall_ms": wall_ms,
@@ -1365,9 +1708,11 @@ fn load_engine(opts: &Opts, threads: usize) -> Result<Engine, String> {
         fennec::prof::enable();
     }
     let dir = opts.model_dir()?;
-    let cfg = Arc::new(TextConfig::from_file(&format!("{dir}/config.json"))?);
+    let mut cfg = TextConfig::from_file(&format!("{dir}/config.json"))?;
     let mut shards = Shards::open(&dir)?;
     attach_cache(opts, &dir, &mut shards)?;
+    fennec::model::bind_prefix(&shards, &mut cfg);
+    let cfg = Arc::new(cfg);
     let sh = Arc::new(shards);
     let tok = fennec::tokenizer::Tokenizer::from_dir(&dir)?;
     let group = group_for(opts, &sh, &cfg);
@@ -1384,7 +1729,7 @@ fn load_engine(opts: &Opts, threads: usize) -> Result<Engine, String> {
     if want_gpu && !po.flags.iter().any(|f| f == "gpu") {
         po.flags.push("gpu".into());
     }
-    let s = setup(&po, &cfg, group)?;
+    let s = setup(&po, &cfg, Some(sh.as_ref()), group)?;
     // The suite passes `--ctx 0` to mean "pick for me"; clamping that to 512
     // would silently give an agent a half-kilobyte context window.
     let ctx = match opts.usize_at("ctx", 32768) {
@@ -1403,7 +1748,10 @@ fn load_engine(opts: &Opts, threads: usize) -> Result<Engine, String> {
 
     let t0 = Instant::now();
     let gpu = open_gpu(&po)?;
-    let m = Model::load_plan(&sh, cfg.clone(), &s.plan, group, threads, ctx, slots, gpu)?;
+    let mut m = Model::load_plan(&sh, cfg.clone(), &s.plan, group, threads, ctx, slots, gpu)?;
+    m.usage_store = s.store;
+    m.rates_store = s.rates;
+    m.rates_borrows = s.borrows;
     #[cfg(feature = "ort")]
     let m = {
         let mut m = m;
@@ -1421,7 +1769,7 @@ fn load_engine(opts: &Opts, threads: usize) -> Result<Engine, String> {
         .plan
         .layers
         .iter()
-        .map(|l| l.pooled.len() + l.npu_resident.len())
+        .map(|l| l.pooled.len())
         .sum();
     // A dense stack routes nothing, so the expert counts would only ever read
     // zero; say what the layer actually holds instead.
@@ -1487,6 +1835,9 @@ fn run_cmd(opts: &Opts, threads: usize) -> Result<(), String> {
     }
     if opts.has("greedy") {
         s.temperature = 0.0;
+    }
+    if let Some(r) = opts.str("repeat-penalty").and_then(|v| v.parse::<f32>().ok()) {
+        s.repeat_penalty = r.max(1.0);
     }
     let srv = fennec::serve::Server::new(
         e.model, e.sh, e.cfg, e.tok, e.id, e.key, e.ctx,

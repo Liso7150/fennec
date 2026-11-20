@@ -72,11 +72,20 @@ pub struct Sample {
     pub top_k: usize,
     pub top_p: f32,
     pub seed: u64,
+    /// Divides the logits of tokens already in the lookback window. 1.0 leaves
+    /// sampling exactly as it was, which is why it is the default: the served
+    /// numbers and the goldens were all measured with it off.
+    pub repeat_penalty: f32,
 }
+
+/// How far back a repeat penalty looks. Long enough to cover the short cycle a
+/// stuck turn falls into, short enough that the ordinary vocabulary of the
+/// surrounding sentence keeps its logits.
+const REPEAT_WINDOW: usize = 64;
 
 impl Default for Sample {
     fn default() -> Sample {
-        Sample { temperature: 1.0, top_k: 20, top_p: 0.95, seed: 0x5EED }
+        Sample { temperature: 1.0, top_k: 20, top_p: 0.95, seed: 0x5EED, repeat_penalty: 1.0 }
     }
 }
 
@@ -95,12 +104,32 @@ impl Sample {
         if let Some(seed) = v["seed"].as_u64() {
             s.seed = seed;
         }
+        if let Some(r) = v["repeat_penalty"].as_f64() {
+            s.repeat_penalty = r.max(1.0) as f32;
+        }
         s
     }
 
     /// Greedy at temperature 0, otherwise top-k then nucleus then a draw. The
     /// RNG is a splitmix so a seed reproduces a completion exactly.
-    fn pick(&self, logits: &[f32], rng: &mut u64) -> usize {
+    fn pick(&self, logits: &[f32], recent: &[u32], rng: &mut u64) -> usize {
+        // A turn that falls into a short cycle spends its whole token budget on
+        // it, and nothing below notices: temperature, top-k and the nucleus each
+        // describe one step, not the sequence. `recent` is what this turn already
+        // said, so the fix has to look at the tokens rather than the logits.
+        let mut damped: Vec<f32> = Vec::new();
+        if self.repeat_penalty > 1.0 && !recent.is_empty() {
+            damped = logits.to_vec();
+            let mut seen = recent.to_vec();
+            seen.sort_unstable();
+            seen.dedup();
+            for id in seen {
+                if let Some(v) = damped.get_mut(id as usize) {
+                    *v = if *v > 0.0 { *v / self.repeat_penalty } else { *v * self.repeat_penalty };
+                }
+            }
+        }
+        let logits: &[f32] = if damped.is_empty() { logits } else { &damped };
         let mut best = 0usize;
         let mut bv = f32::NEG_INFINITY;
         for (i, &x) in logits.iter().enumerate() {
@@ -272,7 +301,7 @@ impl Server {
             }
             crate::kernel::rmsnorm(&x, &model.norm, eps, &mut hn);
             model.logits(&self.shards, &hn, &mut logits)?;
-            let next = s.pick(&logits, &mut rng) as u32;
+            let next = s.pick(&logits, &ids[ids.len().saturating_sub(REPEAT_WINDOW)..], &mut rng) as u32;
             if self.tok.eos.contains(&next) {
                 finish = "stop";
                 break;
@@ -325,6 +354,29 @@ impl Server {
         }
         if !pending.is_empty() {
             emit(&pending, think);
+        }
+        // Fold this turn's routing into the history the next plan is ranked by,
+        // while the lock is still ours: another thread reading `picks` mid-update
+        // would double-count. A few hundred KB of tmp+rename against a turn that
+        // just cost seconds, and it is what stops a long-lived server from
+        // ending its life as blind as it started.
+        if let Some(p) = &model.usage_store {
+            model.save_picks(p);
+        }
+        // Same window, same argument: the ring timings and the host-pick timer are
+        // this turn's, and the next start prices its placement with them. stderr,
+        // because stdout of this function is the answer stream.
+        if let Some(p) = &model.rates_store {
+            if let Some((r, window)) = model.save_rates(p, model.rates_borrows) {
+                let g = |v: Option<f64>| v.map(|x| format!("{x:.1}")).unwrap_or_else(|| "-".into());
+                eprintln!(
+                    "[fennec] rates file {p} now holds: host {} GB/s, disk {}, quant {} | this turn {}",
+                    g(r.host_gbs),
+                    g(r.disk_gbs),
+                    g(r.quant_gbs),
+                    window
+                );
+            }
         }
         Ok((produced, finish.into()))
     }
@@ -462,6 +514,21 @@ impl Server {
         write_json(sock, 200, &body)
     }
 
+    /// The prefetch worker's counters plus what the streamed tier actually
+    /// moved, so the plan's guessed disk and quantise bandwidths can be checked
+    /// against this box instead of a profile. One worker and one set of rings
+    /// serve every layer, and `/metrics` takes the model lock once for both:
+    /// the route already blocks behind generation, it should not do it twice.
+    fn served_stats(&self) -> ((u64, u64, u64, usize), crate::pool::StreamTotals) {
+        match self.model.lock() {
+            Ok(m) => (
+                m.prefetcher.as_ref().map(|pf| pf.stats()).unwrap_or((0, 0, 0, 0)),
+                m.stream_totals(),
+            ),
+            Err(_) => ((0, 0, 0, 0), crate::pool::StreamTotals::default()),
+        }
+    }
+
     fn route(&self, method: &str, path: &str, head: &str, body: &Value, sock: &mut TcpStream) -> Result<(), String> {
         // A browser preflight carries no credentials, so gating it on the key
         // would make every cross-origin request fail before it starts.
@@ -484,6 +551,7 @@ impl Server {
             ("GET", "/metrics") => {
                 let g = self.stats.generated.load(Relaxed);
                 let busy = self.stats.busy_ns.load(Relaxed) as f64 / 1e9;
+                let (pf, st) = self.served_stats();
                 write_json(sock, 200, &json!({
                     "requests": self.stats.requests.load(Relaxed),
                     "prompt_tokens": self.stats.prompt_tokens.load(Relaxed),
@@ -491,6 +559,31 @@ impl Server {
                     "busy_seconds": busy,
                     "tokens_per_second": if busy > 0.0 { g as f64 / busy } else { 0.0 },
                     "uptime_s": self.started.elapsed().as_secs(),
+                    "prefetch_hits": pf.0,
+                    "prefetch_misses": pf.1,
+                    "prefetch_experts": pf.2,
+                    "prefetch_mib": pf.3,
+                    "stream_hits": st.hits,
+                    "stream_misses": st.misses,
+                    "stream_warmed": st.warmed,
+                    // Refills that stayed in the file mapping instead of being copied.
+                    // Zero with a non-zero `stream_gib_copied` means the tier is still
+                    // paying the memcpy whatever the wall clock says.
+                    "stream_borrowed": st.borrowed,
+                    "stream_rings": st.rings,
+                    "stream_gib": st.ring_bytes as f64 / 2f64.powi(30),
+                    // What the same slots would hold as anonymous memory. The gap
+                    // between the two is the RAM the ring gave back to the page cache,
+                    // which is the whole reason borrowing is the faster tier here.
+                    "stream_gib_copied": st.ring_bytes_full as f64 / 2f64.powi(30),
+                    "stream_read_gbs": st.read_gbs(),
+                    "stream_quant_gbs": st.quant_gbs(),
+                    // Seconds, not just the rate: the rate alone cannot say how much
+                    // of `busy_seconds` the streamed tier owns, and that share is the
+                    // whole argument for overlapping it with compute.
+                    "stream_read_s": st.read_ms / 1e3,
+                    "stream_quant_s": st.quant_ms / 1e3,
+                    "stream_gib_read": st.read_bytes as f64 / 2f64.powi(30),
                 }))
             }
             ("GET", "/experts") => {
@@ -792,17 +885,33 @@ mod tests {
     fn greedy_takes_the_argmax() {
         let logits = [0.1, 9.0, -3.0, 2.0];
         let s = Sample { temperature: 0.0, ..Sample::default() };
-        assert_eq!(s.pick(&logits, &mut 1), 1);
+        assert_eq!(s.pick(&logits, &[], &mut 1), 1);
+    }
+
+    #[test]
+    fn a_repeat_penalty_demotes_what_the_turn_already_said() {
+        // The shape of the stuck turn: one token keeps winning because it keeps
+        // being the most likely next one. Off, the argmax is unchanged; on, the
+        // token inside the window loses to the runner-up, and the penalty follows
+        // whichever token is actually in the window.
+        let mut logits = vec![0.0f32; 8];
+        logits[3] = 2.0;
+        logits[4] = 1.9;
+        let off = Sample { temperature: 0.0, ..Sample::default() };
+        assert_eq!(off.pick(&logits, &[3], &mut 1), 3);
+        let on = Sample { repeat_penalty: 1.2, ..off };
+        assert_eq!(on.pick(&logits, &[3], &mut 1), 4);
+        assert_eq!(on.pick(&logits, &[4], &mut 1), 3);
     }
 
     #[test]
     fn top_k_never_reaches_past_the_k_th_logit() {
         let logits: Vec<f32> = (0..10).map(|i| i as f32).collect();
-        let s = Sample { temperature: 1.0, top_k: 3, top_p: 1.0, seed: 0 };
+        let s = Sample { temperature: 1.0, top_k: 3, top_p: 1.0, seed: 0, ..Sample::default() };
         let mut rng = 0x5EEDu64;
         let mut seen = std::collections::BTreeSet::new();
         for _ in 0..400 {
-            let i = s.pick(&logits, &mut rng);
+            let i = s.pick(&logits, &[], &mut rng);
             assert!(i >= 7, "top_k=3 returned index {i}");
             seen.insert(i);
         }
@@ -813,20 +922,20 @@ mod tests {
     fn a_dominant_logit_survives_any_nucleus() {
         let mut logits = vec![0.0f32; 8];
         logits[3] = 100.0;
-        let s = Sample { temperature: 1.0, top_k: 8, top_p: 0.5, seed: 0 };
+        let s = Sample { temperature: 1.0, top_k: 8, top_p: 0.5, seed: 0, ..Sample::default() };
         let mut rng = 7u64;
         for _ in 0..100 {
-            assert_eq!(s.pick(&logits, &mut rng), 3);
+            assert_eq!(s.pick(&logits, &[], &mut rng), 3);
         }
     }
 
     #[test]
     fn the_same_seed_replays_the_same_tokens() {
         let logits: Vec<f32> = (0..16).map(|i| (i as f32 * 0.37).sin()).collect();
-        let s = Sample { temperature: 1.0, top_k: 8, top_p: 0.95, seed: 0 };
+        let s = Sample { temperature: 1.0, top_k: 8, top_p: 0.95, seed: 0, ..Sample::default() };
         let run = |seed: u64| -> Vec<usize> {
             let mut rng = seed;
-            (0..32).map(|_| s.pick(&logits, &mut rng)).collect()
+            (0..32).map(|_| s.pick(&logits, &[], &mut rng)).collect()
         };
         assert_eq!(run(0x5EED), run(0x5EED));
         assert_ne!(run(0x5EED), run(0x5EEE));

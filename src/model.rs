@@ -1,7 +1,7 @@
 //! The qwen3_5_moe block math, transcribed from the transformers reference and
 //! driven by Fennec's own tensors. Every function here has a golden test.
 
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
 use crate::config::{LayerKind, Result, TextConfig};
@@ -367,6 +367,33 @@ impl Layer {
     }
 }
 
+impl Layer {
+    /// Hand every sub-layer the decode worker count.
+    ///
+    /// `Model::load_plan` builds layers on lanes with `threads = 1`, because the
+    /// worker pool has one barrier counter for the whole process and two lanes
+    /// queueing at once would release each other early. That is right for the
+    /// build and wrong to keep: a layer built with 1 thread computes every token
+    /// on one core forever, which measured as the whole CPU decode lane running at
+    /// 1.28 of its `--threads 8` workers (r21/r22). Once the lanes are joined the
+    /// pool has a single caller again and decode may use all of it.
+    pub fn set_threads(&mut self, threads: usize) {
+        let t = threads.max(1);
+        if let Some(m) = &mut self.moe {
+            m.threads = t;
+        }
+        if let Some(f) = &mut self.mlp {
+            f.threads = t;
+        }
+        if let Some(g) = &mut self.gdn {
+            g.threads = t;
+        }
+        if let Some(a) = &mut self.attn {
+            a.threads = t;
+        }
+    }
+}
+
 /// The device tier of one layer: experts whose FQ4 weights live in VRAM and
 /// whose whole gate_up -> silu -> down chain runs there. The `Gpu` is shared
 /// with the rest of the stack and behind a mutex because a command buffer and
@@ -383,20 +410,6 @@ pub struct DevExperts {
     /// put 503 MiB of widened f32 weights on the critical path *after* the
     /// device wait — 26 ms/token measured, while the device sat idle.
     pub shared: Option<[usize; 3]>,
-}
-
-/// The NPU tier of one layer: warm experts that live in dedicated NPU memory
-/// (Intel AI Boost or similar). Runs int4 GEMV on the NPU, offloading CPU work.
-pub struct NpuExperts {
-    /// expert id -> NPU slot, or -1
-    pub slot: Vec<i32>,
-    /// per slot: gate_up nibbles, gate_up scales, down nibbles, down scales
-    pub bufs: Vec<[usize; 4]>,
-    pub group: usize,
-    // NPU device handle: D3D12CreateDevice refuses the Intel AI Boost NPU
-    // (0x887a0004). DirectML is blocked by the same driver limitation.
-    // OpenVINO runtime-linking infrastructure exists in the NPU tier but
-    // compute dispatch requires a working device handle from the OS.
 }
 
 /// Arena layout for one MoE batch, in floats: x at 0, the device accumulator
@@ -598,17 +611,38 @@ pub struct MoeLayer {
     /// checks here before loading from shards, and the forward pass hints it
     /// with the next layer's cold experts.
     pub prefetcher: Option<Arc<crate::prefetch::Prefetcher>>,
+    /// The next layer's hottest streamed experts, in that layer's own plan order.
+    /// Handed to the prefetcher while *this* layer computes, which is the only
+    /// window in which a disk read can still arrive in time for this token.
+    pub ahead: Vec<usize>,
+    /// The layer `ahead` names experts in, kept separate because the last layer
+    /// prefetches for layer zero of the next token.
+    pub ahead_layer: usize,
     pub dev: Option<DevExperts>,
-    pub npu: Option<NpuExperts>,  // NPU tier: warm experts offloaded from CPU
     pub threads: usize,
     /// Routed picks answered by each tier, and the CPU milliseconds spent on the
     /// host and disk tiers while a device batch was in flight. The overlap is
     /// the claim the split exists for, so it gets counted rather than asserted.
     pub dev_hits: AtomicU64,
-    pub npu_hits: AtomicU64,
     pub host_hits: AtomicU64,
     pub disk_hits: AtomicU64,
     pub overlap_ns: AtomicU64,
+    /// Nanoseconds this layer spent computing picks out of the RAM tier, over
+    /// every token. `host_hits` x the pack size over this is the tier's decode
+    /// bandwidth, which is the number `sched::Bandwidth::host_gbs` has been
+    /// guessing at - and the one a placement decision is priced with, so it is
+    /// measured on the real work instead of on a copy loop.
+    pub host_ns: AtomicU64,
+    /// Matrix bytes the batched-prefill union read. A pick is a pick in
+    /// `host_hits`, but the union touches each expert once for the whole chunk,
+    /// so the traffic on that path is not `host_hits` x pack and adding the two
+    /// together would make the tier look faster than it moved.
+    pub host_union_bytes: AtomicU64,
+    /// Selections per expert id since this process started. The plan that hands
+    /// out the RAM slots is built from a histogram of exactly these numbers, so
+    /// a checkpoint that has never been run has no ranking to place itself by
+    /// and its hottest experts land on the disk tier by index order.
+    pub picks: Vec<AtomicU32>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -617,20 +651,61 @@ pub struct Routing {
     pub weights: Vec<f32>,
 }
 
+/// Nanoseconds the current `load_plan` has spent inside `MoeLayer::load_set`
+/// (`EXPERT_SET_NS`) and inside its `host_storage` call (`EXPERT_READ_NS`), so
+/// the difference is the assemble pass. Zeroed when the host pool starts.
+static EXPERT_READ_NS: AtomicU64 = AtomicU64::new(0);
+static EXPERT_SET_NS: AtomicU64 = AtomicU64::new(0);
+/// Nanoseconds the current `load_plan` has spent on the dense half of each
+/// layer: the MLP or mixer, the attention block and the two norms.
+static DENSE_LOAD_NS: AtomicU64 = AtomicU64::new(0);
+
 impl MoeLayer {
+    /// The host tier for `ids`: borrowed from the checkpoint's own mapping when the
+    /// container is already int4, read and quantised into owned memory when it is
+    /// not. The third element carries the borrowed pairs, and `gu`/`dn` come back
+    /// empty alongside them because nothing owns those bytes.
+    fn host_storage(
+        sh: &Shards,
+        cfg: &TextConfig,
+        layer: usize,
+        ids: &[usize],
+        group: usize,
+        threads: usize,
+    ) -> Result<(Q4, Q4, Option<Vec<(Q4, Q4)>>)> {
+        if let Some(m) = map_experts(sh, cfg, layer, ids, group)? {
+            return Ok((
+                Q4::empty(cfg.hidden_size, group),
+                Q4::empty(cfg.moe_intermediate_size, group),
+                Some(m),
+            ));
+        }
+        let (gu, dn) = gather_experts(sh, cfg, layer, ids, group, threads)?;
+        Ok((gu, dn, None))
+    }
+
+    /// Bytes the resident host set holds, whichever of the two storages backs it.
+    fn resident_bytes(gu: &Q4, dn: &Q4, mapped: &Option<Vec<(Q4, Q4)>>) -> usize {
+        match mapped {
+            Some(v) => v.iter().map(|(g, d)| g.bytes_total() + d.bytes_total()).sum(),
+            None => gu.bytes_total() + dn.bytes_total(),
+        }
+    }
+
     /// Every expert resident, straight from the checkpoint. The shape a machine
     /// with enough RAM for the whole layer uses; `load_set` is the general case.
     pub fn load(sh: &Shards, cfg: Arc<TextConfig>, layer: usize, group: usize, threads: usize) -> Result<MoeLayer> {
         let all: Vec<usize> = (0..cfg.num_experts).collect();
         let t0 = std::time::Instant::now();
-        let (gu, dn) = gather_experts(sh, &cfg, layer, &all, group, threads)?;
+        let (gu, dn, mapped) = Self::host_storage(sh, &cfg, layer, &all, group, threads)?;
         eprintln!(
-            "[fennec] layer {layer}: {} experts read and quantised in {:.1} s, {:.2} GiB int4",
+            "[fennec] layer {layer}: {} experts {} in {:.1} s, {:.2} GiB int4",
             all.len(),
+            if mapped.is_some() { "borrowed from the mapping" } else { "read and quantised" },
             t0.elapsed().as_secs_f64(),
-            (gu.bytes_total() + dn.bytes_total()) as f64 / 2f64.powi(30)
+            Self::resident_bytes(&gu, &dn, &mapped) as f64 / 2f64.powi(30)
         );
-        Self::assemble(sh, cfg, layer, all, gu, dn, None, None, threads)
+        Self::assemble(sh, cfg, layer, all, gu, dn, mapped, None, threads)
     }
 
     /// Exactly these experts in RAM, the rest answered from `stream` when the
@@ -639,6 +714,8 @@ impl MoeLayer {
     ///
     /// A pre-quantised container is borrowed rather than copied: `map_experts`
     /// hands back one mapped pair per slot and the gathered matrices stay empty.
+    /// The nibbles stay clean file pages, which is what keeps the resident set out
+    /// of the commit charge Windows has to find room for under pressure.
     pub fn load_set(
         sh: &Arc<Shards>,
         cfg: Arc<TextConfig>,
@@ -648,10 +725,12 @@ impl MoeLayer {
         group: usize,
         threads: usize,
     ) -> Result<MoeLayer> {
-        // Memory mapping pulls too much into RAM (entire checkpoint regions).
-        // Only load the experts we actually need to keep RAM usage bounded.
-        let (gu, dn) = gather_experts(sh, &cfg, layer, ids, group, threads)?;
-        Self::assemble(sh, cfg, layer, ids.to_vec(), gu, dn, None, stream, threads)
+        let t0 = std::time::Instant::now();
+        let (gu, dn, mapped) = Self::host_storage(sh, &cfg, layer, ids, group, threads)?;
+        EXPERT_READ_NS.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+        let moe = Self::assemble(sh, cfg, layer, ids.to_vec(), gu, dn, mapped, stream, threads);
+        EXPERT_SET_NS.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+        moe
     }
 
     fn assemble(
@@ -672,6 +751,7 @@ impl MoeLayer {
         let (s_down, _, _) = dense_half(sh, &format!("{p}.shared_expert.down_proj.weight"))?;
         let (s_egate, _, _) = dense(sh, &format!("{p}.shared_expert_gate.weight"))?;
         let mut slot = vec![-1i32; cfg.num_experts];
+        let picks: Vec<AtomicU32> = (0..cfg.num_experts).map(|_| AtomicU32::new(0)).collect();
         for (s, &e) in ids.iter().enumerate() {
             slot[e] = s as i32;
         }
@@ -717,14 +797,17 @@ impl MoeLayer {
             slot,
             stream: stream.map(Mutex::new),
             prefetcher: None,
+            ahead: Vec::new(),
+            ahead_layer: 0,
             dev: None,
-            npu: None,
             threads: threads.max(1),
             dev_hits: AtomicU64::new(0),
-            npu_hits: AtomicU64::new(0),
             host_hits: AtomicU64::new(0),
             disk_hits: AtomicU64::new(0),
             overlap_ns: AtomicU64::new(0),
+            host_ns: AtomicU64::new(0),
+            host_union_bytes: AtomicU64::new(0),
+            picks,
         })
     }
 
@@ -732,6 +815,7 @@ impl MoeLayer {
         // the matrices carry the resident set: gu.rows / 2I experts, ids 0..n
         let ids: Vec<usize> = (0..gu.rows / (2 * cfg.moe_intermediate_size)).collect();
         let mut slot = vec![-1i32; cfg.num_experts];
+        let picks: Vec<AtomicU32> = (0..cfg.num_experts).map(|_| AtomicU32::new(0)).collect();
         for (s, &e) in ids.iter().enumerate() {
             slot[e] = s as i32;
         }
@@ -765,14 +849,17 @@ impl MoeLayer {
             slot,
             stream: None,
             prefetcher: None,
+            ahead: Vec::new(),
+            ahead_layer: 0,
             dev: None,
-            npu: None,
             threads: threads.max(1),
             dev_hits: AtomicU64::new(0),
-            npu_hits: AtomicU64::new(0),
             host_hits: AtomicU64::new(0),
             disk_hits: AtomicU64::new(0),
             overlap_ns: AtomicU64::new(0),
+            host_ns: AtomicU64::new(0),
+            host_union_bytes: AtomicU64::new(0),
+            picks,
         }
     }
 
@@ -847,6 +934,19 @@ impl MoeLayer {
     /// Bytes the host tier holds, whether it owns them or borrows them.
     pub fn host_bytes(&self) -> usize {
         self.host_gu_bytes() + self.host_dn_bytes()
+    }
+
+    /// Matrix bytes one pick from the RAM tier reads, from the tier's own
+    /// accounting rather than from a formula, so a borrowed pack and an int2
+    /// pack are priced at what they actually are. Zero when the layer has no
+    /// RAM tier, which is also when it should record no host traffic.
+    pub fn host_pick_bytes(&self) -> usize {
+        let n = self.slot.iter().filter(|&&s| s >= 0).count();
+        if n == 0 {
+            0
+        } else {
+            self.host_bytes() / n
+        }
     }
 
     pub fn host_gu_bytes(&self) -> usize {
@@ -995,36 +1095,50 @@ impl MoeLayer {
         Ok(())
     }
 
+    /// The prefetcher's copy of one of this layer's streamed experts, waiting out
+    /// a read the worker already started rather than issuing a second copy of the
+    /// same bytes. `None` means nobody is fetching it and the pool must.
+    fn pick_cached(&self, id: usize) -> Option<Arc<crate::prefetch::CachedExpert>> {
+        let pf = self.prefetcher.as_ref()?;
+        pf.get_cached(self.layer, id)
+            .or_else(|| pf.wait_cached(self.layer, id, crate::prefetch::AHEAD_WAIT))
+    }
+
     /// The host and disk tiers, on the CPU. Called while a device batch is in
     /// flight, which is the whole point of splitting the tiers this way.
     fn cpu_picks(&self, x: &[f32], r: &Routing, host: &[usize], cold: &[usize], parts: &mut [Vec<f32>]) {
         let (h, i) = (self.cfg.hidden_size, self.cfg.moe_intermediate_size);
+        // Prime the next layer before touching this one's cold experts: a hint
+        // for the layer asking right now cannot land before the loop below reads
+        // the same bytes, so only the layer after this one is worth queueing.
+        if let Some(pf) = &self.prefetcher {
+            pf.prefetch_ahead(self.ahead_layer, &self.ahead);
+        }
         if !cold.is_empty() {
-            // Hint the prefetcher with this layer's cold experts so the next
-            // layer's loads may already be in cache.
-            if let Some(pf) = &self.prefetcher {
-                let cold_ids: Vec<usize> = cold.iter().map(|&n| r.ids[n]).collect();
-                pf.prefetch_next_layer(self.layer, &cold_ids);
-            }
             let mut pool = self
                 .stream
                 .as_ref()
                 .unwrap_or_else(|| panic!("a non-resident expert needs a pool"))
                 .lock()
                 .unwrap();
+            // Read every cold expert of this layer before computing any of them.
+            // The router named them all above, so this is the same traffic the
+            // loop below would issue, just deep instead of serial.
+            let want: Vec<usize> = cold
+                .iter()
+                .map(|&n| r.ids[n])
+                .filter(|&id| !self.prefetcher.as_ref().is_some_and(|pf| pf.covers(self.layer, id)))
+                .collect();
+            pool.warm(&want);
             for &n in cold {
                 let (id, w) = (r.ids[n], r.weights[n]);
                 let mut hh = vec![0f32; i];
                 let mut y = vec![0f32; h];
                 let mut part = vec![0f32; h];
-                // Check the prefetcher cache before hitting the disk pool.
-                let loaded = if let Some(pf) = &self.prefetcher {
-                    if let Some(cached) = pf.get_cached(self.layer, id) {
-                        expert_in(&cached.gate_up, &cached.down, i, h, 0, x, &mut hh, &mut y);
-                        true
-                    } else {
-                        false
-                    }
+                // The prefetch cache first: a hit costs a reference count.
+                let loaded = if let Some(c) = self.pick_cached(id) {
+                    expert_in(&c.gate_up, &c.down, i, h, 0, x, &mut hh, &mut y);
+                    true
                 } else {
                     false
                 };
@@ -1036,6 +1150,14 @@ impl MoeLayer {
                 parts[n] = part;
             }
         }
+        // Timed, because the host tier's price in the plan is the one rate nothing
+        // else measures honestly. `Bandwidth::host_gbs` used to come from
+        // `fennec bench`'s copy loop, which r13 showed runs 1.5-2.4x faster than a
+        // decode (13.3-19.4 GB/s against 8.1), and a placement priced on it thinks
+        // RAM picks are nearly free. The activation buffers this section also
+        // touches are under 1% of the pack each pick reads, so picks x pack bytes
+        // over this span is the tier's decode bandwidth on this box.
+        let t_host = (!host.is_empty()).then(std::time::Instant::now);
         if self.threads == 1 || host.len() < 2 || self.host_gu.is_some() {
             // Serial path: one expert at a time. Also used when int2 host experts
             // are active, since the batched DotPrep path is Q4-specific.
@@ -1102,6 +1224,9 @@ impl MoeLayer {
                 }
             });
         }
+        if let Some(t) = t_host {
+            self.host_ns.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+        }
     }
 
     /// The whole block: routed experts plus the sigmoid-gated shared expert.
@@ -1130,6 +1255,17 @@ impl MoeLayer {
         (out, r)
     }
 
+    /// Fold the router's picks into the history the next plan is ranked by. One
+    /// relaxed increment per pick on the thread that did the routing, which is
+    /// why it can sit in the hot path: the ids are already in hand.
+    fn note_picks(&self, ids: &[usize]) {
+        for &id in ids {
+            if let Some(c) = self.picks.get(id) {
+                c.fetch_add(1, Relaxed);
+            }
+        }
+    }
+
     /// One token whose routing is already known, under the guard its caller
     /// holds. The device tier shares one `Mutex<Gpu>` across the whole stack
     /// and `std::sync::Mutex` is not reentrant, so a prompt chunk that is
@@ -1140,14 +1276,11 @@ impl MoeLayer {
         let (h, i) = (self.cfg.hidden_size, self.cfg.moe_intermediate_size);
         let k = r.ids.len();
         let mut parts: Vec<Vec<f32>> = vec![Vec::new(); k];
-        let (mut dev_picks, mut npu_picks, mut host_picks, mut cold) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut dev_picks, mut host_picks, mut cold) = (Vec::new(), Vec::new(), Vec::new());
         for n in 0..k {
             let id = r.ids[n];
             if self.dev.as_ref().is_some_and(|d| d.slot[id] >= 0) {
                 dev_picks.push(n);
-            } else if self.npu.as_ref().is_some_and(|npu| npu.slot[id] >= 0) {
-                npu_picks.push(n);
             } else if self.slot[id] >= 0 {
                 host_picks.push(n);
             } else {
@@ -1155,16 +1288,14 @@ impl MoeLayer {
             }
         }
         let mut dev_out = vec![0f32; h];
+        self.note_picks(&r.ids);
         self.dev_hits.fetch_add(dev_picks.len() as u64, Relaxed);
-        self.npu_hits.fetch_add(npu_picks.len() as u64, Relaxed);
         self.host_hits.fetch_add(host_picks.len() as u64, Relaxed);
         self.disk_hits.fetch_add(cold.len() as u64, Relaxed);
         let dev_shared = self.dev.as_ref().and_then(|d| d.shared);
         // The sigmoid gate is 2048 f32 MACs on the host; computing it here lets
         // the shared expert's axpy ride in the same batch as the routed picks.
         let shared_gate = kernel::sigmoid(kernel::dot(&self.s_egate, x));
-        // NPU compute not yet implemented: route NPU picks through host path
-        host_picks.extend_from_slice(&npu_picks);
         if dev_picks.is_empty() && dev_shared.is_none() {
             let _t = prof::start(prof::MOE_CPU);
             self.cpu_picks(x, &r, &host_picks, &cold, &mut parts);
@@ -1314,6 +1445,7 @@ impl MoeLayer {
                 &mut ids[r * k..(r + 1) * k],
             );
         }
+        self.note_picks(&ids);
         // The union of the chunk's picks, in first-seen order, each expert
         // carrying the flat pick indices that use it.
         let mut at = vec![usize::MAX; e];
@@ -1341,30 +1473,31 @@ impl MoeLayer {
             let _cpu = prof::start(prof::MOE_CPU);
             self.host_hits
                 .fetch_add((n * k - cold.len()) as u64, Relaxed);
+            // Prime the next layer while this one still has host work left to
+            // do; this layer's own misses are too late to overlap anything.
+            if let Some(pf) = &self.prefetcher {
+                pf.prefetch_ahead(self.ahead_layer, &self.ahead);
+            }
             if !cold.is_empty() {
-                // Hint the prefetcher with this layer's cold experts.
-                if let Some(pf) = &self.prefetcher {
-                    let cold_ids: Vec<usize> = cold.iter().map(|&q| ids[q]).collect();
-                    pf.prefetch_next_layer(self.layer, &cold_ids);
-                }
                 let mut pool = self
                     .stream
                     .as_ref()
                     .unwrap_or_else(|| panic!("a non-resident expert needs a pool"))
                     .lock()
                     .unwrap();
+                let want: Vec<usize> = cold
+                    .iter()
+                    .map(|&q| ids[q])
+                    .filter(|&id| !self.prefetcher.as_ref().is_some_and(|pf| pf.covers(self.layer, id)))
+                    .collect();
+                pool.warm(&want);
                 let mut hh = vec![0f32; i];
                 let mut y = vec![0f32; h];
                 for &q in &cold {
                     let (id, w, r) = (ids[q], wts[q], q / k);
-                    // Check the prefetcher cache before hitting the disk pool.
-                    let loaded = if let Some(pf) = &self.prefetcher {
-                        if let Some(cached) = pf.get_cached(self.layer, id) {
-                            expert_in(&cached.gate_up, &cached.down, i, h, 0, &xs[r * h..(r + 1) * h], &mut hh, &mut y);
-                            true
-                        } else {
-                            false
-                        }
+                    let loaded = if let Some(c) = self.pick_cached(id) {
+                        expert_in(&c.gate_up, &c.down, i, h, 0, &xs[r * h..(r + 1) * h], &mut hh, &mut y);
+                        true
                     } else {
                         false
                     };
@@ -1377,6 +1510,10 @@ impl MoeLayer {
                     kernel::axpy(&mut parts[q * h..(q + 1) * h], &y, w);
                 }
             }
+            // The RAM tier's bandwidth is priced on this work too, so the union's
+            // own read is timed and counted: one pack per union member, not one
+            // per pick.
+            let t_host = std::time::Instant::now();
             // Within a layer every expert comes from the same pack, so the first
             // resident one decides whether the integer dot is available to all of
             // them — the assumption `cpu_picks` already makes.
@@ -1422,6 +1559,10 @@ impl MoeLayer {
                     }
                 }
             });
+            self.host_union_bytes
+                .fetch_add(nu as u64 * self.host_pick_bytes() as u64, Relaxed);
+            self.host_ns
+                .fetch_add(t_host.elapsed().as_nanos() as u64, Relaxed);
         }
         let si = self.cfg.shared_expert_intermediate_size;
         let mut shared_out = vec![0f32; n * h];
@@ -1505,25 +1646,24 @@ impl MoeLayer {
         let mut parts = vec![0f32; n * k * h];
         
         // Process cold experts (disk-streamed)
+        if let Some(pf) = &self.prefetcher {
+            pf.prefetch_ahead(self.ahead_layer, &self.ahead);
+        }
         if !cold.is_empty() {
-            // Hint the prefetcher with this layer's cold experts.
-            if let Some(pf) = &self.prefetcher {
-                let cold_ids: Vec<usize> = cold.iter().map(|&(_tok, _pick, id, _w)| id).collect();
-                pf.prefetch_next_layer(self.layer, &cold_ids);
-            }
             let mut pool = self.stream.as_ref().unwrap().lock().unwrap();
+            let want: Vec<usize> = cold
+                .iter()
+                .map(|&(_, _, id, _)| id)
+                .filter(|&id| !self.prefetcher.as_ref().is_some_and(|pf| pf.covers(self.layer, id)))
+                .collect();
+            pool.warm(&want);
             let mut hh = vec![0f32; i];
             let mut y = vec![0f32; h];
             for &(token_idx, pick_idx, id, w) in &cold {
                 let x = &xs[token_idx * h..(token_idx + 1) * h];
-                // Check the prefetcher cache before hitting the disk pool.
-                let loaded = if let Some(pf) = &self.prefetcher {
-                    if let Some(cached) = pf.get_cached(self.layer, id) {
-                        expert_in(&cached.gate_up, &cached.down, i, h, 0, x, &mut hh, &mut y);
-                        true
-                    } else {
-                        false
-                    }
+                let loaded = if let Some(c) = self.pick_cached(id) {
+                    expert_in(&c.gate_up, &c.down, i, h, 0, x, &mut hh, &mut y);
+                    true
                 } else {
                     false
                 };
@@ -1738,6 +1878,42 @@ pub fn cached_expert(
         .then(|| packed_expert(sh, prefix, layer, id, h, i, group))
 }
 
+/// One streamed expert without moving its bytes: whichever pre-quantised form
+/// this checkpoint has, the FQ4 sidecar's rows or the packed container's blocks,
+/// both left in the file mapping they came from.
+///
+/// `None` means the tier has to own them - a bf16 checkpoint that is quantised on
+/// the way in - so the caller pays the allocation and the encode pass. Where a
+/// pre-quantised source does exist, copying it into a ring slot made the streamed
+/// lane touch every expert twice: once to fault its pages in, once to `memcpy` the
+/// same 1.7 MiB, in an anonymous page the OS cannot share or reclaim quietly.
+pub fn borrow_expert(
+    sh: &Shards,
+    prefix: &str,
+    layer: usize,
+    id: usize,
+    h: usize,
+    i: usize,
+    group: usize,
+) -> Option<Result<(Q4, Q4)>> {
+    if let Some(sc) = sh.fq4() {
+        if let (Some(gi), Some(di)) = (
+            sc.item(&format!("blk.{layer}.ffn.gate_up_exps")),
+            sc.item(&format!("blk.{layer}.ffn.down_exps")),
+        ) {
+            if gi.group == group && di.group == group && gi.cols == h && di.cols == i {
+                return Some((|| -> Result<(Q4, Q4)> {
+                    Ok((
+                        sc.rows_borrowed(&gi, id * 2 * i, (id + 1) * 2 * i)?,
+                        sc.rows_borrowed(&di, id * h, (id + 1) * h)?,
+                    ))
+                })());
+            }
+        }
+    }
+    map_expert(sh, prefix, layer, id, h, i, group)
+}
+
 /// The host tier without a copy: one borrowed pair of matrices per expert,
 /// straight out of the pre-quantised container's mapping.
 ///
@@ -1764,22 +1940,47 @@ pub fn map_experts(
     if !sh.contains(&format!("{p}.0.merged_weight")) || h % group != 0 {
         return Ok(None);
     }
-    let block_bytes = i * h / 2;
-    let block_scales = i * (h / group);
     let mut out = Vec::with_capacity(ids.len());
     for &e in ids {
-        let ep = format!("{p}.{e}");
-        let Some((map, off)) = sh.mapped(&format!("{ep}.merged_weight")) else {
-            return Ok(None);
-        };
-        let s = sh.slice_f32(&format!("{ep}.qs"), 0, 3 * block_scales)?;
-        let cut = 2 * block_scales;
-        out.push((
-            Q4::mapped(map.clone(), off, 2 * i, h, group, s[..cut].to_vec(), true),
-            Q4::mapped(map, off + 2 * block_bytes, h, i, group, s[cut..].to_vec(), true),
-        ));
+        match map_expert(sh, &cfg.prefix, layer, e, h, i, group) {
+            Some(r) => out.push(r?),
+            None => return Ok(None),
+        }
     }
     Ok(Some(out))
+}
+
+/// One expert of a packed int4 container, still sitting in the shard mapping.
+///
+/// The nibbles are never read here, only located, so the cost of the pair is its
+/// scales: a ninth of the bytes. `None` means "not a packed container", and an
+/// `Err` is the tensor read failing, which the caller reports rather than
+/// replays through the copying path.
+fn map_expert(
+    sh: &Shards,
+    prefix: &str,
+    layer: usize,
+    e: usize,
+    h: usize,
+    i: usize,
+    group: usize,
+) -> Option<Result<(Q4, Q4)>> {
+    if h % group != 0 {
+        return None;
+    }
+    let ep = format!("{prefix}.layers.{layer}.mlp.experts.{e}");
+    let (map, off) = sh.mapped(&format!("{ep}.merged_weight"))?;
+    let block_bytes = i * h / 2;
+    let block_scales = i * (h / group);
+    let s = match sh.slice_f32(&format!("{ep}.qs"), 0, 3 * block_scales) {
+        Ok(s) => s,
+        Err(err) => return Some(Err(err)),
+    };
+    let cut = 2 * block_scales;
+    Some(Ok((
+        Q4::mapped(map.clone(), off, 2 * i, h, group, s[..cut].to_vec(), true),
+        Q4::mapped(map, off + 2 * block_bytes, h, i, group, s[cut..].to_vec(), true),
+    )))
 }
 
 /// The two FQ4 matrices for exactly `ids`, in that order, one expert block at a
@@ -1839,16 +2040,100 @@ pub fn gather_experts(
         dn.shrink_to_fit();
         return Ok((gu, dn));
     }
+    // Detect which expert tensor format the checkpoint uses. Three layouts exist:
+    //   A) Fused `{p}.gate_up_proj` (Qwen3-MoE safetensors)
+    //   B) Separate `{p}.gate_proj` + `{p}.up_proj` (some HF exports)
+    //   C) Edge0 `{p2}.gate_proj.weight` + `{p2}.up_proj.weight` under `switch_mlp`
+    let has_fused = sh.contains(&gu_name);
+    let gate_name = format!("{p}.gate_proj");
+    let up_name = format!("{p}.up_proj");
+    let gate_w = format!("{gate_name}.weight");
+    let up_w = format!("{up_name}.weight");
+    let p2 = format!("{}.layers.{layer}.mlp.switch_mlp", cfg.prefix);
+    let edge_gate = format!("{p2}.gate_proj.weight");
+    let edge_up = format!("{p2}.up_proj.weight");
+    let edge_dn = format!("{p2}.down_proj.weight");
+    let has_separate = sh.contains(&gate_name) || sh.contains(&gate_w);
+    let has_edge0 = sh.contains(&edge_gate);
     for &e in ids {
-        let g = sh.slice_f32(&gu_name, e * 2 * i * h, (e + 1) * 2 * i * h)?;
-        gu.push(&Q4::quantize(&g, 2 * i, h, group, threads));
-        let d = sh.slice_f32(&dn_name, e * h * i, (e + 1) * h * i)?;
-        dn.push(&Q4::quantize(&d, h, i, group, threads));
+        if has_fused {
+            let g = sh.slice_f32(&gu_name, e * 2 * i * h, (e + 1) * 2 * i * h)?;
+            gu.push(&Q4::quantize(&g, 2 * i, h, group, threads));
+        } else if has_edge0 {
+            // Edge0: separate gate/up under switch_mlp, each [num_experts*I, H] with .weight
+            let gate_rows = sh.slice_f32(&edge_gate, e * i * h, (e + 1) * i * h)?;
+            let up_rows = sh.slice_f32(&edge_up, e * i * h, (e + 1) * i * h)?;
+            let mut fused = gate_rows;
+            fused.extend_from_slice(&up_rows);
+            gu.push(&Q4::quantize(&fused, 2 * i, h, group, threads));
+        } else if has_separate {
+            let gn = if sh.contains(&gate_w) { &gate_w } else { &gate_name };
+            let un = if sh.contains(&up_w) { &up_w } else { &up_name };
+            let gate_rows = sh.slice_f32(gn, e * i * h, (e + 1) * i * h)?;
+            let up_rows = sh.slice_f32(un, e * i * h, (e + 1) * i * h)?;
+            let mut fused = gate_rows;
+            fused.extend_from_slice(&up_rows);
+            gu.push(&Q4::quantize(&fused, 2 * i, h, group, threads));
+        } else {
+            let g = sh.slice_f32(&gu_name, e * 2 * i * h, (e + 1) * 2 * i * h)?;
+            gu.push(&Q4::quantize(&g, 2 * i, h, group, threads));
+        }
+        let dn_slice = if has_edge0 {
+            sh.slice_f32(&edge_dn, e * h * i, (e + 1) * h * i)?
+        } else {
+            sh.slice_f32(&dn_name, e * h * i, (e + 1) * h * i)?
+        };
+        dn.push(&Q4::quantize(&dn_slice, h, i, group, threads));
     }
     // Shrink to fit: release memory wasted by Vec's doubling growth strategy.
     // This is automatic memory management so the user never needs to clean up RAM by hand.
     gu.shrink_to_fit();
     dn.shrink_to_fit();
+    Ok((gu, dn))
+}
+
+/// Load one expert's gate-up and down as raw f32, handling all three checkpoint
+/// formats (fused, separate, Edge0 switch_mlp). Returns `(gate_up, down)` where
+/// `gate_up` has `2*i*h` elements and `down` has `h*i` elements.
+pub fn load_expert_pair(
+    sh: &Shards,
+    prefix: &str,
+    layer: usize,
+    id: usize,
+    h: usize,
+    i: usize,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    let p = format!("{prefix}.layers.{layer}.mlp.experts");
+    let gu_name = format!("{p}.gate_up_proj");
+    let dn_name = format!("{p}.down_proj");
+    if sh.contains(&gu_name) {
+        let gu = sh.slice_f32(&gu_name, id * 2 * i * h, (id + 1) * 2 * i * h)?;
+        let dn = sh.slice_f32(&dn_name, id * h * i, (id + 1) * h * i)?;
+        return Ok((gu, dn));
+    }
+    let p2 = format!("{prefix}.layers.{layer}.mlp.switch_mlp");
+    let edge_gate = format!("{p2}.gate_proj.weight");
+    let edge_up = format!("{p2}.up_proj.weight");
+    let edge_dn = format!("{p2}.down_proj.weight");
+    if sh.contains(&edge_gate) {
+        let gate = sh.slice_f32(&edge_gate, id * i * h, (id + 1) * i * h)?;
+        let up = sh.slice_f32(&edge_up, id * i * h, (id + 1) * i * h)?;
+        let dn = sh.slice_f32(&edge_dn, id * h * i, (id + 1) * h * i)?;
+        let mut gu = gate;
+        gu.extend_from_slice(&up);
+        return Ok((gu, dn));
+    }
+    let gate_name = format!("{p}.gate_proj");
+    let up_name = format!("{p}.up_proj");
+    let gate_w = format!("{gate_name}.weight");
+    let up_w = format!("{up_name}.weight");
+    let gn = if sh.contains(&gate_w) { &gate_w } else { &gate_name };
+    let un = if sh.contains(&up_w) { &up_w } else { &up_name };
+    let gate = sh.slice_f32(gn, id * i * h, (id + 1) * i * h)?;
+    let up = sh.slice_f32(un, id * i * h, (id + 1) * i * h)?;
+    let dn = sh.slice_f32(&dn_name, id * h * i, (id + 1) * h * i)?;
+    let mut gu = gate;
+    gu.extend_from_slice(&up);
     Ok((gu, dn))
 }
 
@@ -2983,8 +3268,12 @@ impl Layer {
                 None,
             )
         } else {
-            (None, Some(MlpLayer::load(sh, cfg.clone(), layer, threads, quantize_i8)?))
+            let t = std::time::Instant::now();
+            let mlp = MlpLayer::load(sh, cfg.clone(), layer, threads, quantize_i8)?;
+            DENSE_LOAD_NS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            (None, Some(mlp))
         };
+        let t_dense = std::time::Instant::now();
         let gdn = match kind {
             LayerKind::Linear => Some(GdnLayer::load(sh, cfg.clone(), layer, threads, quantize_i8)?),
             LayerKind::Full => None,
@@ -2993,16 +3282,10 @@ impl Layer {
             LayerKind::Full => Some(AttnLayer::load(sh, cfg.clone(), layer, kv_cap, threads, quantize_i8)?),
             LayerKind::Linear => None,
         };
-        Ok(Layer {
-            cfg,
-            kind,
-            norm_in: norm_w(sh, &format!("{p}.input_layernorm.weight"), zc)?,
-            norm_post: norm_w(sh, &format!("{p}.post_attention_layernorm.weight"), zc)?,
-            moe,
-            mlp,
-            gdn,
-            attn,
-        })
+        let norm_in = norm_w(sh, &format!("{p}.input_layernorm.weight"), zc)?;
+        let norm_post = norm_w(sh, &format!("{p}.post_attention_layernorm.weight"), zc)?;
+        DENSE_LOAD_NS.fetch_add(t_dense.elapsed().as_nanos() as u64, Relaxed);
+        Ok(Layer { cfg, kind, norm_in, norm_post, moe, mlp, gdn, attn })
     }
 
     pub fn state(&self, cfg: &TextConfig, kv_cap: usize) -> LayerState {
@@ -3219,6 +3502,56 @@ pub struct Model {
     /// cache before hitting the disk pool, and hint it with the next layer's
     /// cold experts after each forward pass.
     pub prefetcher: Option<Arc<crate::prefetch::Prefetcher>>,
+    /// Where a run folds the router picks it observed. The plan that hands out
+    /// the RAM slots is ranked by a histogram of exactly those picks, so a model
+    /// that has never been run has no ranking and places itself blind. `None`
+    /// means this process records nothing: a dense stack, or a caller that asked
+    /// for no history.
+    pub usage_store: Option<String>,
+    /// Where a run writes the rates it measured while running, beside the usage
+    /// file and under the same rule: Fennec's own, never anything Colibri reads.
+    pub rates_store: Option<String>,
+    /// Whether the streamed tier borrowed its packs for this plan, which is what
+    /// decides whether the recorded disk rate carries an encode pass with it.
+    pub rates_borrows: bool,
+    /// The lane traffic the last rates sample was taken from, so that a sample is
+    /// a window rather than the process lifetime re-read. `serve` saves after
+    /// every turn and the lane counters run for the whole process, so without
+    /// this mark the samples it merges are nested windows of one run - turn 1
+    /// inside turn 2 inside turn 3 - and `Measured::merge`, which keeps the
+    /// coldest disk sample, mechanically chooses the earliest one. r16's narrow
+    /// arms show it: six saves gave disk 4.0, then 3.7, then 3.7 four times over,
+    /// while the same lane's cumulative read at end of run was 6.5 GB/s. Turn 1,
+    /// whose window is nothing but first-touch page faults, was pricing every
+    /// turn after it. Zero for a run that saves once, which is every decode run.
+    rates_seen: Mutex<LaneWindow>,
+}
+
+/// Traffic the timed lanes have moved since the process started, which is what
+/// they report cumulatively: see `Model::rates_seen` for why a sample has to be
+/// the difference between two readings of it.
+#[derive(Debug, Clone, Copy, Default)]
+struct LaneWindow {
+    read_bytes: u64,
+    read_ms: f64,
+    quant_bytes: u64,
+    quant_ms: f64,
+    host_bytes: u64,
+    host_ns: u64,
+}
+
+impl LaneWindow {
+    /// What moved between an earlier reading of the counters and this one.
+    fn since(&self, prev: &LaneWindow) -> LaneWindow {
+        LaneWindow {
+            read_bytes: self.read_bytes.saturating_sub(prev.read_bytes),
+            read_ms: self.read_ms - prev.read_ms,
+            quant_bytes: self.quant_bytes.saturating_sub(prev.quant_bytes),
+            quant_ms: self.quant_ms - prev.quant_ms,
+            host_bytes: self.host_bytes.saturating_sub(prev.host_bytes),
+            host_ns: self.host_ns.saturating_sub(prev.host_ns),
+        }
+    }
 }
 
 impl Model {
@@ -3260,64 +3593,177 @@ impl Model {
         gpu: Option<Arc<Mutex<Gpu>>>,
     ) -> Result<Model> {
         let mut layers = Vec::with_capacity(plan.layers.len());
-        let t_host = std::time::Instant::now();
-        for lp in &plan.layers {
-            let ids: Vec<usize> = if gpu.is_some() {
-                // GPU path: load host + NPU experts (NPU falls back to CPU)
-                lp.pooled.iter().chain(&lp.npu_resident).copied().collect()
+        EXPERT_READ_NS.store(0, Relaxed);
+        EXPERT_SET_NS.store(0, Relaxed);
+        DENSE_LOAD_NS.store(0, Relaxed);
+        // One layer's host half is a burst of independent file reads plus its own
+        // quantise pass, and the worker pool is not what either of them waits on: the
+        // dense pass summed to 7.5 s with the pool at 16 threads and 7.7 s with it at
+        // 1. The layers themselves are independent, so building them on lanes of
+        // their own does overlap them — and the shared pool stays out of it, since
+        // `par_rows` runs inline at threads <= 1 and a lane must not queue work into
+        // the pool another lane may already be holding.
+        //
+        // Only for the no-device plan, though, and that half is measurement rather
+        // than mechanism: paired on one binary, the device plan took host pool
+        // 2.6 -> 1.3 s from 2 lanes but 6.2 -> 9.6 s from the device upload that
+        // follows, so connect went 9.5 -> 11.7 s (3, 4 and 6 lanes all land at
+        // 11.4-12.3 s; the pair repeated to within 0.2 s). The two phases do not
+        // even read the same expert sets, so nothing here explains why overlapping
+        // the first starves the second — it only says not to. Without an upload
+        // there is nothing to starve and the lanes are a clean win: connect
+        // 10.9 -> 5.2 s, repeated as 10.8 -> 5.0 s.
+        //
+        // `FENNEC_LOAD_LANES=1` is the A/B control for both halves of that — it
+        // selects the serial loop on either plan, same binary, same checkpoint.
+        let cap = std::env::var("FENNEC_LOAD_LANES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(6);
+        let has_gpu = gpu.is_some();
+        let lanes = if has_gpu || plan.layers.len() < 2 {
+            1
+        } else {
+            // Each in-flight layer is another working set, and RAM is the scarce
+            // resource here rather than threads, so no more lanes than the box has
+            // usable cores.
+            threads.clamp(1, cap).min(plan.layers.len())
+        };
+        let inner = if lanes > 1 { 1 } else { threads };
+        let build = |i: usize| -> Result<Layer> {
+            let lp = &plan.layers[i];
+            let ids: Vec<usize> = if has_gpu {
+                // GPU path: the host pool is the RAM tier; the resident set is in VRAM
+                lp.pooled.clone()
             } else {
-                // CPU-only path: load device + host + NPU experts
-                lp.resident
-                    .iter()
-                    .chain(&lp.pooled)
-                    .chain(&lp.npu_resident)
-                    .copied()
-                    .collect()
+                // CPU-only path: the device tier has no VRAM to live in, so the
+                // host reads it out of RAM like the pool
+                lp.resident.iter().chain(&lp.pooled).copied().collect()
             };
             let stream = if lp.streamed.is_empty() || stream_slots == 0 {
                 None
             } else {
+                // `threads`, not `inner`: this one is what the ring refiller reads
+                // with at decode time, and the lane is long gone by then.
                 Some(Stream::new(sh.clone(), &cfg, lp.layer, group, threads, stream_slots))
             };
-            layers.push(Layer::with_experts(
+            Layer::with_experts(
                 sh,
                 cfg.clone(),
                 lp.layer,
                 &ids,
                 stream,
                 group,
-                threads,
+                inner,
                 kv_cap,
                 lp.dense_on_device,
-            )?);
+            )
+        };
+        let t_host = std::time::Instant::now();
+        if lanes == 1 {
+            for i in 0..plan.layers.len() {
+                layers.push(build(i)?);
+            }
+        } else {
+            // `Model::finish` and the prefetcher's next-layer handoff both index by
+            // position in the plan, so the lanes fill slots and the order is
+            // restored here rather than by whatever lane finished first.
+            let per = plan.layers.len().div_ceil(lanes);
+            let mut slots: Vec<Option<Result<Layer>>> =
+                (0..plan.layers.len()).map(|_| None).collect();
+            let build = &build;
+            std::thread::scope(|s| {
+                for (c, chunk) in slots.chunks_mut(per).enumerate() {
+                    let base = c * per;
+                    s.spawn(move || {
+                        for (j, slot) in chunk.iter_mut().enumerate() {
+                            *slot = Some(build(base + j));
+                        }
+                    });
+                }
+            });
+            layers = slots
+                .into_iter()
+                .map(|s| s.unwrap())
+                .collect::<Result<Vec<Layer>>>()?;
+        }
+        // The build lanes are joined, so the worker pool has one caller again and the
+        // layers may use all of it. Leaving them at `inner` decodes every token on one
+        // core, which is what cost the served CPU lane most of its throughput (#463).
+        for layer in layers.iter_mut() {
+            layer.set_threads(threads);
         }
         let host_ms = t_host.elapsed().as_secs_f64() * 1e3;
         crate::mem::report("host pool");
         let first = plan.layers.first().map(|lp| lp.layer).unwrap_or(0);
         let t_finish = std::time::Instant::now();
         let mut model = Model::finish(sh, cfg.clone(), first, layers, threads)?;
-        // Start the prefetcher when any layer has streamed (cold) experts.
-        // The cache holds one layer's worth of cold experts: overlapping disk
-        // reads with the compute of the current layer.
+        // Start the prefetcher when any layer has streamed (cold) experts. Its job
+        // is to have the *next* layer's picks in RAM while this one computes, so
+        // each layer is handed the prefix of the next layer's streamed list — a
+        // list that already arrives ranked hottest-first from the usage histogram.
         let has_streamed = plan.layers.iter().any(|lp| !lp.streamed.is_empty());
         if has_streamed && stream_slots > 0 {
-            let cache_bytes = stream_slots * 20 * 1024 * 1024;
-            model.prefetcher = Some(Arc::new(crate::prefetch::Prefetcher::start(
-                cache_bytes,
-                sh.clone(),
-                cfg.clone(),
-                group,
-                threads,
-            )));
-            eprintln!("[fennec] prefetcher started with {} MiB cache", cache_bytes / 1024 / 1024);
-            // Share the prefetcher with every layer's MoE so cold-expert loads
-            // can check the cache before hitting the disk pool.
-            if let Some(pf) = &model.prefetcher {
-                for layer in &mut model.layers {
+            let mb = std::env::var("FENNEC_PREFETCH_MB")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(256)
+                .max(16);
+            let cache_bytes = mb * 1024 * 1024;
+            // Speculation has one competitor: the OS file cache for the very same
+            // bytes. Measured on a box with room to cache the whole expert matrix
+            // (MATRIX.md, r5 sweep), an engine-side cache cost 2 % of decode at
+            // depth 4 and 18.5 % at depth 16 — it displaced file pages that were
+            // already serving the streamed tier, and the histogram guessed which
+            // experts to hoist right only 3.6-13.4 % of the time. So speculate
+            // only when the streamed matrix cannot stay cached, which is where a
+            // read is genuinely cold. `FENNEC_PREFETCH_AHEAD` forces either way.
+            let streamed: usize = plan
+                .layers
+                .iter()
+                .map(|lp| lp.streamed.len() * plan.expert_bytes)
+                .sum();
+            let ram = crate::mem::available_bytes() as usize;
+            let fits = streamed <= ram;
+            let depth = std::env::var("FENNEC_PREFETCH_AHEAD")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(if fits { 0 } else { cfg.num_experts_per_tok });
+            if depth == 0 {
+                eprintln!(
+                    "[fennec] prefetch: off — {:.1} GiB of streamed experts fits the {:.1} GiB \
+                     the OS can cache, and a speculated copy of a cached page is pure overhead",
+                    streamed as f64 / 2f64.powi(30),
+                    ram as f64 / 2f64.powi(30)
+                );
+            } else {
+                let pf = Arc::new(crate::prefetch::Prefetcher::start(
+                    cache_bytes,
+                    sh.clone(),
+                    cfg.clone(),
+                    group,
+                    threads,
+                ));
+                model.prefetcher = Some(pf.clone());
+                // Share the prefetcher with every layer's MoE and hand each one the
+                // layer computed after it. `plan.layers` is built in layer order, so
+                // the next entry is the next layer; the last wraps to the first
+                // because that is where the following token starts.
+                let n = plan.layers.len();
+                for (idx, layer) in model.layers.iter_mut().enumerate() {
                     if let Some(moe) = &mut layer.moe {
                         moe.prefetcher = Some(pf.clone());
+                        if let Some(np) = plan.layers.get((idx + 1) % n) {
+                            moe.ahead_layer = np.layer;
+                            moe.ahead = np.streamed.iter().take(depth).copied().collect();
+                        }
                     }
                 }
+                eprintln!(
+                    "[fennec] prefetcher: {} MiB cache, {depth} experts of the next layer per hint",
+                    cache_bytes / 1024 / 1024
+                );
             }
         }
         let finish_ms = t_finish.elapsed().as_secs_f64() * 1e3;
@@ -3375,8 +3821,22 @@ impl Model {
             host_ms / 1e3, finish_ms / 1e3, head_ms / 1e3, dev_ms / 1e3
         );
         if model.cfg.is_moe() {
+            let read = EXPERT_READ_NS.load(Relaxed);
+            let set = EXPERT_SET_NS.load(Relaxed);
+            let dense = DENSE_LOAD_NS.load(Relaxed);
             eprintln!(
-                "[fennec] host experts: {:.2} GiB of matrix, {:.2} GiB of allocator capacity, {mapped}/{} layers borrowed from the mapping",
+                // The three components are work summed over the build lanes, so
+                // only their total is comparable to the wall-clock host pool number.
+                "[fennec] host pool inside ({lanes} lanes, work summed): expert read {:.1} s | assemble {:.1} s | dense {:.1} s | plan+stream {:.1} s",
+                read as f64 / 1e9,
+                set.saturating_sub(read) as f64 / 1e9,
+                dense as f64 / 1e9,
+                ((host_ms * 1e6) as u64).saturating_sub(set + dense) as f64 / 1e9
+            );
+        }
+        if model.cfg.is_moe() {
+            eprintln!(
+                "[fennec] host experts: {:.2} GiB of matrix, {:.2} GiB held (file pages, not commit, where borrowed), {mapped}/{} layers borrowed from the mapping",
                 used as f64 / 2f64.powi(30),
                 held as f64 / 2f64.powi(30),
                 model.layers.len()
@@ -3455,7 +3915,224 @@ impl Model {
             #[cfg(feature = "ort")]
             ort_head: None,
             prefetcher: None,
+            usage_store: None,
+            rates_store: None,
+            rates_borrows: false,
+            rates_seen: Mutex::new(LaneWindow::default()),
         })
+    }
+
+    /// Summed over every layer's ring: bytes and milliseconds the streamed tier
+    /// really moved during this process's life. The plan's `disk_gbs` and
+    /// `quant_gbs` are guesses until something like this says otherwise, and this
+    /// costs no load time because it is the production path itself being measured.
+    pub fn stream_totals(&self) -> crate::pool::StreamTotals {
+        let mut t = crate::pool::StreamTotals::default();
+        for l in &self.layers {
+            if let Some(pool) = l.moe.as_ref().and_then(|m| m.stream.as_ref()) {
+                let st = pool.lock().unwrap();
+                t.hits += st.hits;
+                t.misses += st.misses;
+                t.warmed += st.warmed;
+                t.borrowed += st.borrowed;
+                t.ring_bytes += st.bytes();
+                t.ring_bytes_full += st.slots() * st.pack_bytes();
+
+                t.read_ms += st.read_ms;
+                t.quant_ms += st.quant_ms;
+                t.read_bytes += st.read_bytes;
+                t.quant_bytes += st.quant_bytes;
+                t.rings += 1;
+            }
+        }
+        t
+    }
+
+    /// Bytes the RAM tier read and the nanoseconds it spent reading them, over
+    /// this process's life. Both shapes count: a decode pick reads one pack, the
+    /// batched-prefill union reads one per expert it touched rather than one per
+    /// pick, and folding the two together is what makes the derived rate the one
+    /// a placement decision should be priced with.
+    pub fn host_traffic(&self) -> (u64, u64) {
+        let (mut bytes, mut ns) = (0u64, 0u64);
+        for l in &self.layers {
+            if let Some(m) = &l.moe {
+                bytes +=
+                    m.host_hits.load(Relaxed) * m.host_pick_bytes() as u64 + m.host_union_bytes.load(Relaxed);
+                ns += m.host_ns.load(Relaxed);
+            }
+        }
+        (bytes, ns)
+    }
+
+    /// Matrix bytes the RAM tier presents per byte it commits: around 9 when
+    /// every layer borrows its experts out of the file mapping, 1.0 when none
+    /// does. Printed, not priced - r13 measured that a wider tier costs both
+    /// more commit and more time, so the budget stays in matrix bytes.
+    fn host_held_ratio(&self) -> Option<f64> {
+        let (mut matrix, mut held) = (0f64, 0f64);
+        for l in &self.layers {
+            if let Some(m) = &l.moe {
+                matrix += m.host_bytes() as f64;
+                held += m.host_bytes_held() as f64;
+            }
+        }
+        (matrix > 0.0 && held > 0.0).then(|| matrix / held)
+    }
+
+    /// Bytes moved in a timed window, as decimal GB/s, when and only when the
+    /// window was long enough to be a rate at all.
+    ///
+    /// The floor sits between two populations r15 measured on the served path with
+    /// one binary. A placement whose RAM tier covered nearly every non-resident
+    /// expert left the read timer holding 5.5-9.1 ms of cumulative traffic: five
+    /// ring refills, 8.85 MB, across a 20 s run. The 0.81-1.44 GB/s `save_rates`
+    /// persisted from those arms is the same 8.85 MB over 6.1-10.9 ms. Because
+    /// `Measured::merge` keeps the coldest disk sample it is given, one of those
+    /// first-fault readings would have priced this box's streamed tier for as long
+    /// as the rates file lived. The arms that actually carried the tier read
+    /// 3.38 GiB in 449-599 ms, for 6.1-8.1 GB/s. Twenty milliseconds is above
+    /// every poison window and an order of magnitude below every genuine one,
+    /// which at these rates is about 125 host picks or 84 refills - a seat between
+    /// the populations, not a tuned constant.
+    fn sustained_gbs(bytes: u64, ms: f64) -> Option<f64> {
+        const OBSERVED_MS: f64 = 20.0;
+        (ms >= OBSERVED_MS && bytes > 0).then(|| bytes as f64 / (ms / 1e3) / 1e9)
+    }
+
+    /// Write down what this run measured about the rates the plan prices with, so
+    /// the next start plans with this box's numbers instead of the constants
+    /// `laptop_4060()` guessed at it. A lane that did not run long enough to be
+    /// timed contributes nothing, which is what keeps a turn that streamed nothing
+    /// from blanking the disk rate a run that streamed a tier had earned.
+    ///
+    /// It goes to Fennec's own rates file beside `.fennec_usage`, never to
+    /// anything Colibri reads. Returns what was written and the window this
+    /// sample was taken over, or None when this run measured nothing worth
+    /// persisting.
+    ///
+    /// The window is part of the answer because the number alone was not
+    /// traceable: `save_rates` runs after every serve turn against counters that
+    /// are cumulative for the process, and a merged rate gives no clue which
+    /// bytes it came from. Sampling the difference between two readings - rather
+    /// than the whole life so far - is also what makes the merge mean anything:
+    /// nested cumulative samples are one window repeated, so coldest-wins kept
+    /// turn 1, first page faults and all, and rejected every turn after it.
+    pub fn save_rates(&self, path: &str, borrows: bool) -> Option<(crate::sched::Measured, String)> {
+        let st = self.stream_totals();
+        let (bytes, ns) = self.host_traffic();
+        let now = LaneWindow {
+            read_bytes: st.read_bytes,
+            read_ms: st.read_ms,
+            quant_bytes: st.quant_bytes,
+            quant_ms: st.quant_ms,
+            host_bytes: bytes,
+            host_ns: ns,
+        };
+        let turn = {
+            let mut seen = self.rates_seen.lock().unwrap();
+            let turn = now.since(&seen);
+            *seen = now;
+            turn
+        };
+        let fresh = crate::sched::Measured {
+            disk_gbs: Self::sustained_gbs(turn.read_bytes, turn.read_ms),
+            quant_gbs: Self::sustained_gbs(turn.quant_bytes, turn.quant_ms),
+            host_gbs: Self::sustained_gbs(turn.host_bytes, turn.host_ns as f64 / 1e6),
+            held_ratio: (bytes > 0).then(|| self.host_held_ratio()).flatten(),
+            borrows,
+        };
+        if fresh.is_empty() {
+            return None;
+        }
+        let window = format!(
+            "streamed {} MB in {:.0} ms, host {} MB in {:.0} ms",
+            turn.read_bytes / 1_048_576,
+            turn.read_ms,
+            turn.host_bytes / 1_048_576,
+            turn.host_ns as f64 / 1e6
+        );
+        let mut merged = crate::sched::Measured::load(path).unwrap_or_default();
+        merged.merge(&fresh);
+        match merged.save(path) {
+            Ok(()) => Some((merged, window)),
+            Err(e) => {
+                eprintln!("[fennec] rates: {e}");
+                None
+            }
+        }
+    }
+
+    /// The router picks counted since the last call, as a histogram over the
+    /// whole model: a row for every layer, filled only for the layers it holds.
+    ///
+    /// Take, not read - each counter goes back to zero as it is collected. The
+    /// reason is `serve`, which folds after every turn: a cumulative read would
+    /// write turn one again on turn two, and the ranking would drift toward
+    /// whatever the process happened to run first. A `fetch_swap` is exact, and
+    /// an increment landing between two layers' swaps simply arrives one flush
+    /// later, which is how the numbers are counted anyway.
+    fn take_picks(&self) -> crate::sched::Usage {
+        let (n, e) = (self.cfg.num_hidden_layers, self.cfg.num_experts);
+        let mut counts = vec![vec![0u64; e]; n];
+        for l in &self.layers {
+            if let Some(m) = &l.moe {
+                // `m.layer` is the index in the checkpoint, not in this process,
+                // which is what lets a `--layers` run write its rows where the
+                // full model expects them instead of at the top of the file.
+                if m.layer < n && m.picks.len() == e {
+                    for (c, got) in counts[m.layer].iter_mut().zip(&m.picks) {
+                        *c += got.swap(0, Relaxed) as u64;
+                    }
+                }
+            }
+        }
+        crate::sched::Usage { layers: n, experts: e, counts }
+    }
+
+    /// Fold the picks counted since the last call into the histogram the next
+    /// plan is ranked by, so a model's placement improves with use instead of
+    /// staying blind forever. Returns how many were written, or None when there
+    /// was nothing to say or the file could not be touched.
+    ///
+    /// It goes to Fennec's own file and never to `.coli_usage`: Colibri reads
+    /// that one at start to decide what to AUTOPIN, so what Fennec counts must
+    /// not be able to quietly change what Colibri does. Merging onto the file on
+    /// disk rather than overwriting it is what keeps a three-layer debug run from
+    /// writing zeros over forty layers of history.
+    pub fn save_picks(&self, path: &str) -> Option<u64> {
+        let mine = self.take_picks();
+        let added = mine.total();
+        if added == 0 {
+            return None;
+        }
+        let mut merged = match crate::sched::Usage::load(path) {
+            Ok(u) if u.layers == mine.layers && u.experts == mine.experts => u,
+            Ok(u) => {
+                eprintln!(
+                    "[fennec] usage: {path} is {}x{}, not this model's {}x{} — left alone",
+                    u.layers, u.experts, mine.layers, mine.experts
+                );
+                return None;
+            }
+            Err(_) => crate::sched::Usage {
+                layers: mine.layers,
+                experts: mine.experts,
+                counts: vec![vec![0u64; mine.experts]; mine.layers],
+            },
+        };
+        for (row, ours) in merged.counts.iter_mut().zip(&mine.counts) {
+            for (c, &add) in row.iter_mut().zip(ours) {
+                *c += add;
+            }
+        }
+        match merged.save(path) {
+            Ok(()) => Some(added),
+            Err(e) => {
+                eprintln!("[fennec] usage: {e}");
+                None
+            }
+        }
     }
 
     pub fn states(&self, kv_cap: usize) -> Vec<LayerState> {
@@ -3773,5 +4450,71 @@ mod tests {
         assert_eq!(packed_group(&sh, PREFIX, 8, 2), None);
         assert!(!sh.contains(&format!("{p}.0.merged_weight")));
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// r15's two populations, as the golden inputs the gate actually saw.
+    #[test]
+    fn a_lane_touched_only_in_passing_reports_no_rate() {
+        // The poison: five ring refills, 8.85 MB, timed over a whole serve run at
+        // 0.81-0.97 GB/s - 9.1, 9.3 and 10.9 ms for these bytes. Coldest-wins then
+        // keeps whichever was worst and prices every later start on this box.
+        let five_refills = 8_847_360u64;
+        assert_eq!(Model::sustained_gbs(five_refills, 10.94), None);
+        assert_eq!(Model::sustained_gbs(five_refills, 0.0), None);
+        assert_eq!(Model::sustained_gbs(0, 10_000.0), None);
+        // The genuine tier: 3.38 GiB in 448.6 ms, the narrow arms' lifetime disk
+        // traffic. Kept however poor the number is, because a lane that stayed busy
+        // for half a second has a bandwidth.
+        let carried = Model::sustained_gbs(3_634_495_488, 448.6367).unwrap();
+        assert!((carried - 8.10).abs() < 0.01, "{carried}");
+        // The floor is inclusive, and it gates windows, never numbers: the 2.910
+        // GB/s this box's rates file carried through r14 and r15, held against
+        // warmer samples, is still earnable from a window this wide.
+        let cold = Model::sustained_gbs(58_205_582, 20.0).unwrap();
+        assert!((cold - 2.910).abs() < 0.001, "{cold}");
+    }
+
+    /// Serve takes a rates sample after every turn off counters that are
+    /// cumulative for the process, so a sample has to be the difference between
+    /// two readings. When it was not, r16's arms saved 4.0 GB/s on turn 1 and 3.7
+    /// on every turn after: each nested reading still contained turn 1, whose
+    /// window is first-touch page faults, and coldest-wins chose it every time.
+    /// The windows below are arithmetic, not a transcript.
+    #[test]
+    fn each_serve_turn_is_priced_on_its_own_traffic() {
+        let after_turn1 = LaneWindow {
+            read_bytes: 400_000_000,
+            read_ms: 107.0,
+            host_bytes: 400_000_000,
+            host_ns: 40_000_000,
+            ..Default::default()
+        };
+        let after_turn2 = LaneWindow {
+            read_bytes: 900_000_000,
+            read_ms: 232.0,
+            host_bytes: 800_000_000,
+            host_ns: 65_000_000,
+            ..Default::default()
+        };
+        let turn2 = after_turn2.since(&after_turn1);
+        assert_eq!(turn2.read_bytes, 500_000_000);
+        assert_eq!(turn2.host_bytes, 400_000_000);
+        assert!((turn2.read_ms - 125.0).abs() < 1e-9);
+        // Turn 2's own 500 MB in 125 ms is 4.0 GB/s. Read cumulatively - the shape
+        // r16 merged - the same two turns are 900 MB in 232 ms, 3.88, because turn
+        // 1's faults ride along, and that colder number is the one that wins.
+        assert!(
+            (Model::sustained_gbs(turn2.read_bytes, turn2.read_ms).unwrap() - 4.0).abs() < 1e-9
+        );
+        assert!(
+            (Model::sustained_gbs(after_turn2.read_bytes, after_turn2.read_ms).unwrap() - 3.879)
+                .abs()
+                < 0.001
+        );
+        // A turn that touched neither lane adds no sample, rather than a repeat of
+        // the lifetime total it already contributed.
+        let idle = after_turn2.since(&after_turn2);
+        assert_eq!(Model::sustained_gbs(idle.read_bytes, idle.read_ms), None);
+        assert_eq!(Model::sustained_gbs(idle.host_bytes, idle.host_ns as f64 / 1e6), None);
     }
 }

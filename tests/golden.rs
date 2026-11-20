@@ -568,19 +568,29 @@ fn a_streamed_expert_is_the_same_expert() {
     let st = cold.stream.as_ref().unwrap().lock().unwrap();
     println!(
         "  pool: {} tokens x {} experts through a ring of {} slots: {} misses, \
-         {:.2} GiB held, {:.0} ms read {:.0} ms quantise in {:.1} s",
+         {}/{} refills borrowed, {:.3} MiB held of at most {:.3}, \
+         {:.0} ms read {:.0} ms quantise in {:.1} s",
         n,
         c.num_experts_per_tok,
         st.slots(),
         st.misses,
-        st.bytes() as f64 / 2f64.powi(30),
+        st.borrowed,
+        st.warmed + st.misses,
+        st.bytes() as f64 / 2f64.powi(20),
+        st.slots() as f64 * st.pack_bytes() as f64 / 2f64.powi(20),
         st.read_ms,
         st.quant_ms,
         t0.elapsed().as_secs_f64(),
     );
     assert!(st.misses > 0, "the cold layer never streamed anything");
     assert!(st.slots() <= 3, "the ring outgrew its cap");
-    assert_eq!(st.bytes(), st.slots() * st.slot_bytes(), "slots differ in size");
+    assert!(
+        st.bytes() <= st.slots() * st.pack_bytes(),
+        "{} slots reporting {} bytes, more than {} each",
+        st.slots(),
+        st.bytes(),
+        st.pack_bytes()
+    );
 
     // Cost: the ring is the knob, and every slot it keeps is a disk read and a
     // quantise pass it does not pay again. LRU can only get better with room.
@@ -616,6 +626,108 @@ fn a_streamed_expert_is_the_same_expert() {
         );
     }
     assert!(prev > 0, "no ring size ever reused an expert");
+}
+
+/// `warm` issues the ring's reads several deep instead of one at a time, so it
+/// has to land expert `want[n]` in destination `n`. A misaligned index would
+/// swap two experts, fill the ring and move every counter exactly as much as
+/// the correct code does - only the numbers would say otherwise. So this names
+/// everything the router is going to ask for, warms it in one batch, and
+/// requires that every later pick is a hit on a ring that still reproduces the
+/// all-resident layer's output byte for byte.
+#[test]
+fn warming_the_ring_is_the_same_as_streaming_it_one_at_a_time() {
+    let Some((sh, c)) = checkpoint() else { return };
+    let h = c.hidden_size;
+    let g = group_of(&sh, &c);
+    let hot = MoeLayer::load(&sh, c.clone(), 0, g, 8).expect("resident layer 0");
+    let e = fx("fwd.embed");
+    let n = e.data.len() / h;
+    let toks: Vec<Vec<f32>> = (0..n).map(|t| row32(&e.data, t, h)).collect();
+    let want: Vec<(Vec<f32>, Vec<usize>)> =
+        toks.iter().map(|v| hot.forward(v)).map(|(a, r)| (a, r.ids)).collect();
+
+    // Every expert this layer will be asked for, in first-use order.
+    let mut picks: Vec<usize> = Vec::new();
+    for (_, ids) in &want {
+        for &id in ids {
+            if !picks.contains(&id) {
+                picks.push(id);
+            }
+        }
+    }
+    let mk = || {
+        MoeLayer::load_set(
+            &sh,
+            c.clone(),
+            0,
+            &[],
+            Some(Stream::new(sh.clone(), &c, 0, g, 8, picks.len())),
+            g,
+            8,
+        )
+        .expect("pooled layer 0")
+    };
+
+    let deep = mk();
+    deep.stream.as_ref().unwrap().lock().unwrap().warm(&picks);
+    let serial = mk();
+
+    for t in 0..n {
+        let (b, rb) = deep.forward(&toks[t]);
+        assert_eq!(rb.ids, want[t].1, "token {t}: warming the ring changed the router");
+        assert_eq!(b, want[t].0, "token {t}: a warmed expert is not the same expert");
+        let (s, _) = serial.forward(&toks[t]);
+        assert_eq!(s, want[t].0, "token {t}: batched and serial rings disagree");
+    }
+
+    let st = deep.stream.as_ref().unwrap().lock().unwrap();
+    // Every pick this layer asked the pool for went through `with`, so that
+    // count - not `tokens x experts_per_tok` - is how many of them the batch has
+    // to have satisfied from RAM.
+    let asked = deep.disk_hits.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        st.warmed as usize,
+        picks.len(),
+        "{} reads for {} distinct ids: an expert landed twice, or the batch missed one",
+        st.warmed,
+        picks.len()
+    );
+    assert_eq!(st.misses, 0, "a pick the batch was told about still went to disk serially");
+    assert_eq!(st.hits, asked, "a pick the batch was told about still went to disk");
+    assert_eq!(st.slots(), picks.len(), "the ring did not hold what it was given");
+    assert!(
+        st.bytes() <= st.slots() * st.pack_bytes(),
+        "{} slots reporting {} bytes, more than {} each",
+        st.slots(),
+        st.bytes(),
+        st.pack_bytes()
+    );
+    // The memory this change is meant to stop paying: a borrowed slot keeps its
+    // scales and leaves the nibbles in the page cache, so a ring that borrowed
+    // every expert holds a fraction of the copies it replaced.
+    if st.borrowed > 0 {
+        assert!(
+            st.bytes() * 4 < st.slots() * st.pack_bytes(),
+            "{} of {} slots borrowed but the ring still holds {:.2} of {:.2} GiB",
+            st.borrowed,
+            st.slots(),
+            st.bytes() as f64 / 2f64.powi(30),
+            st.slots() as f64 * st.pack_bytes() as f64 / 2f64.powi(30),
+        );
+    }
+    println!(
+        "  warm: {} experts read in one batch of {:.1} GiB in {:.0} ms ({:.2} GB/s), \
+         {}/{} borrowed, then {}/{} picks served from RAM",
+        picks.len(),
+        st.read_bytes as f64 / 2f64.powi(30),
+        st.read_ms,
+        st.read_bytes as f64 / (st.read_ms / 1e3) / 1e9,
+        st.borrowed,
+        st.warmed,
+        st.hits,
+        asked,
+    );
 }
 
 /// Eight real token ids through embedding, the decoder stack, the final norm

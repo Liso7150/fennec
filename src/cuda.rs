@@ -234,7 +234,9 @@ impl Cuda {
                 (self.api.device_get_attribute)(&mut major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev);
                 (self.api.device_get_attribute)(&mut minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev);
             }
-            // Query free memory on this device's context
+            // No context exists yet at enumeration time, so `query_free_mem`
+            // reports 0 here and `free_gib` is a runtime figure: `CudaGpu::
+            // refresh_free_vram` fills it once `open` has bound a context.
             let free_bytes = self.query_free_mem()?;
             out.push(CudaDevice {
                 index: i as usize,

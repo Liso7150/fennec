@@ -1,16 +1,32 @@
 //! Background prefetcher for cold experts on SSD.
 //!
-//! While layer N computes, the prefetcher loads layer N+1's streamed experts
-//! from disk into an LRU cache. This overlaps disk I/O with compute, reducing
-//! the effective latency of the disk tier.
+//! While layer N computes, a worker reads layer N+1's hottest streamed experts
+//! from disk into an LRU cache, so a router pick that has no tier to live in is
+//! often already in RAM by the time it is asked for.
+//!
+//! The hint has to be *predictive*. Re-asking for the experts this layer just
+//! missed is a guaranteed miss: the read cannot land before the same layer's
+//! disk path runs, so the caller blocks on the pool and does the identical read
+//! a second time. `sched::LayerPlan::streamed` arrives ranked hottest-first (it
+//! is the tail of `rank_order`), so its prefix is the prediction and no separate
+//! predictor is needed.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, Condvar};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use crate::config::TextConfig;
 use crate::quant::Q4;
 use crate::safetensors::Shards;
+
+/// How long a caller waits for a read the worker already owns before doing it
+/// itself. Generous on purpose: the alternative is a duplicate read of the same
+/// bytes, which costs the disk and delays the token that was waiting for it. A
+/// streamed expert is at worst a bf16 shard read plus a quantise pass, which
+/// measures single-digit milliseconds here.
+pub(crate) const AHEAD_WAIT: Duration = Duration::from_millis(250);
 
 /// Cache key: (layer, expert_id) uniquely identifies one expert's weights.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -35,16 +51,16 @@ impl CachedExpert {
 }
 
 /// A request to prefetch an expert from disk.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct PrefetchRequest {
-    pub expert_id: usize,
     pub layer: usize,
-    pub priority: u32,
+    pub expert_id: usize,
 }
 
-/// LRU cache for prefetched experts.
+/// LRU cache for prefetched experts. Values are held behind `Arc` so a hit costs
+/// a reference count rather than a copy of a megabyte and a half of weights.
 pub struct LruCache {
-    data: HashMap<CacheKey, CachedExpert>,
+    data: HashMap<CacheKey, Arc<CachedExpert>>,
     order: Vec<CacheKey>,
     max_bytes: usize,
     current_bytes: usize,
@@ -60,7 +76,12 @@ impl LruCache {
         }
     }
 
-    pub fn insert(&mut self, key: CacheKey, expert: CachedExpert) {
+    /// Whether this key is in the cache, without touching recency.
+    pub fn holds(&self, key: &CacheKey) -> bool {
+        self.data.contains_key(key)
+    }
+
+    pub fn insert(&mut self, key: CacheKey, expert: Arc<CachedExpert>) {
         let size = expert.byte_size();
 
         while self.current_bytes + size > self.max_bytes && !self.order.is_empty() {
@@ -76,18 +97,15 @@ impl LruCache {
         }
 
         self.order.insert(0, key);
-        self.data.insert(key, expert);
         self.current_bytes += size;
+        self.data.insert(key, expert);
     }
 
-    pub fn get(&mut self, key: &CacheKey) -> Option<&CachedExpert> {
-        if self.data.contains_key(key) {
-            self.order.retain(|k| k != key);
-            self.order.insert(0, *key);
-            self.data.get(key)
-        } else {
-            None
-        }
+    pub fn get(&mut self, key: &CacheKey) -> Option<Arc<CachedExpert>> {
+        let expert = self.data.get(key).cloned()?;
+        self.order.retain(|k| k != key);
+        self.order.insert(0, *key);
+        Some(expert)
     }
 
     pub fn contains(&self, key: &CacheKey) -> bool {
@@ -103,6 +121,233 @@ impl LruCache {
     }
 }
 
+/// The work list plus the set of keys a caller may be waiting on. One condvar
+/// guards both: a dropped request has to wake anyone waiting for it, and a
+/// completed one has to do the same, so they cannot live under separate locks.
+#[derive(Default)]
+struct Queue {
+    reqs: VecDeque<PrefetchRequest>,
+    pending: HashSet<CacheKey>,
+    /// The request the worker is inside right now. A caller that needs a *queued*
+    /// expert has to be able to tell "loading" from "seventh in line", or it pays
+    /// the whole queue as latency.
+    in_flight: Option<CacheKey>,
+    stop: bool,
+}
+
+struct Inner {
+    queue: Mutex<Queue>,
+    ready: Condvar,
+    cache: Mutex<LruCache>,
+    shards: Arc<Shards>,
+    config: Arc<TextConfig>,
+    group: usize,
+    threads: usize,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    loaded: AtomicU64,
+}
+
+/// Background prefetcher that loads experts from disk into cache.
+pub struct Prefetcher {
+    inner: Arc<Inner>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Prefetcher {
+    /// Start a new prefetcher with the given cache budget (bytes).
+    pub fn start(
+        cache_bytes: usize,
+        shards: Arc<Shards>,
+        config: Arc<TextConfig>,
+        group: usize,
+        threads: usize,
+    ) -> Self {
+        let inner = Arc::new(Inner {
+            queue: Mutex::new(Queue::default()),
+            ready: Condvar::new(),
+            cache: Mutex::new(LruCache::new(cache_bytes)),
+            shards,
+            config,
+            group,
+            threads,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            loaded: AtomicU64::new(0),
+        });
+        let handle = {
+            let inner = inner.clone();
+            thread::spawn(move || Self::run(inner))
+        };
+        Self {
+            inner,
+            handle: Some(handle),
+        }
+    }
+
+    fn run(inner: Arc<Inner>) {
+        loop {
+            let req = {
+                let mut q = inner.queue.lock().unwrap();
+                loop {
+                    if q.stop {
+                        return;
+                    }
+                    match q.reqs.pop_front() {
+                        Some(r) => break r,
+                        None => q = inner.ready.wait(q).unwrap(),
+                    }
+                }
+            };
+            let key = CacheKey {
+                layer: req.layer,
+                expert_id: req.expert_id,
+            };
+            // Announce the read before starting it, so a caller that needs this
+            // expert while it is loading waits for it instead of duplicating it.
+            inner.queue.lock().unwrap().in_flight = Some(key);
+            let held = inner.cache.lock().unwrap().contains(&key);
+            if !held {
+                match load_single_expert(
+                    &inner.shards,
+                    &inner.config,
+                    req.layer,
+                    req.expert_id,
+                    inner.group,
+                    inner.threads,
+                ) {
+                    Ok(expert) => {
+                        inner.cache.lock().unwrap().insert(key, Arc::new(expert));
+                        inner.loaded.fetch_add(1, Relaxed);
+                    }
+                    Err(e) => {
+                        eprintln!("[prefetch] layer {} expert {}: {e}", req.layer, req.expert_id);
+                    }
+                }
+            }
+            let mut q = inner.queue.lock().unwrap();
+            q.in_flight = None;
+            q.pending.remove(&key);
+            drop(q);
+            inner.ready.notify_all();
+        }
+    }
+
+    /// Queue `ids` for `layer`, replacing whatever was held for an earlier layer.
+    /// A request for a layer the token has already passed is not late, it is
+    /// wrong: it is the one thing that lets the worker fall permanently behind,
+    /// so the list is never more than one layer deep.
+    pub fn prefetch_ahead(&self, layer: usize, ids: &[usize]) {
+        if ids.is_empty() {
+            return;
+        }
+        let mut q = self.inner.queue.lock().unwrap();
+        let stale: Vec<PrefetchRequest> = q.reqs.drain(..).collect();
+        for s in stale {
+            q.pending.remove(&CacheKey {
+                layer: s.layer,
+                expert_id: s.expert_id,
+            });
+        }
+        for &expert_id in ids {
+            let key = CacheKey { layer, expert_id };
+            if q.pending.insert(key) {
+                q.reqs.push_back(PrefetchRequest { layer, expert_id });
+            }
+        }
+        drop(q);
+        self.inner.ready.notify_all();
+    }
+
+    /// An expert the worker has already delivered, counting the hit either way so
+    /// the overlap the tier split exists for is readable from the log rather than
+    /// assumed from the design.
+    pub fn get_cached(&self, layer: usize, expert_id: usize) -> Option<Arc<CachedExpert>> {
+        let found = {
+            let mut c = self.inner.cache.lock().unwrap();
+            c.get(&CacheKey { layer, expert_id })
+        };
+        match &found {
+            Some(_) => self.inner.hits.fetch_add(1, Relaxed),
+            None => self.inner.misses.fetch_add(1, Relaxed),
+        };
+        found
+    }
+
+    /// Whether this expert is already delivered or already being fetched, without
+    /// touching the counters or the recency order. The pool asks before spending
+    /// a second read on bytes this tier is already moving for it.
+    pub fn covers(&self, layer: usize, expert_id: usize) -> bool {
+        let key = CacheKey { layer, expert_id };
+        self.inner.cache.lock().unwrap().holds(&key)
+            || self.inner.queue.lock().unwrap().pending.contains(&key)
+    }
+
+    /// Wait out a read the worker already owns for this expert, so the caller
+    /// never pays for the same disk traffic twice. A read that is queued but not
+    /// started is pulled to the front first: making the token wait behind experts
+    /// it does not need yet is the one way a prefetch thread can add latency
+    /// instead of hiding it. `None` with nothing pending returns immediately;
+    /// that is the ordinary path, not a timeout.
+    pub fn wait_cached(
+        &self,
+        layer: usize,
+        expert_id: usize,
+        wait: Duration,
+    ) -> Option<Arc<CachedExpert>> {
+        let key = CacheKey { layer, expert_id };
+        {
+            let mut q = self.inner.queue.lock().unwrap();
+            if !q.pending.contains(&key) {
+                return None;
+            }
+            if q.in_flight != Some(key) {
+                if let Some(at) = q.reqs.iter().position(|r| CacheKey { layer: r.layer, expert_id: r.expert_id } == key)
+                {
+                    if let Some(req) = q.reqs.remove(at) {
+                        q.reqs.push_front(req);
+                        self.inner.ready.notify_one();
+                    }
+                }
+            }
+            let (q, _) = self
+                .inner
+                .ready
+                .wait_timeout_while(q, wait, |q| q.pending.contains(&key))
+                .ok()?;
+            drop(q);
+        }
+        let mut c = self.inner.cache.lock().unwrap();
+        c.get(&key)
+    }
+
+    /// (cache hits, cache misses, experts loaded, MiB held).
+    pub fn stats(&self) -> (u64, u64, u64, usize) {
+        let held = self.inner.cache.lock().unwrap().byte_size();
+        (
+            self.inner.hits.load(Relaxed),
+            self.inner.misses.load(Relaxed),
+            self.inner.loaded.load(Relaxed),
+            held / (1024 * 1024),
+        )
+    }
+}
+
+impl Drop for Prefetcher {
+    fn drop(&mut self) {
+        {
+            let mut q = self.inner.queue.lock().unwrap();
+            q.stop = true;
+            q.reqs.clear();
+            q.pending.clear();
+        }
+        self.inner.ready.notify_all();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// Load a single expert's gate_up and down projections from the shards.
 /// Mirrors the loading logic in `gather_experts` but for one expert at a time.
 fn load_single_expert(
@@ -115,8 +360,6 @@ fn load_single_expert(
 ) -> crate::config::Result<CachedExpert> {
     let (h, i) = (cfg.hidden_size, cfg.moe_intermediate_size);
     let p = format!("{}.layers.{layer}.mlp.experts", cfg.prefix);
-    let gu_name = format!("{p}.gate_up_proj");
-    let dn_name = format!("{p}.down_proj");
 
     // Fast path: FQ4 sidecar cache (memcpy, no quantisation)
     if let Some(sc) = sh.fq4() {
@@ -138,163 +381,19 @@ fn load_single_expert(
         return Ok(CachedExpert { gate_up: gu, down: dn });
     }
 
-    // Slow path: read bf16 slices and quantise
-    let gu_slice = sh.slice_f32(&gu_name, expert_id * 2 * i * h, (expert_id + 1) * 2 * i * h)?;
+    // Slow path: read bf16 slices and quantise (handles fused, separate, and Edge0 formats)
+    let (gu_slice, dn_slice) = crate::model::load_expert_pair(sh, &cfg.prefix, layer, expert_id, h, i)?;
     let gate_up = Q4::quantize(&gu_slice, 2 * i, h, group, threads);
-    let dn_slice = sh.slice_f32(&dn_name, expert_id * h * i, (expert_id + 1) * h * i)?;
     let down = Q4::quantize(&dn_slice, h, i, group, threads);
     Ok(CachedExpert { gate_up, down })
-}
-
-/// Background prefetcher that loads experts from disk into cache.
-#[allow(dead_code)]
-pub struct Prefetcher {
-    queue: Arc<(Mutex<Vec<PrefetchRequest>>, Condvar)>,
-    cache: Arc<Mutex<LruCache>>,
-    shards: Arc<Shards>,
-    config: Arc<TextConfig>,
-    group: usize,
-    threads: usize,
-    _handle: Option<thread::JoinHandle<()>>,
-}
-
-impl Prefetcher {
-    /// Start a new prefetcher with the given cache budget (bytes).
-    pub fn start(
-        cache_bytes: usize,
-        shards: Arc<Shards>,
-        config: Arc<TextConfig>,
-        group: usize,
-        threads: usize,
-    ) -> Self {
-        let queue = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
-        let cache = Arc::new(Mutex::new(LruCache::new(cache_bytes)));
-
-        let queue_clone = queue.clone();
-        let cache_clone = cache.clone();
-        let shards_clone = shards.clone();
-        let config_clone = config.clone();
-
-        let handle = thread::spawn(move || {
-            Self::prefetch_loop(queue_clone, cache_clone, shards_clone, config_clone, group, threads);
-        });
-
-        Self {
-            queue,
-            cache,
-            shards,
-            config,
-            group,
-            threads,
-            _handle: Some(handle),
-        }
-    }
-
-    fn prefetch_loop(
-        queue: Arc<(Mutex<Vec<PrefetchRequest>>, Condvar)>,
-        cache: Arc<Mutex<LruCache>>,
-        shards: Arc<Shards>,
-        config: Arc<TextConfig>,
-        group: usize,
-        threads: usize,
-    ) {
-        loop {
-            let (lock, cvar) = &*queue;
-            let mut queue_guard = lock.lock().unwrap();
-
-            while queue_guard.is_empty() {
-                queue_guard = cvar.wait(queue_guard).unwrap();
-            }
-
-            queue_guard.sort_by(|a, b| b.priority.cmp(&a.priority));
-            let req = queue_guard.remove(0);
-            drop(queue_guard);
-
-            let key = CacheKey {
-                layer: req.layer,
-                expert_id: req.expert_id,
-            };
-
-            {
-                let c = cache.lock().unwrap();
-                if c.contains(&key) {
-                    continue;
-                }
-            }
-
-            match load_single_expert(&shards, &config, req.layer, req.expert_id, group, threads) {
-                Ok(expert) => {
-                    let mut c = cache.lock().unwrap();
-                    c.insert(key, expert);
-                }
-                Err(e) => {
-                    eprintln!("[prefetch] failed to load expert {}/{}: {}", req.layer, req.expert_id, e);
-                }
-            }
-        }
-    }
-
-    /// Queue a prefetch request for the next layer's streamed experts.
-    pub fn prefetch_next_layer(&self, layer: usize, streamed_experts: &[usize]) {
-        let (lock, cvar) = &*self.queue;
-        let mut queue = lock.lock().unwrap();
-
-        for &expert_id in streamed_experts {
-            queue.push(PrefetchRequest {
-                expert_id,
-                layer,
-                priority: 100 - layer as u32,
-            });
-        }
-
-        cvar.notify_one();
-    }
-
-    /// Check if an expert is in the cache.
-    pub fn is_cached(&self, layer: usize, expert_id: usize) -> bool {
-        let key = CacheKey { layer, expert_id };
-        let c = self.cache.lock().unwrap();
-        c.contains(&key)
-    }
-
-    /// Get a cached expert (returns None if not present).
-    pub fn get_cached(&self, layer: usize, expert_id: usize) -> Option<CachedExpert> {
-        let key = CacheKey { layer, expert_id };
-        let mut c = self.cache.lock().unwrap();
-        c.get(&key).cloned()
-    }
-
-    /// Get cache statistics: (entry_count, byte_size).
-    pub fn cache_stats(&self) -> (usize, usize) {
-        let c = self.cache.lock().unwrap();
-        (c.entry_count(), c.byte_size())
-    }
-}
-
-impl Drop for Prefetcher {
-    fn drop(&mut self) {
-        let (lock, cvar) = &*self.queue;
-        let mut queue = lock.lock().unwrap();
-        queue.clear();
-        cvar.notify_one();
-        drop(queue);
-
-        if let Some(handle) = self._handle.take() {
-            let _ = handle.join();
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_lru_cache() {
-        // mk_expert(n) costs 10*n bytes (data + scale for gate_up and down)
-        let mut cache = LruCache::new(51_000);
-
-        let mk_expert = |size: usize| CachedExpert {
+    fn mk_expert(size: usize) -> Arc<CachedExpert> {
+        Arc::new(CachedExpert {
             gate_up: Q4 {
                 rows: size,
                 cols: 64,
@@ -311,7 +410,13 @@ mod tests {
                 scale: vec![1.0; size],
                 signed: false,
             },
-        };
+        })
+    }
+
+    #[test]
+    fn test_lru_cache() {
+        // mk_expert(n) costs 10*n bytes (data + scale for gate_up and down)
+        let mut cache = LruCache::new(51_000);
 
         let key1 = CacheKey { layer: 0, expert_id: 1 };
         let key2 = CacheKey { layer: 0, expert_id: 2 };
@@ -325,7 +430,7 @@ mod tests {
         assert!(cache.contains(&key2));
 
         // Access key1 to make it most recently used
-        cache.get(&key1);
+        assert!(cache.get(&key1).is_some());
 
         // 49500 bytes: total would be 51500 > 51000, so key2 (LRU) is evicted
         cache.insert(key3, mk_expert(4950));
@@ -339,5 +444,17 @@ mod tests {
         let k1 = CacheKey { layer: 0, expert_id: 5 };
         let k2 = CacheKey { layer: 1, expert_id: 5 };
         assert_ne!(k1, k2);
+    }
+
+    /// A hit hands back the same allocation, not a copy of the weights.
+    #[test]
+    fn test_cache_hit_shares_the_expert() {
+        let mut cache = LruCache::new(1 << 20);
+        let key = CacheKey { layer: 3, expert_id: 7 };
+        cache.insert(key, mk_expert(64));
+        let a = cache.get(&key).unwrap();
+        let b = cache.get(&key).unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(a.byte_size(), 64 * 10);
     }
 }

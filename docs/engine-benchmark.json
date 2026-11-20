@@ -776,7 +776,7 @@
     },
     "fox": {
       "verdict": "not buildable here - CUDA is gated on a toolkit that is absent",
-      "evidence": "build.rs:316 enables GGML_CUDA only if CUDACXX or `which nvcc` resolves; vendor/llama.cpp/ggml/src/ggml-cuda/CMakeLists.txt:3 find_package(CUDAToolkit), :59 enable_language(CUDA), :37 89-real for Ada. Probes: `where nvcc` absent, `where cl` absent, 'C:/Program Files/NVIDIA GPU Computing Toolkit' absent, both Visual Studio directories absent. cmake is present (WinLibs MinGW) but MinGW gcc is not a valid nvcc host compiler. No ggml-cuda.dll exists anywhere in the suite; the prebuilt set in target/release/build/ferrumox-*/out/bin is ggml-vulkan.dll, ggml-cpu.dll, ggml-base.dll, ggml.dll, libllama.dll, libllama-common.dll, libmtmd.dll. C:/Windows/System32/nvcuda.dll is present, so the driver is there - only the compiler is missing.",
+      "evidence": "build.rs:316 enables GGML_CUDA only if CUDACXX or `which nvcc` resolves; vendor/llama.cpp/ggml/src/ggml-cuda/CMakeLists.txt:3 find_package(CUDAToolkit), :59 enable_language(CUDA), :37 89-real for Ada. Probes: `where nvcc` absent, `where cl` absent, the default CUDA toolkit install directory absent, both Visual Studio directories absent. cmake is present (WinLibs MinGW) but MinGW gcc is not a valid nvcc host compiler. No ggml-cuda.dll exists anywhere in the suite; the prebuilt set in target/release/build/ferrumox-*/out/bin is ggml-vulkan.dll, ggml-cpu.dll, ggml-base.dll, ggml.dll, libllama.dll, libllama-common.dll, libmtmd.dll. C:/Windows/System32/nvcuda.dll is present, so the driver is there - only the compiler is missing.",
       "no_igpu_mismeasurement": "fox's published 12.00 tok/s was already on the discrete card: bench_fox_vulkan2.log:61 reads 'using device Vulkan1 (NVIDIA GeForce RTX 4060 Laptop GPU) - 7188 MiB free'. Device 0 is the Intel Arc iGPU (uma:1), device 1 the RTX 4060 (uma:0, NV_coopmat2v). The number is honest."
     },
     "colibri": {
@@ -2066,7 +2066,7 @@
       "inputs": "engine-bench/rust-lanes/make_inputs.py -> inputs.json",
       "log": "engine-bench/rust-lanes/lanes-npu-rust.log"
     },
-    "not_yet_wired_into_fennec": "This is a standalone lane crate, deliberately outside D:/Fennec so the engine's offline build does not acquire the dependency. Wiring it behind an optional feature is a separate decision; nothing in the engine changed."
+    "not_yet_wired_into_fennec": "This is a standalone lane crate, deliberately outside the engine repo so the engine's offline build does not acquire the dependency. Wiring it behind an optional feature is a separate decision; nothing in the engine changed."
   },
   "burn_cubecl_lane": {
     "request": "unblock what is possible: vendor Burn + CubeCL and measure the MoE kernels in Rust",
