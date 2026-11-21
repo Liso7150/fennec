@@ -18,10 +18,10 @@
 //! [`BREAKDOWN`].
 //!
 //! A request is two kinds of forward pass: the prompt, which [`split`] moves
-//! into its own counters, and one token at a time afterwards, which
-//! [`decode_steps`] counts. Dividing the prompt's chunked work by completion
-//! tokens makes a table that is about neither, so the decode stages are
-//! reported per decode step and the prompt gets its own line.
+//! into its own counters and out of the step count, and one token at a time
+//! afterwards, which [`decode_steps`] counts. Dividing the prompt's chunked work
+//! by completion tokens makes a table that is about neither, so the decode
+//! stages are reported per decode step and the prompt gets its own line.
 //!
 //! **Overlap measurement**: [`OverlapTimer`] measures how much CPU work runs
 //! concurrently with GPU dispatches. Start it before submitting a batch, stop
@@ -152,8 +152,12 @@ static NS: [AtomicU64; STAGE_COUNT] = [const { AtomicU64::new(0) }; STAGE_COUNT]
 static PROMPT_NS: [AtomicU64; STAGE_COUNT] = [const { AtomicU64::new(0) }; STAGE_COUNT];
 static PROMPT_TOKENS: AtomicU64 = AtomicU64::new(0);
 static STEPS: AtomicU64 = AtomicU64::new(0);
+/// The step count when [`split`] closed the prompt. `Model::forward` ticks
+/// itself and `serve` prefills one token at a time, so without this the prompt's
+/// passes join the decode count and every row shrinks by (P+D)/D.
+static PROMPT_STEPS: AtomicU64 = AtomicU64::new(0);
 /// When the decode phase began, so the wall clock in the report is the one the
-/// step count belongs to. `None` until a split, which only a batched prefill does.
+/// step count belongs to. `None` until a split.
 static DECODE_T0: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
 
 // Overlap measurement: how much CPU work ran concurrently with GPU dispatches.
@@ -179,6 +183,7 @@ pub fn reset() {
     }
     PROMPT_TOKENS.store(0, Relaxed);
     STEPS.store(0, Relaxed);
+    PROMPT_STEPS.store(0, Relaxed);
     OVERLAP_NS.store(0, Relaxed);
     GPU_BUSY_NS.store(0, Relaxed);
     OVERLAP_SAMPLES.store(0, Relaxed);
@@ -209,6 +214,8 @@ pub fn split(tokens: usize) {
         }
     }
     PROMPT_TOKENS.fetch_add(tokens as u64, Relaxed);
+    // `decode_wall_ms` starts here, so the denominator has to start here too.
+    PROMPT_STEPS.store(STEPS.load(Relaxed), Relaxed);
     *DECODE_T0.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
 }
 
@@ -221,8 +228,9 @@ pub fn decode_wall_ms() -> Option<f64> {
 }
 
 /// One more single-token forward, called by `Model::forward`. The decode table
-/// divides by this rather than by the tokens emitted: the last forward answers
-/// with EOS and produces nothing, and a prefill chunk never calls it.
+/// divides by [`decode_steps`] rather than by the tokens emitted: the last
+/// forward answers with EOS and produces nothing. A prefill run one token at a
+/// time lands here too, which is why [`split`] has to bound the count.
 pub fn tick_decode_step() {
     if enabled() {
         STEPS.fetch_add(1, Relaxed);
@@ -230,7 +238,9 @@ pub fn tick_decode_step() {
 }
 
 pub fn decode_steps() -> usize {
-    STEPS.load(Relaxed) as usize
+    STEPS
+        .load(Relaxed)
+        .saturating_sub(PROMPT_STEPS.load(Relaxed)) as usize
 }
 
 /// Prompt-phase milliseconds per stage, and how many tokens they cover.
@@ -478,7 +488,9 @@ mod tests {
         tick_decode_step();
         split(7);
         assert_eq!(millis()[ROUTE], 0.0, "the decode set restarts at the split");
-        assert_eq!(decode_steps(), 1, "a split must not invent or drop a step");
+        assert_eq!(decode_steps(), 0, "the prompt's own forward is not a decode step");
+        tick_decode_step();
+        assert_eq!(decode_steps(), 1, "a split must not drop a decode step");
         let (prompt, tokens) = prompt_millis();
         assert!(prompt[ROUTE] > 0.0, "the prompt work has to be visible somewhere");
         assert_eq!(tokens, 7);
