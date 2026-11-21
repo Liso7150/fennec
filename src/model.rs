@@ -2443,7 +2443,12 @@ impl GdnLayer {
             // The read below is a blocking DtoH on CUDA, so waiting here too
             // pays a second WDDM flush per layer for nothing. Vulkan's read is
             // a mapped copy and still needs the wait.
-            if read_syncs { bt.submit().unwrap(); } else { bt.run().unwrap(); }
+            //
+            // Every argument in this queue - the seven weight and state buffers,
+            // the arena offsets, the shapes - belongs to the layer and not to the
+            // token, so CUDA replays it as one captured graph instead of paying
+            // seven cuLaunchKernel calls per layer per token.
+            if read_syncs { bt.submit_replay().unwrap(); } else { bt.run().unwrap(); }
         }
         {
             let _r = prof::start(prof::MIXER_DEV_READBACK);

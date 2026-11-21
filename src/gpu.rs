@@ -1875,6 +1875,15 @@ impl Gpu {
         }
     }
 
+    /// Graph captures and replays so far, in that order. The Vulkan tier submits
+    /// one command buffer per batch already, so it has nothing to capture.
+    pub fn graphs(&self) -> (u64, u64) {
+        match self {
+            Gpu::Vk(_) => (0, 0),
+            Gpu::Cuda(g) => (g.graph_captures, g.graph_hits),
+        }
+    }
+
     pub fn batch(&mut self) -> Result<Batch<'_>> {
         match self {
             Gpu::Vk(g) => Ok(Batch::Vk(g.batch()?)),
@@ -2033,6 +2042,16 @@ impl<'a> Batch<'a> {
         match self {
             Batch::Vk(b) => b.submit(),
             Batch::Cuda(b) => b.submit(),
+        }
+    }
+
+    /// Submit through the backend's cheapest replay path. CUDA replays a captured
+    /// graph of the queue, which is only sound when every argument repeats; the
+    /// Vulkan batch is already one command buffer, so it just submits.
+    pub fn submit_replay(&mut self) -> Result<()> {
+        match self {
+            Batch::Vk(b) => b.submit(),
+            Batch::Cuda(b) => b.submit_graph(),
         }
     }
 

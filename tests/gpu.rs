@@ -677,6 +677,18 @@ fn fused_mixer_matches_the_cpu_mixer_and_its_state() {
         dev.forward(&mut y, &mut sb, pos);
         close(&format!("token {pos} hidden state"), &x, &y, 2e-5);
     }
+    // The queue belongs to the layer, not to the token, so CUDA captures it once
+    // and replays it for the rest. Falling back to per-launch submits keeps every
+    // number above identical, so the counters are the only proof the tier is
+    // actually graphed and not quietly degrading to seven launches a token.
+    let (backend, (captures, hits)) = {
+        let g = gpu.lock().unwrap();
+        (g.backend(), g.graphs())
+    };
+    if backend == Backend::Cuda {
+        assert_eq!(captures, 1, "one capture for the one layer's mixer queue");
+        assert_eq!(hits, toks.len() as u64 - 1, "every later token replays it");
+    }
     let (ga, gb) = match (&mut sa[0], &mut sb[0]) {
         (LayerState::Linear(p), LayerState::Linear(q)) => (p, q),
         _ => panic!("layer 0 is not a gated delta net"),

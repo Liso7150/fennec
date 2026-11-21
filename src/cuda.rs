@@ -41,6 +41,10 @@ const CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES: c_int = 6;
 
 // CUDA graph capture flags
 const CU_STREAM_CAPTURE_MODE_RELAXED: c_uint = 2;
+/// A blocking stream: the driver orders it against the legacy stream in both
+/// directions, which is what lets a synchronous memcpy bracket a graph launch.
+/// CU_STREAM_NON_BLOCKING (1) would drop that ordering.
+const CU_STREAM_DEFAULT: c_uint = 0;
 
 /// The driver entry points this backend uses. Resolved once at load, so a
 /// launch is a direct call through a function pointer, same as the Vulkan api.
@@ -72,7 +76,7 @@ struct Api {
     ) -> c_int,
     get_error_string: unsafe extern "system" fn(c_int, *mut *const c_char) -> c_int,
     // Stream and graph APIs for command buffer reuse
-    stream_create: unsafe extern "system" fn(*mut Handle) -> c_int,
+    stream_create: unsafe extern "system" fn(*mut Handle, c_uint) -> c_int,
     stream_destroy: unsafe extern "system" fn(Handle) -> c_int,
     stream_synchronize: unsafe extern "system" fn(Handle) -> c_int,
     stream_begin_capture: unsafe extern "system" fn(Handle, c_uint) -> c_int,
@@ -154,7 +158,7 @@ impl Cuda {
                 memcpy_dtoh: resolve!(lib, "cuMemcpyDtoH_v2", unsafe extern "system" fn(*mut c_void, DevPtr, usize) -> c_int),
                 launch_kernel: resolve!(lib, "cuLaunchKernel", unsafe extern "system" fn(Handle, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, Handle, *mut *mut c_void, *mut *mut c_void) -> c_int),
                 get_error_string: resolve!(lib, "cuGetErrorString", unsafe extern "system" fn(c_int, *mut *const c_char) -> c_int),
-                stream_create: resolve!(lib, "cuStreamCreate", unsafe extern "system" fn(*mut Handle) -> c_int),
+                stream_create: resolve!(lib, "cuStreamCreate", unsafe extern "system" fn(*mut Handle, c_uint) -> c_int),
                 stream_destroy: resolve!(lib, "cuStreamDestroy_v2", unsafe extern "system" fn(Handle) -> c_int),
                 stream_synchronize: resolve!(lib, "cuStreamSynchronize", unsafe extern "system" fn(Handle) -> c_int),
                 stream_begin_capture: resolve!(lib, "cuStreamBeginCapture_v2", unsafe extern "system" fn(Handle, c_uint) -> c_int),
@@ -400,12 +404,15 @@ impl Cuda {
         self.check(unsafe { (self.api.ctx_synchronize)() }, "cuCtxSynchronize")
     }
 
-    /// Create a CUDA stream for async operations and graph capture.
+    /// Create a blocking CUDA stream for graph capture. The flags argument is
+    /// CU_STREAM_DEFAULT on purpose: a non-blocking stream would not be ordered
+    /// against the legacy stream, and the synchronous arena memcpys that bracket
+    /// a graph launch are what makes the tier correct.
     pub fn create_stream(&mut self) -> Result<Handle> {
         self.bind();
         let mut stream: Handle = std::ptr::null_mut();
         self.check(
-            unsafe { (self.api.stream_create)(&mut stream) },
+            unsafe { (self.api.stream_create)(&mut stream, CU_STREAM_DEFAULT) },
             "cuStreamCreate",
         )?;
         Ok(stream)

@@ -168,6 +168,12 @@ impl CudaGpu {
         self.cu.free(self.arena_dev);
         self.arena_dev = dev;
         self.arena_floats = floats;
+        // A captured graph carries the arena base in every kernel parameter, so
+        // moving the arena invalidates all of them. Without this a queue that
+        // repeats after a grow would replay against the freed buffer.
+        for (_, exec) in self.graph_cache.drain() {
+            self.cu.destroy_graph_exec(exec);
+        }
         Ok(())
     }
 
@@ -381,19 +387,6 @@ impl CudaGpu {
         r
     }
 
-    /// Wait on the capture stream instead of the default.
-    pub fn wait_stream(&mut self) -> Result<()> {
-        let t0 = std::time::Instant::now();
-        let r = if self.stream.is_null() {
-            self.cu.sync()
-        } else {
-            self.cu.sync_stream(self.stream)
-        };
-        self.sync_ms += t0.elapsed().as_secs_f64() * 1e3;
-        self.syncs += 1;
-        r
-    }
-
     pub fn wait_idle(&mut self) -> Result<()> {
         self.cu.sync()
     }
@@ -504,26 +497,50 @@ impl<'a> CudaBatch<'a> {
         self.gpu.wait()
     }
 
-    /// Compute a hash of the launch queue for graph cache lookup.
+    /// Every value that reaches the driver has to reach the hash, including the
+    /// device pointers and arena offsets. A queue keyed on shape alone is the
+    /// same for all forty MoE and mixer layers, so the second layer would replay
+    /// the first layer's weights and nothing would report an error.
     fn queue_hash(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.queue.len().hash(&mut hasher);
         for l in &self.queue {
-            // Hash the launch shape (op type and key parameters)
             match *l {
-                Launch::Axpy { n, set, .. } => { (0u8, n, set as u8).hash(&mut hasher) }
-                Launch::SiluMul { n, .. } => { (1u8, n).hash(&mut hasher) }
-                Launch::RmsNorm { n, eps, .. } => { (2u8, n, eps.to_bits()).hash(&mut hasher) }
-                Launch::GemvQ4 { rows, cols, group, .. } => { (3u8, rows, cols, group).hash(&mut hasher) }
-                Launch::GemvHalf { f16, rows, cols, .. } => { (4u8, f16 as u8, rows, cols).hash(&mut hasher) }
-                Launch::GdnConv { base, cd, kernel, hist, .. } => { (5u8, base, cd, kernel, hist).hash(&mut hasher) }
-                Launch::GdnRec { base, kd, nv, dk, dv, rep, eps, .. } => {
-                    (6u8, base, kd, nv, dk, dv, rep, eps.to_bits()).hash(&mut hasher)
+                Launch::Axpy { n, x_off, y_off, w, set } => {
+                    (0u8, n, x_off, y_off, w.to_bits(), set as u8).hash(&mut hasher)
+                }
+                Launch::SiluMul { n, a_off, b_off, y_off } => {
+                    (1u8, n, a_off, b_off, y_off).hash(&mut hasher)
+                }
+                Launch::RmsNorm { n, x_off, w_off, y_off, eps } => {
+                    (2u8, n, x_off, w_off, y_off, eps.to_bits()).hash(&mut hasher)
+                }
+                Launch::GemvQ4 { w, s, rows, cols, group, x_off, y_off } => {
+                    (3u8, w, s, rows, cols, group, x_off, y_off).hash(&mut hasher)
+                }
+                Launch::GemvHalf { w, f16, rows, cols, x_off, y_off } => {
+                    (4u8, w, f16 as u8, rows, cols, x_off, y_off).hash(&mut hasher)
+                }
+                Launch::GdnConv { w, state, base, cd, kernel, hist } => {
+                    (5u8, w, state, base, cd, kernel, hist).hash(&mut hasher)
+                }
+                Launch::GdnRec { w, state, base, out_off, kd, nv, dk, dv, rep, eps } => {
+                    (6u8, w, state, base, out_off, kd, nv, dk, dv, rep, eps.to_bits()).hash(&mut hasher)
                 }
             }
         }
         hasher.finish()
+    }
+
+    /// Plain per-launch submit of an already-detached queue.
+    fn run_plain(gpu: &mut CudaGpu, q: Vec<Launch>) -> Result<()> {
+        for l in q {
+            gpu.exec(l)?;
+            gpu.dispatches += 1;
+        }
+        gpu.submitted += 1;
+        Ok(())
     }
 
     /// Submit the batch using a cached CUDA graph if available, or capture and
@@ -546,46 +563,57 @@ impl<'a> CudaBatch<'a> {
             return Ok(());
         }
 
-        // First time seeing this pattern: capture it into a graph
-        if self.gpu.stream.is_null() {
-            // Fall back to normal submit if stream creation failed
-            return self.submit();
-        }
-
-        // Begin capture on the stream
-        self.gpu.cu.begin_capture(self.gpu.stream)?;
-
-        // Execute the launches on the capture stream (they are recorded, not run)
+        // One capture per reusable queue, so a couple of hundred distinct queues
+        // is well past any model's layer count. Beyond that the callers repeat
+        // nothing and capture costs more than the launches it saves.
+        const MAX_GRAPHS: usize = 256;
         let q = std::mem::take(&mut self.queue);
-        for l in &q {
-            self.gpu.exec_on_stream(*l, self.gpu.stream)?;
-            self.gpu.dispatches += 1;
+        let stream = self.gpu.stream;
+        if stream.is_null() || self.gpu.graph_cache.len() >= MAX_GRAPHS {
+            return CudaBatch::run_plain(self.gpu, q);
         }
 
-        // End capture and get the graph
-        let graph = self.gpu.cu.end_capture(self.gpu.stream)?;
-
+        // A launch that fails partway through capture would leave the stream in
+        // capture mode, where every later call on it fails too, so the capture is
+        // always closed and anything not usable comes out as plain launches.
+        let mut graph = None;
+        if self.gpu.cu.begin_capture(stream).is_ok() {
+            let mut recorded = true;
+            for l in &q {
+                if self.gpu.exec_on_stream(*l, stream).is_err() {
+                    recorded = false;
+                    break;
+                }
+            }
+            match (recorded, self.gpu.cu.end_capture(stream)) {
+                (true, Ok(g)) => graph = Some(g),
+                (_, Ok(g)) => self.gpu.cu.destroy_graph(g),
+                _ => {}
+            }
+        }
+        let Some(captured) = graph else {
+            return CudaBatch::run_plain(self.gpu, q);
+        };
         // Instantiate the graph into an executable
-        let exec = self.gpu.cu.instantiate_graph(graph)?;
+        let exec = match self.gpu.cu.instantiate_graph(captured) {
+            Ok(e) => e,
+            Err(_) => {
+                self.gpu.cu.destroy_graph(captured);
+                return CudaBatch::run_plain(self.gpu, q);
+            }
+        };
 
         // Cache the executable (we keep the graph alive via the exec)
         self.gpu.graph_cache.insert(hash, exec);
         self.gpu.graph_captures += 1;
         self.gpu.submitted += 1;
+        self.gpu.dispatches += q.len() as u64;
 
         // Clean up the graph (the exec holds a reference)
-        self.gpu.cu.destroy_graph(graph);
+        self.gpu.cu.destroy_graph(captured);
 
         // Now launch the graph for real
-        self.gpu.cu.launch_graph(exec, self.gpu.stream)?;
-
-        Ok(())
-    }
-
-    /// Submit and wait using graph capture/replay.
-    pub fn run_graph(&mut self) -> Result<()> {
-        self.submit_graph()?;
-        self.gpu.wait_stream()
+        self.gpu.cu.launch_graph(exec, stream)
     }
 }
 
