@@ -40,7 +40,7 @@ void main() {
     // ones whose row is past the end of a partial last workgroup.
     if (r < p.rows) {
         uint base = r * half_cols;
-        if ((half_cols & 3u) == 0u) {
+        if ((half_cols & 3u) == 0u && (p.x_off & 3u) == 0u) {
             uint quads = half_cols >> 2;
             for (uint i = lane; i < quads; i += 64u) {
                 uvec4 u = w4[(base >> 2) + i];
@@ -53,7 +53,9 @@ void main() {
                      + bf(u.w, 0u) * x1.z + bf(u.w, 1u) * x1.w;
             }
         } else {
-            // cols % 8 != 0: a row base is not 16-byte aligned, so read scalars.
+            // cols % 8 != 0, or x_off is not a whole vec4: `x_off >> 2` floors
+            // without complaining, so either way the wide path reads the wrong
+            // elements and only scalars answer the question that was asked.
             for (uint i = lane; i < half_cols; i += 64u) {
                 uint u = w[base + i];
                 uint c = p.x_off + (i << 1);

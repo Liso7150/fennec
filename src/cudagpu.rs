@@ -511,6 +511,14 @@ impl<'a> CudaBatch<'a> {
 
     pub fn gemv_half(&mut self, w: usize, rows: usize, cols: usize, x_off: usize, y_off: usize) -> Result<&mut CudaBatch<'a>> {
         assert!(cols % 2 == 0, "half pairs need an even column count");
+        // The PTX takes its wide path on `cols % 8 == 0` alone, and there its
+        // scalar fallback sits behind the same branch. `ld.global.v4.f32`
+        // requires a 16-byte-aligned address, so an `x_off` that is not a whole
+        // float4 faults the context instead of reading the row at a stride. The
+        // Vulkan shaders gained an `x_off & 3` guard; this precompiled PTX has no
+        // source or toolchain here, so the layout has to answer for it: prefill's
+        // arena keeps every gemv input on a float4 boundary (see `Chunk::new`).
+        assert!(cols % 8 != 0 || x_off % 4 == 0, "gemv_half at cols {cols} loads x as float4, so x_off {x_off} must be a multiple of 4");
         let f16 = self.gpu.bufs[w].f16;
         self.push(Launch::GemvHalf { w: self.gpu.bufs[w].ptr, f16, rows: rows as u32, cols: cols as u32, x_off: x_off as u32, y_off: y_off as u32 })
     }

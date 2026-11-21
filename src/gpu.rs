@@ -1993,6 +1993,15 @@ impl<'a> Batch<'a> {
         Ok(self)
     }
 
+    /// Same, for the gated activation, whose arms write disjoint output slices.
+    pub fn silu_mul_indep(&mut self, n: usize, a_off: usize, b_off: usize, y_off: usize) -> Result<&mut Batch<'a>> {
+        match self {
+            Batch::Vk(b) => { b.silu_mul_nb(n, a_off, b_off, y_off)?; }
+            Batch::Cuda(b) => { b.silu_mul(n, a_off, b_off, y_off)?; }
+        };
+        Ok(self)
+    }
+
     pub fn axpy(&mut self, n: usize, x_off: usize, y_off: usize, w: f32, set: bool) -> Result<&mut Batch<'a>> {
         match self {
             Batch::Vk(b) => { b.axpy(n, x_off, y_off, w, set)?; }

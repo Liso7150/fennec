@@ -436,9 +436,16 @@ const DENSE_FLOATS: usize = 1 << 15;
 
 /// A batched prefill chunk's own region of the activation arena. Decode claims
 /// everything below `DENSE_OFF` - the MoE block at `moe_arena`'s offsets and
-/// the logits - and a chunk that picks a VRAM expert still runs that per-token
-/// chain, which writes its `x` at offset 0. So the batch lives above both.
+/// the logits - and the dense tier claims `DENSE_OFF`.., so a chunk that wants
+/// to hold its token rows across every layer lives above both.
 const PREFILL_OFF: usize = 1 << 20;
+
+/// Device expert chains a prompt chunk may have in flight at once. One pick
+/// needs [`moe_arena`]'s stride, and a wave closes when the next token's picks
+/// would not fit, so the arena pays for 64 chains however long the chunk is.
+/// At the served coverage a pick belongs on the device about 1.24 times per
+/// token, which makes this roughly fifty tokens deep.
+const PREFILL_SLOTS: usize = 64;
 
 /// Floats a mixer needs per token beyond its input row: attention's q, k, v
 /// and the read-out that feeds `o_proj`, or the delta net's four projections
@@ -468,18 +475,42 @@ pub struct Chunk {
     pub mix: usize,
     pub w_in: usize,
     pub w_post: usize,
+    /// The MoE picks that ran in VRAM, summed on the device into one row per
+    /// token, so the chunk reads them back once instead of once per token.
+    pub dev: usize,
+    /// Those picks' router weights, indexed by global pick order, plus one
+    /// shared-expert gate per token that used the device shared expert.
+    pub dw: usize,
+    /// `PREFILL_SLOTS` expert chains' intermediates, reused wave by wave.
+    pub slot: usize,
 }
 
 impl Chunk {
     /// Floats touched, from the base to one past the last element.
     pub fn span(cfg: &TextConfig, n: usize) -> usize {
-        let h = cfg.hidden_size;
-        3 * n * h + n * mixer_aux(cfg) + 2 * h
+        let c = Chunk::new(cfg, n);
+        c.slot - PREFILL_OFF + PREFILL_SLOTS * moe_arena(cfg).2
     }
 
     pub fn new(cfg: &TextConfig, n: usize) -> Chunk {
         let (h, aux) = (cfg.hidden_size, mixer_aux(cfg));
-        let mix = PREFILL_OFF + 3 * n * h;
+        let k = cfg.num_experts_per_tok;
+        // Every block starts on a float4 boundary: the half-precision gemvs index
+        // their activation as `x_off >> 2` to load four floats per instruction
+        // (`gemv_q4` guards, `gemv_bf16`/`gemv_f16` fall back to scalars, CUDA's
+        // precompiled PTX does neither and faults), and an expert chain reads its
+        // second stage out of its own slot. `n * (k + 1)` router weights is an
+        // odd count, and `n * aux` need not be either, so each block rounds up
+        // instead of the layout assuming a shape that answers to 4.
+        let mut off = PREFILL_OFF + 3 * n * h;
+        let mix = off;
+        off = align4(mix + n * aux);
+        let w_in = off;
+        off = align4(w_in + 2 * h);
+        let dev = off;
+        off = align4(dev + n * h);
+        let dw = off;
+        let slot = align4(dw + n * (k + 1));
         Chunk {
             n,
             h,
@@ -487,10 +518,18 @@ impl Chunk {
             buf: PREFILL_OFF + n * h,
             res: PREFILL_OFF + 2 * n * h,
             mix,
-            w_in: mix + n * aux,
-            w_post: mix + n * aux + h,
+            w_in,
+            w_post: w_in + h,
+            dev,
+            dw,
+            slot,
         }
     }
+}
+
+/// The next arena float index that a vec4 load can start at.
+fn align4(v: usize) -> usize {
+    (v + 3) & !3
 }
 
 fn f32_bytes(v: &[f32]) -> &[u8] {
@@ -1555,51 +1594,8 @@ impl MoeLayer {
             // own read is timed and counted: one pack per union member, not one
             // per pick.
             let t_host = std::time::Instant::now();
-            // Within a layer every expert comes from the same pack, so the first
-            // resident one decides whether the integer dot is available to all of
-            // them — the assumption `cpu_picks` already makes.
-            let (gu0, _, _) = self.expert_pair(union[0].0);
-            let int = gu0.wants_int();
-            let mut px: Vec<DotPrep> = (0..n).map(|_| DotPrep::with_int(h, int)).collect();
-            for r in 0..n {
-                px[r].fill(&xs[r * h..(r + 1) * h]);
-            }
             let nu = union.len();
-            let mut hh = vec![0f32; n * k * i];
-            {
-                let hhp = kernel::SharedPtr::new(hh.as_mut_ptr());
-                kernel::par_index(nu * i, self.threads, |start, len| {
-                    for g in start..start + len {
-                        let u = g / i;
-                        let j = g - u * i;
-                        let (gu, _, s) = self.expert_pair(union[u].0);
-                        let base = s * 2 * i;
-                        for &q in &union[u].1 {
-                            let p = &px[q as usize / k];
-                            let a = gu.dot_prepped(base + j, p);
-                            let b = gu.dot_prepped(base + i + j, p);
-                            unsafe { *hhp.at(q as usize * i + j) = kernel::silu(a) * b };
-                        }
-                    }
-                });
-            }
-            let mut ph: Vec<DotPrep> = (0..n * k).map(|_| DotPrep::with_int(i, int)).collect();
-            for q in 0..n * k {
-                ph[q].fill(&hh[q * i..(q + 1) * i]);
-            }
-            let pp = kernel::SharedPtr::new(parts.as_mut_ptr());
-            kernel::par_index(nu * h, self.threads, |start, len| {
-                for g in start..start + len {
-                    let u = g / h;
-                    let j = g - u * h;
-                    let (_, dn, s) = self.expert_pair(union[u].0);
-                    let row = s * h + j;
-                    for &q in &union[u].1 {
-                        let v = dn.dot_prepped(row, &ph[q as usize]);
-                        unsafe { *pp.at(q as usize * h + j) = wts[q as usize] * v };
-                    }
-                }
-            });
+            self.union_rows(&union, xs, &wts, &mut parts, n);
             self.host_union_bytes
                 .fetch_add(nu as u64 * self.host_pick_bytes() as u64, Relaxed);
             self.union_ns
@@ -1633,63 +1629,308 @@ impl MoeLayer {
         true
     }
 
-    /// Device-batched grouped expert union: processes all n tokens through the MoE
-    /// layer. Uses grouped expert processing for HOST experts (like Colibri's batch-union moe()).
-    /// 
-    /// Tokens whose routing touches VRAM run the device chain one at a time;
-    /// the rest share one grouped pass over the host-resident and cold experts.
-    /// 
-    /// Returns the output buffer (n × h floats) ready to write back to GPU.
-    pub fn prefill_device_grouped(&self, gpu: &mut Gpu, xs: &[f32], n: usize) -> Vec<f32> {
+    /// The RAM tier of a prompt chunk, which is the one place the expert weights
+    /// are read once for several tokens: `union` holds each expert the chunk
+    /// picked, with the flat pick indices (`row * k + pick`) that use it, so a
+    /// row's bytes come into cache for the first pick and every later pick of
+    /// the same expert hits them there. At one pick per expert - a short prompt -
+    /// it is the same work the per-token path does, and the reuse only pays as
+    /// the chunk grows (the served model averages 1.6 picks per union member at
+    /// 34 prompt tokens, 16 at 500).
+    ///
+    /// Both stages run as a row x expert grid split across every worker, the same
+    /// `par_index` shape [`MoeLayer::cpu_picks`] gives one token's picks, because
+    /// one expert per worker leaves most of the pool idle. Splitting rows never
+    /// changes what a row computes, so this is bit-identical to doing the picks
+    /// one at a time. `parts` receives one row per flat pick index, already
+    /// scaled by `wts`.
+    fn union_rows(&self, union: &[(usize, Vec<u32>)], xs: &[f32], wts: &[f32],
+                  parts: &mut [f32], n: usize) {
+        let (h, i) = (self.cfg.hidden_size, self.cfg.moe_intermediate_size);
+        let k = self.cfg.num_experts_per_tok;
+        if union.is_empty() {
+            return;
+        }
+        // Within a layer every expert comes from the same pack, so the first
+        // resident one decides whether the integer dot is available to all of
+        // them — the assumption `cpu_picks` already makes.
+        let (gu0, _, _) = self.expert_pair(union[0].0);
+        let int = gu0.wants_int();
+        let nu = union.len();
+        let mut px: Vec<DotPrep> = (0..n).map(|_| DotPrep::with_int(h, int)).collect();
+        for r in 0..n {
+            px[r].fill(&xs[r * h..(r + 1) * h]);
+        }
+        let mut hh = vec![0f32; n * k * i];
+        {
+            let hhp = kernel::SharedPtr::new(hh.as_mut_ptr());
+            kernel::par_index(nu * i, self.threads, |start, len| {
+                for g in start..start + len {
+                    let u = g / i;
+                    let j = g - u * i;
+                    let (gu, _, s) = self.expert_pair(union[u].0);
+                    let base = s * 2 * i;
+                    for &q in &union[u].1 {
+                        let p = &px[q as usize / k];
+                        let a = gu.dot_prepped(base + j, p);
+                        let b = gu.dot_prepped(base + i + j, p);
+                        unsafe { *hhp.at(q as usize * i + j) = kernel::silu(a) * b };
+                    }
+                }
+            });
+        }
+        let mut ph: Vec<DotPrep> = (0..n * k).map(|_| DotPrep::with_int(i, int)).collect();
+        for q in 0..n * k {
+            ph[q].fill(&hh[q * i..(q + 1) * i]);
+        }
+        let pp = kernel::SharedPtr::new(parts.as_mut_ptr());
+        kernel::par_index(nu * h, self.threads, |start, len| {
+            for g in start..start + len {
+                let u = g / h;
+                let j = g - u * h;
+                let (_, dn, s) = self.expert_pair(union[u].0);
+                let row = s * h + j;
+                for &q in &union[u].1 {
+                    let v = dn.dot_prepped(row, &ph[q as usize]);
+                    unsafe { *pp.at(q as usize * h + j) = wts[q as usize] * v };
+                }
+            }
+        });
+    }
+
+    /// Device-batched grouped expert union: every pick of a prompt chunk goes
+    /// through the tier it was placed on, once, and the tiers run at once.
+    ///
+    /// This split by token before: a chunk token with any VRAM pick ran the
+    /// whole per-token chain, so its RAM-resident picks paid their own weight
+    /// read instead of joining the union. Splitting by pick is what the union
+    /// was always for - at the served coverage a token touches VRAM on 3 of its
+    /// 4 visits while only 1 pick in 6 lives there, so the old rule sent most of
+    /// the chunk down the path that reads every weight again.
+    ///
+    /// The device chains are recorded `PREFILL_SLOTS` picks to a command buffer,
+    /// one wave after another, and each token's picks are reduced on the device
+    /// into its own row of `c.dev`. The chunk therefore pays a fence and a
+    /// read-back per wave instead of per token, and each chain reads its `x`
+    /// from the row the chunk already put in the arena rather than re-uploading
+    /// it. The host union runs between the last submit and the wait, which is
+    /// the same overlap [`MoeLayer::forward`] buys a single token.
+    ///
+    /// A token's sum is assembled the way `forward_with` assembles one: device
+    /// picks first (already reduced, in pick order), then the host and streamed
+    /// picks in pick order, then the shared expert last.
+    pub fn prefill_device_grouped(&self, gpu: &mut Gpu, c: Chunk, xs: &[f32], n: usize) -> Vec<f32> {
         let (h, i) = (self.cfg.hidden_size, self.cfg.moe_intermediate_size);
         let (e, k) = (self.cfg.num_experts, self.cfg.num_experts_per_tok);
-        
+        let stride = moe_arena(&self.cfg).2;
         let routings = self.route_batch(xs, n);
-        let on_device = |id: usize| self.dev.as_ref().is_some_and(|d| d.slot[id] >= 0);
-        // A token whose picks are all in RAM joins the union; one that touches
-        // VRAM runs the device chain on its own, because the union has no
-        // batched q4 kernel yet. Splitting per token rather than per chunk is
-        // the point: in a device plan most picks are in VRAM, so the old
-        // all-or-nothing test sent the whole chunk down the per-token path and
-        // the union never ran on the tier it was written for.
-        let vram: Vec<usize> = (0..n).filter(|&t| routings[t].ids.iter().copied().any(on_device)).collect();
-        let grouped: Vec<usize> = (0..n).filter(|t| !vram.contains(t)).collect();
-        
-        // No device experts - use batched grouped processing for host experts
+        let dev_shared = self.dev.as_ref().and_then(|d| d.shared);
+        let dslot = |id: usize| -> i32 {
+            self.dev.as_ref().and_then(|d| d.slot.get(id).copied()).unwrap_or(-1)
+        };
+
+        // One shared gate per token, computed here because both tiers need it:
+        // a token whose picks went to VRAM pays for its shared expert with it,
+        // and every other token gets the host expert summed last with it.
+        let gates: Vec<f32> = (0..n)
+            .map(|t| kernel::sigmoid(kernel::dot(&self.s_egate, &xs[t * h..(t + 1) * h])))
+            .collect();
+
+        // Classify every pick of the chunk. `first[t]` is where token t's device
+        // picks start in `picks`, and its weight run in `wv` is always at
+        // `t * (k + 1)`, which is what the device reduce reads.
+        let mut picks: Vec<usize> = Vec::new(); // device slot, per pick
+        let mut first = vec![usize::MAX; n];
+        let mut wv = vec![0f32; n * (k + 1)];
+        let (mut n_host, mut n_cold) = (vec![0u8; n], vec![0u8; n]);
         let mut at = vec![usize::MAX; e];
-        let mut union: Vec<(usize, Vec<(usize, usize, f32)>)> = Vec::new();
+        // The host tier's union, keyed by expert and holding flat pick indices,
+        // which is the shape [`MoeLayer::union_rows`] takes; `wts` is indexed the
+        // same way, so the two tiers read the router's decision from one place.
+        let mut union: Vec<(usize, Vec<u32>)> = Vec::new();
+        let mut wts = vec![0f32; n * k];
         let mut cold: Vec<(usize, usize, usize, f32)> = Vec::new();
-        
-        for &token_idx in &grouped {
-            let routing = &routings[token_idx];
-            for pick_idx in 0..k {
-                let id = routing.ids[pick_idx];
-                let w = routing.weights[pick_idx];
-                
-                if self.slot[id] >= 0 {
-                    // Host resident expert
-                    let u = at[id];
-                    let union_idx = if u == usize::MAX {
+        for t in 0..n {
+            let r = &routings[t];
+            for q in 0..k {
+                let id = r.ids[q];
+                wts[t * k + q] = r.weights[q];
+                let s = dslot(id);
+                if s >= 0 {
+                    if first[t] == usize::MAX {
+                        first[t] = picks.len();
+                    }
+                    wv[t * (k + 1) + picks.len() - first[t]] = r.weights[q];
+                    picks.push(s as usize);
+                } else if self.slot[id] >= 0 {
+                    n_host[t] += 1;
+                    let ui = if at[id] == usize::MAX {
                         at[id] = union.len();
                         union.push((id, Vec::new()));
                         union.len() - 1
                     } else {
-                        u
+                        at[id]
                     };
-                    union[union_idx].1.push((token_idx, pick_idx, w));
+                    union[ui].1.push((t * k + q) as u32);
                 } else {
-                    // Cold (disk) expert
-                    cold.push((token_idx, pick_idx, id, w));
+                    n_cold[t] += 1;
+                    cold.push((t, q, id, r.weights[q]));
                 }
             }
+            if first[t] != usize::MAX && dev_shared.is_some() {
+                let d = picks.len() - first[t];
+                wv[t * (k + 1) + d] = gates[t];
+            }
         }
-        
-        let mut parts = vec![0f32; n * k * h];
-        
-        // Process cold experts (disk-streamed)
+        let dev_toks: Vec<usize> = (0..n).filter(|&t| first[t] != usize::MAX).collect();
+        // The tier's pick counts, for the plan's report.
+        for t in 0..n {
+            self.note_picks(&routings[t].ids);
+            self.dev_hits.fetch_add((k - (n_host[t] + n_cold[t]) as usize) as u64, Relaxed);
+            self.host_hits.fetch_add(n_host[t] as u64, Relaxed);
+            self.disk_hits.fetch_add(n_cold[t] as u64, Relaxed);
+        }
+
+        // Waves: token-aligned runs whose chains fit the slot budget, so no
+        // token is split across two command buffers.
+        let mut need: Vec<usize> = Vec::with_capacity(dev_toks.len());
+        for (u, &t) in dev_toks.iter().enumerate() {
+            let f = first[t];
+            let d = if u + 1 < dev_toks.len() { first[dev_toks[u + 1]] } else { picks.len() } - f;
+            need.push(d + dev_shared.is_some() as usize);
+        }
+        let mut waves: Vec<(usize, usize)> = Vec::new();
+        let (mut w0, mut used) = (0usize, 0usize);
+        for u in 0..dev_toks.len() {
+            if u > w0 && used + need[u] > PREFILL_SLOTS {
+                waves.push((w0, u));
+                w0 = u;
+                used = 0;
+            }
+            used += need[u];
+        }
+        if !dev_toks.is_empty() {
+            waves.push((w0, dev_toks.len()));
+        }
+
+        // One expert chain to record: its own input row, its own slot block, and
+        // the weights backing it. `shared` marks the f16 expert, which has no
+        // nibble pair and rides last in its token's run.
+        struct Step {
+            tok: usize,
+            x: usize,
+            gu: usize,
+            w: [usize; 4],
+            shared: bool,
+            weight: f32,
+        }
+        let last = waves.len().saturating_sub(1);
+        if !dev_toks.is_empty() {
+            // The reduce reads each token's weights by pick order, so one upload
+            // backs every wave.
+            gpu.write(c.dw, &wv);
+        }
+        for (wi, &(wa, wb)) in waves.iter().enumerate() {
+            let mut steps: Vec<Step> = Vec::new();
+            let bufs = &self.dev.as_ref().unwrap().bufs;
+            for u in wa..wb {
+                let t = dev_toks[u];
+                let f = first[t];
+                let d = need[u] - dev_shared.is_some() as usize;
+                for j in 0..d {
+                    let [gw, gs, dw, ds] = bufs[picks[f + j]];
+                    steps.push(Step {
+                        tok: t,
+                        x: c.buf + t * h,
+                        gu: c.slot + steps.len() * stride,
+                        w: [gw, gs, dw, ds],
+                        shared: false,
+                        weight: wv[t * (k + 1) + j],
+                    });
+                }
+                if let Some(sh) = dev_shared {
+                    steps.push(Step {
+                        tok: t,
+                        x: c.buf + t * h,
+                        gu: c.slot + steps.len() * stride,
+                        w: [sh[0], sh[1], sh[2], 0],
+                        shared: true,
+                        weight: gates[t],
+                    });
+                }
+            }
+            let group = self.dev.as_ref().unwrap().group;
+            {
+                let _t = prof::start(prof::MOE_RECORD);
+                let mut b = gpu.batch().unwrap();
+                for s in &steps {
+                    if s.shared {
+                        b.gemv_half_indep(s.w[0], i, h, s.x, s.gu).unwrap();
+                        b.gemv_half_indep(s.w[1], i, h, s.x, s.gu + i).unwrap();
+                    } else {
+                        b.gemv_q4_indep(s.w[0], s.w[1], 2 * i, h, group, s.x, s.gu).unwrap();
+                    }
+                }
+                b.barrier().unwrap();
+                for s in &steps {
+                    b.silu_mul_indep(i, s.gu, s.gu + i, s.gu + 2 * i).unwrap();
+                }
+                b.barrier().unwrap();
+                for s in &steps {
+                    if s.shared {
+                        b.gemv_half_indep(s.w[2], h, i, s.gu + 2 * i, s.gu + 4 * i).unwrap();
+                    } else {
+                        b.gemv_q4_indep(s.w[2], s.w[3], h, i, group, s.gu + 2 * i, s.gu + 4 * i).unwrap();
+                    }
+                }
+                b.barrier().unwrap();
+                // Each token's run is contiguous, so it reduces with one kernel
+                // on Vulkan and one axpy per pick on CUDA, into its own arena row.
+                let vk = matches!(&b, crate::gpu::Batch::Vk(_));
+                if vk {
+                    if let crate::gpu::Batch::Vk(v) = &mut b {
+                        let mut s0 = 0;
+                        while s0 < steps.len() {
+                            let t = steps[s0].tok;
+                            let mut s1 = s0 + 1;
+                            while s1 < steps.len() && steps[s1].tok == t {
+                                s1 += 1;
+                            }
+                            v.moe_reduce(
+                                s1 - s0,
+                                h,
+                                stride,
+                                steps[s0].gu,
+                                4 * i,
+                                c.dev + t * h,
+                                c.dw + t * (k + 1),
+                            )
+                            .unwrap();
+                            s0 = s1;
+                        }
+                    }
+                } else {
+                    for (j, s) in steps.iter().enumerate() {
+                        let first_of = j == 0 || steps[j - 1].tok != s.tok;
+                        b.axpy(h, s.gu + 4 * i, c.dev + s.tok * h, s.weight, first_of).unwrap();
+                    }
+                }
+                b.submit().unwrap();
+            }
+            if wi != last {
+                let _s = prof::start(prof::MOE_SYNC);
+                gpu.wait().unwrap();
+            }
+        }
+
+        let has_dev = |t: usize| first[t] != usize::MAX;
+
+        // The host and disk tiers, for the whole chunk, while the last wave runs.
+        let _cpu = prof::start(prof::MOE_CPU);
         if let Some(pf) = &self.prefetcher {
             pf.prefetch_ahead(self.ahead_layer, &self.ahead);
         }
+        let mut parts = vec![0f32; n * k * h];
         if !cold.is_empty() {
             let mut pool = self.stream.as_ref().unwrap().lock().unwrap();
             let want: Vec<usize> = cold
@@ -1716,57 +1957,11 @@ impl MoeLayer {
                 kernel::axpy(out, &y, w);
             }
         }
-        
-        // Process host expert groups
-        if !union.is_empty() {
-            let (gu0, _, _) = self.expert_pair(union[0].0);
-            let int = gu0.wants_int();
-            let px: Vec<DotPrep> = (0..n).map(|r| {
-                let mut prep = DotPrep::with_int(h, int);
-                prep.fill(&xs[r * h..(r + 1) * h]);
-                prep
-            }).collect();
-            
-            let mut hh = vec![0f32; n * k * i];
-            for (_u_idx, (expert_id, picks)) in union.iter().enumerate() {
-                let (gu, _, s) = self.expert_pair(*expert_id);
-                let base = s * 2 * i;
-                for &(token_idx, pick_idx, _) in picks {
-                    let p = &px[token_idx];
-                    let hh_off = (token_idx * k + pick_idx) * i;
-                    for j in 0..i {
-                        let g = gu.dot_prepped(base + j, p);
-                        let u = gu.dot_prepped(base + i + j, p);
-                        hh[hh_off + j] = kernel::silu(g) * u;
-                    }
-                }
-            }
-            
-            let ph: Vec<DotPrep> = (0..n * k).map(|q| {
-                let mut prep = DotPrep::with_int(i, int);
-                prep.fill(&hh[q * i..(q + 1) * i]);
-                prep
-            }).collect();
-            
-            for (_u_idx, (expert_id, picks)) in union.iter().enumerate() {
-                let (_, dn, s) = self.expert_pair(*expert_id);
-                let row_base = s * h;
-                for &(token_idx, pick_idx, w) in picks {
-                    let q = token_idx * k + pick_idx;
-                    let p = &ph[q];
-                    let out = &mut parts[q * h..(q + 1) * h];
-                    for j in 0..h {
-                        let v = dn.dot_prepped(row_base + j, p);
-                        out[j] = w * v;
-                    }
-                }
-            }
-        }
-        
-        // Add shared expert contribution for the grouped tokens, on the host:
-        // attaching the device tier uploads this expert but keeps the host
-        // copy, so the union multiplies the same weights `forward` would. The
-        // VRAM tokens below get it through the device chain instead.
+        // The RAM tier, batched and threaded exactly as the host-only prefill
+        // does it: this is the chunk's dominant tier, and the row-major order
+        // `union_rows` walks is what makes an expert used by several tokens cost
+        // one weight read instead of one per pick.
+        self.union_rows(&union, xs, &wts, &mut parts, n);
         let si = self.cfg.shared_expert_intermediate_size;
         let mut shared_out = vec![0f32; n * h];
         {
@@ -1779,24 +1974,32 @@ impl MoeLayer {
             }
             self.s_down.gemv_batch(h, si, &u, &mut shared_out, self.threads);
         }
-        
-        // Sum all contributions per token
+        drop(_cpu);
+
+        // Join the tiers: one row per token, device sum first, then every host
+        // and streamed pick in order, then the shared expert.
+        let mut dev_out = vec![0f32; n * h];
+        if !dev_toks.is_empty() {
+            if !gpu.read_syncs() {
+                let _s = prof::start(prof::MOE_SYNC);
+                gpu.wait().unwrap();
+            }
+            let _r = prof::start(prof::MOE_READ);
+            gpu.read_into(c.dev, &mut dev_out);
+        }
         let mut out = vec![0f32; n * h];
-        for &r in &grouped {
-            let gate = kernel::sigmoid(kernel::dot(&self.s_egate, &xs[r * h..(r + 1) * h]));
-            let o = &mut out[r * h..(r + 1) * h];
-            o.fill(0.0);
-            for q in r * k..(r + 1) * k {
+        for t in 0..n {
+            let o = &mut out[t * h..(t + 1) * h];
+            if has_dev(t) {
+                kernel::axpy(o, &dev_out[t * h..(t + 1) * h], 1.0);
+            }
+            for q in t * k..(t + 1) * k {
                 kernel::axpy(o, &parts[q * h..(q + 1) * h], 1.0);
             }
-            kernel::axpy(o, &shared_out[r * h..(r + 1) * h], gate);
+            if !(has_dev(t) && dev_shared.is_some()) {
+                kernel::axpy(o, &shared_out[t * h..(t + 1) * h], gates[t]);
+            }
         }
-        for &t in &vram {
-            let x = &xs[t * h..(t + 1) * h];
-            let moe_out = self.forward_with(Some(gpu), x, &routings[t]);
-            out[t * h..(t + 1) * h].copy_from_slice(&moe_out);
-        }
-        
         out
     }
 }
@@ -3450,7 +3653,7 @@ impl Layer {
             (Some(moe), _) => {
                 let mut all = vec![0f32; n * h];
                 gpu.read_into(c.buf, &mut all);
-                let moe_out = moe.prefill_device_grouped(gpu, &all, n);
+                let moe_out = moe.prefill_device_grouped(gpu, c, &all, n);
                 gpu.write(c.res, &moe_out);
                 let mut bt = gpu.batch()?;
                 bt.axpy_batch(h, n, c.res, c.xs, 1.0, false)?;
@@ -4283,13 +4486,14 @@ impl Model {
     }
 
     /// Whether [`Model::prefill`] can take the prompt: its batch kernels are
-    /// host kernels, so a plan that put the dense tier in VRAM has to keep
-    /// walking [`Model::forward`] token by token. Routing a device prompt
-    /// through these kernels instead was measured: 26 prompt tokens in 2166 ms
-    /// against 1750 ms on the VRAM path, because the host buys its one weight
-    /// pass per chunk (379 ms for the mixer projections) while the GPU idles and
-    /// the dot competes with the host expert pool for the same bandwidth. The
-    /// bytes are cheaper on the host, the token is not.
+    /// host kernels, so a plan that put the dense tier in VRAM batches through
+    /// [`Model::prefill_device`] instead. Routing a device prompt through the
+    /// host kernels was measured and lost: 26 prompt tokens in 2166 ms against
+    /// 1750 ms on the VRAM path, because the host buys its one weight pass per
+    /// chunk (379 ms for the mixer projections) while the GPU idles and the dot
+    /// competes with the host expert pool for the same bandwidth. The bytes are
+    /// cheaper on the host, the token is not - which is why the device tier got
+    /// a batch kernel of its own rather than this one.
     pub fn prefill_ready(&self) -> bool {
         self.gpu.is_none()
     }
@@ -4299,9 +4503,10 @@ impl Model {
     /// and so only serves a host tier.
     ///
     /// The rows get their own region of the activation arena, above everything
-    /// decode claims, because a token that picks a VRAM expert still runs the
-    /// per-token device chain inside the chunk and that chain writes its `x` at
-    /// offset 0.
+    /// decode and the dense tier claim, because every stage of a chunk needs all
+    /// `n` token rows alive at once: the mixer reads and writes them, and a
+    /// device expert chain reads its `x` straight out of its token's row instead
+    /// of paying an upload of its own.
     pub fn prefill_device(&self, xs: &mut [f32], st: &mut [LayerState], pos0: usize) -> Result<()> {
         let h = self.cfg.hidden_size;
         let n = xs.len() / h;
@@ -4701,5 +4906,64 @@ mod tests {
         // The arithmetic the folded counter produced for the same traffic.
         let folded = m.union_picks.load(Relaxed) * pack + m.host_union_bytes.load(Relaxed);
         assert_eq!(folded, 29 * pack);
+    }
+
+    /// Every block a chunk's gemv reads its activation from has to start on a
+    /// float4 boundary: the half-precision shaders index `x_off >> 2` to pull four
+    /// floats per instruction, and CUDA's precompiled PTX has no scalar arm outside
+    /// its `cols` branch, so an odd offset there faults the context instead of
+    /// reading a row at a stride. qwen36's router weights are `n * (k + 1)` floats —
+    /// an odd count per token, which is what put `slot` off-boundary and left every
+    /// device chain's second stage reading one float astray.
+    #[test]
+    fn every_prefill_block_starts_where_a_vec4_load_can() {
+        let cfg = TextConfig {
+            hidden_size: 2048,
+            num_hidden_layers: 40,
+            vocab_size: 151_936,
+            rms_norm_eps: 1e-6,
+            norm_zero_centered: false,
+            layer_types: vec![LayerKind::Full],
+            num_attention_heads: 16,
+            num_key_value_heads: 2,
+            head_dim: 128,
+            partial_rotary_factor: 1.0,
+            rope_theta: 1e6,
+            attn_output_gate: true,
+            intermediate_size: 0,
+            tie_word_embeddings: false,
+            linear_num_key_heads: 32,
+            linear_num_value_heads: 32,
+            linear_key_head_dim: 128,
+            linear_value_head_dim: 128,
+            linear_conv_kernel_dim: 4,
+            num_experts: 256,
+            num_experts_per_tok: 8,
+            moe_intermediate_size: 512,
+            shared_expert_intermediate_size: 512,
+            prefix: "model".into(),
+            name: "qwen36-shape".into(),
+        };
+        let k = cfg.num_experts_per_tok;
+        assert_eq!((k + 1) % 4, 1, "the premise: an odd weight count per token");
+        let (_acc, base, stride) = moe_arena(&cfg);
+        // A chain's second stage reads its activations at `base + 2 * I` inside
+        // its own stride-wide slot, so that and the slot pitch have to be aligned
+        // too, not just the slot block's start.
+        assert_eq!((base + 2 * cfg.moe_intermediate_size) % 4, 0, "a chain's second stage reads there");
+        assert_eq!(stride % 4, 0, "the next chain's slot");
+        for n in 1..=PREFILL_SLOTS {
+            let c = Chunk::new(&cfg, n);
+            for (tag, off) in [
+                ("xs", c.xs), ("buf", c.buf), ("res", c.res), ("mix", c.mix),
+                ("w_in", c.w_in), ("dev", c.dev), ("dw", c.dw), ("slot", c.slot),
+            ] {
+                assert_eq!(off % 4, 0, "{tag} at n {n} is off a float4 boundary");
+            }
+            assert_eq!(c.w_post, c.w_in + cfg.hidden_size, "the two norms stay adjacent");
+            // The reservation has to cover the last slot even now the blocks pad.
+            let last = c.slot + PREFILL_SLOTS * stride;
+            assert_eq!(last - PREFILL_OFF, Chunk::span(&cfg, n), "span at n {n}");
+        }
     }
 }

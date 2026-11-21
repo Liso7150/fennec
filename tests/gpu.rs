@@ -186,6 +186,43 @@ fn a_device_gemv_is_the_cpu_gemv() {
     g.write(0, &x);
     g.batch().unwrap().gemv_q4(wb, sb, rows, cols, 64, 0, cols).unwrap().run().unwrap();
     close("q4 group 64", &want, &g.read(cols, rows), 2e-5);
+
+    // An activation that does not start on a float4 boundary. Every one of these
+    // kernels loads `x` four floats per instruction from `x_off >> 2`, which
+    // floors, so `gemv_q4` guards its wide path on `x_off & 3 == 0` — and the
+    // half kernels silently read a row at a stride until they were given the
+    // same guard. CUDA has no scalar arm outside its `cols` branch, so recording
+    // an unaligned `x_off` there faults the context; its wrapper asserts the
+    // alignment instead and prefill's arena keeps every input on a boundary.
+    if g.backend() != Backend::Cuda {
+        let (rows, cols) = (64usize, 2048usize);
+        for off in [1usize, 2, 5] {
+            let w = bf16_bytes(&lcg(rows * cols, 37, 0.05));
+            let x = lcg(cols, 41, 1.0);
+            let mut want = vec![0f32; rows];
+            kernel::gemv_bf16(&w, rows, cols, &x, &mut want, threads);
+            let wb = g.upload(&w).unwrap();
+            g.write(off, &x);
+            g.batch().unwrap().gemv_half(wb, rows, cols, off, off + cols).unwrap().run().unwrap();
+            close(&format!("bf16 unaligned x_off {off}"), &want, &g.read(off + cols, rows), 2e-6);
+        }
+        let w = f16_bytes(&lcg(rows * 512, 43, 0.05));
+        let x = lcg(512, 47, 1.0);
+        let mut want = vec![0f32; rows];
+        kernel::gemv_f16(&w, rows, 512, &x, &mut want, threads);
+        let wb = g.upload_half(&w, true).unwrap();
+        g.write(3, &x);
+        g.batch().unwrap().gemv_half(wb, rows, 512, 3, 3 + 512).unwrap().run().unwrap();
+        close("f16 unaligned x_off 3", &want, &g.read(3 + 512, rows), 2e-6);
+
+        let q = Q4::quantize(&lcg(rows * 512, 53, 0.04), rows, 512, 64, threads);
+        let x = lcg(512, 59, 1.0);
+        let want: Vec<f32> = (0..rows).map(|r| q.dot_row(r, &x)).collect();
+        let (wb, sb) = g.upload_q4(&q).unwrap();
+        g.write(1, &x);
+        g.batch().unwrap().gemv_q4(wb, sb, rows, 512, 64, 1, 1 + 512).unwrap().run().unwrap();
+        close("q4 unaligned x_off 1", &want, &g.read(1 + 512, rows), 2e-5);
+    }
 }
 
 /// Subnormal f16 weights are |w| < 6.1e-5, which real checkpoints do contain.
@@ -1839,6 +1876,71 @@ fn the_batch_kernels_are_the_single_ones() {
 /// its own, and the mixer states are compared next to the hidden states: a
 /// chunk that mis-handles the conv window or the KV row can still hand back a
 /// plausible last token and only go wrong on the first decode.
+///
+/// `need_device` makes it a failure when no pick of the chunk landed in VRAM.
+/// The tier a pick takes comes from the router, so a plan can silently stop
+/// exercising the device chains; the counter says whether the branch ran.
+fn chunk_matches_loop(dev: &Model, sh: &Shards, h: usize, toks: &[usize], ns: &[usize], want: &str, need_device: bool) {
+    let hits = |d: &Model| -> u64 {
+        d.layers.iter().filter_map(|l| l.moe.as_ref()).map(|m| m.dev_hits.load(Relaxed)).sum()
+    };
+    let mut emb = vec![0f32; toks.len() * h];
+    for (t, &id) in toks.iter().enumerate() {
+        let x = dev.embed_row(sh, id).expect("embed");
+        emb[t * h..(t + 1) * h].copy_from_slice(&x);
+    }
+    for &n in ns {
+        let label = format!("{want} chunk {n}");
+        let mut chunk = emb[..n * h].to_vec();
+        // Batched first: the device holds one mixer state buffer per layer,
+        // and the token loop reuses it, so the chunk's own state has to be
+        // read out before the reference run overwrites it.
+        let before = hits(dev);
+        let mut st_b = dev.states(n);
+        dev.prefill_device(&mut chunk, &mut st_b, 0).expect("device prefill");
+        let ran = hits(dev) - before;
+        assert!(!need_device || ran > 0, "{label}: not one pick reached VRAM, so the device branch went untested");
+        println!("  {label}: {ran} picks on the device tier");
+        let kept: Vec<Vec<f32>> = st_b
+            .iter()
+            .map(|s| match s {
+                LayerState::Linear(p) => [p.conv.as_slice(), p.rec.as_slice()].concat(),
+                LayerState::Full(a) => [a.k.as_slice(), a.v.as_slice()].concat(),
+            })
+            .collect();
+
+        let mut stepped = vec![0f32; n * h];
+        let mut st_s = dev.states(n);
+        for pos in 0..n {
+            let mut x = emb[pos * h..(pos + 1) * h].to_vec();
+            dev.forward(&mut x, &mut st_s, pos);
+            stepped[pos * h..(pos + 1) * h].copy_from_slice(&x);
+        }
+        // The token loop leaves the delta-net state in VRAM; the chunk keeps
+        // it on the host. Pull the reference back before diffing the two.
+        for (l, s) in dev.layers.iter().zip(st_s.iter_mut()) {
+            if let LayerState::Linear(p) = s {
+                l.gdn.as_ref().unwrap().sync_state(p).expect("read the device state back");
+            }
+        }
+        for t in 0..n {
+            close(
+                &format!("{label} token {t} hidden state"),
+                &stepped[t * h..(t + 1) * h],
+                &chunk[t * h..(t + 1) * h],
+                2e-5,
+            );
+        }
+        for (l, (want_, st)) in kept.iter().zip(st_s.iter()).enumerate() {
+            let now: Vec<f32> = match st {
+                LayerState::Linear(p) => [p.conv.as_slice(), p.rec.as_slice()].concat(),
+                LayerState::Full(a) => [a.k.as_slice(), a.v.as_slice()].concat(),
+            };
+            close(&format!("{label} layer {l} mixer state"), want_, &now, 2e-5);
+        }
+    }
+}
+
 #[test]
 fn the_batched_device_prefill_is_the_token_loop() {
     let Some(g) = gpu() else { return };
@@ -1889,58 +1991,7 @@ fn the_batched_device_prefill_is_the_token_loop() {
             .expect("device stack");
         assert!(dev.prefill_device_ready(), "a device plan can batch its prompt on the device");
         assert!(!dev.prefill_ready(), "a device plan has no batched host prompt path to fall back on");
-
-        let mut emb = vec![0f32; toks.len() * h];
-        for (t, &id) in toks.iter().enumerate() {
-            let x = dev.embed_row(&sh, id).expect("embed");
-            emb[t * h..(t + 1) * h].copy_from_slice(&x);
-        }
-        for n in [1usize, 2, 6] {
-            let want = format!("layers {layers:?} chunk {n}");
-            let mut chunk = emb[..n * h].to_vec();
-            // Batched first: the device holds one mixer state buffer per layer,
-            // and the token loop reuses it, so the chunk's own state has to be
-            // read out before the reference run overwrites it.
-            let mut st_b = dev.states(n);
-            dev.prefill_device(&mut chunk, &mut st_b, 0).expect("device prefill");
-            let kept: Vec<Vec<f32>> = st_b
-                .iter()
-                .map(|s| match s {
-                    LayerState::Linear(p) => [p.conv.as_slice(), p.rec.as_slice()].concat(),
-                    LayerState::Full(a) => [a.k.as_slice(), a.v.as_slice()].concat(),
-                })
-                .collect();
-
-            let mut stepped = vec![0f32; n * h];
-            let mut st_s = dev.states(n);
-            for pos in 0..n {
-                let mut x = emb[pos * h..(pos + 1) * h].to_vec();
-                dev.forward(&mut x, &mut st_s, pos);
-                stepped[pos * h..(pos + 1) * h].copy_from_slice(&x);
-            }
-            // The token loop leaves the delta-net state in VRAM; the chunk keeps
-            // it on the host. Pull the reference back before diffing the two.
-            for (l, s) in dev.layers.iter().zip(st_s.iter_mut()) {
-                if let LayerState::Linear(p) = s {
-                    l.gdn.as_ref().unwrap().sync_state(p).expect("read the device state back");
-                }
-            }
-            for t in 0..n {
-                close(
-                    &format!("{want} token {t} hidden state"),
-                    &stepped[t * h..(t + 1) * h],
-                    &chunk[t * h..(t + 1) * h],
-                    2e-5,
-                );
-            }
-            for (l, (want_, st)) in kept.iter().zip(st_s.iter()).enumerate() {
-                let now: Vec<f32> = match st {
-                    LayerState::Linear(p) => [p.conv.as_slice(), p.rec.as_slice()].concat(),
-                    LayerState::Full(a) => [a.k.as_slice(), a.v.as_slice()].concat(),
-                };
-                close(&format!("{want} layer {l} mixer state"), want_, &now, 2e-5);
-            }
-        }
+        chunk_matches_loop(&dev, &sh, h, &toks, &[1, 2, 6], &format!("layers {layers:?} host-only"), false);
     }
 
     let g = gpu.lock().unwrap();
@@ -1949,4 +2000,66 @@ fn the_batched_device_prefill_is_the_token_loop() {
         g.dispatches(),
         g.submitted(),
     );
+}
+
+/// The same comparison with a third of the experts in VRAM, so most tokens of
+/// a chunk are answered by both tiers at once. The test above leaves `resident`
+/// empty and therefore runs only the host union: it never records a device
+/// chain, never reduces one into a chunk row and never splits a chunk into
+/// waves. Those are the parts that can be wrong without moving the last
+/// token's logits.
+#[test]
+fn the_device_chunk_matches_the_loop_when_picks_live_in_vram() {
+    let Some(g) = gpu() else { return };
+    let model = model();
+    if !std::path::Path::new(&model).is_dir() {
+        println!("  no checkpoint at {model}");
+        return;
+    }
+    let sh = Arc::new(Shards::open(&model).expect("shards"));
+    let cfg = Arc::new(TextConfig::from_file(&format!("{model}/config.json")).expect("config"));
+    let (group, threads, h) = (32usize, 8usize, cfg.hidden_size);
+    let vram: Vec<usize> = (0..cfg.num_experts).filter(|e| e % 8 < 3).collect();
+    let ram: Vec<usize> = (0..cfg.num_experts).filter(|e| e % 8 >= 3).collect();
+    let gpu = Arc::new(Mutex::new(g));
+
+    let toks = [15059usize, 9948, 271, 1024, 311, 4096, 264, 2594, 315, 17892, 374, 264, 1296, 13835, 5569, 315, 2670, 304, 2612, 553];
+    for layers in [&[0usize][..], &[3][..]] {
+        let plan = Plan {
+            layers: layers
+                .iter()
+                .map(|&l| LayerPlan {
+                    layer: l,
+                    resident: vram.clone(),
+                    pooled: ram.clone(),
+                    streamed: Vec::new(),
+                    bytes_expert: 0,
+                    dense_bytes: 0,
+                    dense_on_device: true,
+                })
+                .collect(),
+            device_bytes_used: 0,
+            device_bytes_budget: 0,
+            host_bytes_used: 0,
+            host_bytes_budget: 0,
+            host_dense_bytes: 0,
+            device_hit_rate: 0.0,
+            host_hit_rate: 0.0,
+            disk_rate: 0.0,
+            expert_bytes: 0,
+            dense_bytes_layer: 0,
+            ms_per_token: 0.0,
+            lm_head_ms: 0.0,
+            moe_device_ms: 0.0,
+            moe_host_ms: 0.0,
+            overlap_credit_ms: 0.0,
+        };
+        // `kv_cap` also sizes the RoPE table, and the 20-token chunk walks it to
+        // position 19.
+        let dev = Model::load_plan(&sh, cfg.clone(), &plan, group, threads, 32, 0, Some(gpu.clone()))
+            .expect("split stack");
+        // Twenty tokens put more expert chains through the slot budget than one
+        // wave holds, so the chunk has to break into two and still match.
+        chunk_matches_loop(&dev, &sh, h, &toks, &[1, 2, 6, 20], &format!("layers {layers:?} {} in VRAM", vram.len()), true);
+    }
 }

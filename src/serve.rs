@@ -35,7 +35,8 @@ const PREFILL_CHUNK: usize = 32;
 
 /// Where the token-by-token loop starts. The chunked prefill leaves the prompt
 /// in the layer states up to the last token, so the loop resumes there; a
-/// device tier has no batched path, and then the loop owns every prompt token.
+/// prompt too short to chunk has nothing for a batch to cover, and then the
+/// loop owns every prompt token.
 /// Getting this wrong is not slow, it is silent: the model answers the last
 /// prompt token as if it were the whole conversation.
 fn first_forward(prompt_len: usize, batched: bool) -> usize {
@@ -260,14 +261,26 @@ impl Server {
         // Prefill takes the prompt in chunks, one pass over the dense trunk per
         // chunk instead of one per token, and stops one token short so the
         // logits path below stays exactly where it was. Generation stays token
-        // by token: a new token is the argument to the next forward. Chunking
-        // the prompt is host-tier only - the gate below says why. Pulling the
-        // prompt off the device and running it through the host kernels measured
-        // 2166 ms against 1750 ms on the VRAM path, so the device tier keeps its
-        // own device path for the prompt even though it runs it one token at a
-        // time.
+        // by token: a new token is the argument to the next forward.
+        //
+        // Both tiers batch. The host tier runs the chunk through the CPU
+        // kernels; the device tier runs it through `prefill_device`, whose MoE
+        // groups a chunk's expert picks by expert once per chunk instead of once
+        // per token. The device tier used to sit this out: the first grouped
+        // union read 2166 ms against the token loop's 1750 ms, which was the
+        // union classifying each prompt expert by its first pick and running the
+        // host half of its dots on one core. Classifying every pick and threading
+        // the host half won the paired run at 34, 126 and 531 prompt tokens -
+        // both orders at each length, by 8.1-8.4 ms per prompt token
+        // (benchmarks/artifacts/raw/ab-2026-11-21-prefill-201/picklevel.json). Two
+        // disclosures from that same session: at 531 the arms generated different
+        // token counts, so its TTFT is not the same request on both sides (34 and
+        // 126 are), and at 126 the chunk decoded at 84.0 ms/token against the
+        // loop's 77.3, so a win here is a prompt-length win and says nothing about
+        // decode.
         let prompt_len = ids.len();
-        let batched = prompt_len > 1 && model.prefill_ready();
+        let on_device = model.prefill_device_ready();
+        let batched = prompt_len > 1;
         let first = first_forward(prompt_len, batched);
         if batched {
             let mut xs = vec![0f32; PREFILL_CHUNK.min(first) * h];
@@ -276,10 +289,16 @@ impl Server {
             while c0 < first {
                 let n = nrow.min(first - c0);
                 for (i, &id) in ids[c0..c0 + n].iter().enumerate() {
-            let row = model.embed_row(&self.shards, id as usize)?;
+                    let row = model.embed_row(&self.shards, id as usize)?;
                     xs[i * h..(i + 1) * h].copy_from_slice(&row);
                 }
-                model.prefill(&mut xs[..n * h], &mut st, c0);
+                if on_device {
+                    model
+                        .prefill_device(&mut xs[..n * h], &mut st, c0)
+                        .map_err(|e| format!("device prefill: {e}"))?;
+                } else {
+                    model.prefill(&mut xs[..n * h], &mut st, c0);
+                }
                 c0 += n;
             }
             crate::prof::split(first);
@@ -288,14 +307,6 @@ impl Server {
         for t in first..end {
             let mut x = model.embed_row(&self.shards, ids[t] as usize)?;
             model.forward(&mut x, &mut st, t);
-            // Only the chunked arm has a phase boundary of its own: a prompt run
-            // token by token would otherwise leave every prompt stage in the
-            // decode counters, and `prompt` would mean two different things in
-            // the two profiles being compared. One token short, same as
-            // `split(first)` above.
-            if !batched && t + 2 == prompt_len {
-                crate::prof::split(t + 1);
-            }
             if t + 1 < ids.len() {
                 continue;
             }
@@ -977,10 +988,10 @@ mod tests {
 
     #[test]
     fn a_plan_without_a_batched_path_walks_the_whole_prompt() {
-        // This is the device tier: `prefill_ready` is false because the dense
-        // projections live in VRAM, so starting the loop at the last prompt
-        // token would drop everything before it. The output stays fluent and
-        // the TTFT looks wonderful, which is why the bound is a named function.
+        // Nothing was prefilled, so the loop starts at token 0 and owns every
+        // prompt token. Getting this wrong is not slow, it is silent: the model
+        // answers the last prompt token as if it were the whole conversation,
+        // which is why the bound is a named function and not an inline `min`.
         for prompt_len in [0usize, 1, 2, 30, 4096] {
             assert_eq!(first_forward(prompt_len, false), 0, "{prompt_len} tokens");
         }
