@@ -63,38 +63,41 @@ The routing pipeline:
 
 ### Batched GPU Prefill
 
-`Model::prefill_device` (`src/model.rs:3247`) runs a chunk of prompt tokens through the
+`Model::prefill_device` (`src/model.rs:4510`) runs a chunk of prompt tokens through the
 layers in batches, so a weight block is read once for the chunk instead of once per token:
 
 - **Batched operations** (GPU): RMSNorm, AXPY residual, GDN projections (5× per layer),
   Attention projections (4× per layer) - the five `*_batch.comp` shaders
-- **Grouped expert union**: host experts grouped by ID across the chunk, one pass per
-  unique expert (`MoeLayer::prefill_device_grouped`, `src/model.rs:1304`)
-- **Device expert fallback**: a token with any VRAM-resident pick leaves the union and
-  takes the per-token forward - the union splits by token, not by pick
-- **Status**: built and numerically checked against the token loop, reached from the
-  tests, and **not served**. The `let batched` gate in `src/serve.rs` batches only on the
-  host-tier `prefill_ready()`; the mutex re-lock and the overlapping scratch arena that
-  used to block this path are fixed. What keeps the device tier out is measurement: a
-  25-token prompt prefilled in 2.014-2.120 s chunked against 1.419-1.540 s as 25 per-token
-  device forwards, +0.57 to +0.64 s in 4 of 4 ABBA rounds with both orders agreeing, on
-  2026-11-15.
-- **Why it lost, and what would fix it**: on a tier with this much of the stack in VRAM
-  almost every prompt token has at least one device expert, so it leaves the union and
-  runs the device chain one at a time anyway. The chunk pays the arena round-trips and the
-  union bookkeeping without amortising the host-expert work that dominates its own prompt
-  profile. The lever is a **pick-level** union (batch host picks across all prompt tokens,
-  or keep the chunk resident on-device); flip the gate after that, not before.
+- **Pick-level expert union**: every pick in the chunk is classified on its own
+  (`MoeLayer::prefill_device_grouped`, `src/model.rs:1722`) - a VRAM-resident pick records
+  once into the device wave, a host-pool pick joins one batch-union run across the worker
+  pool, a cold pick streams. The first version unioned by *token*, so any token with one
+  device pick ran its whole expert chain alone inside the chunk and paid for both.
+- **Served on CUDA**: the device arm of the `let batched` gate in `src/serve.rs` is
+  `Model::prefill_device_chunked` (`src/model.rs:4540`), which says CUDA. Chunking there
+  beat the per-token device loop by 8.1-8.4 ms per prompt token at 34, 126 and 531 tokens,
+  both orders at every length. The host tier batches through `Model::prefill` on any
+  backend.
+- **Not served on Vulkan**: the same script, same binary, `--backend vulkan`, at the
+  served 34-token prompt read 1.845 s per-token against 2.779 s chunked - 27.5 ms per
+  prompt token *slower*, +0.730 s in one order and +0.987 s in the other, decode step
+  unmoved at 68.6 against 69.1 ms/token. That tier keeps the per-token path.
+- **Why the two tiers disagree is not measured.** Something the chunk does through SPIR-V
+  costs what the same work does not cost through the CUDA driver, and no stage counter
+  separates them yet. Both arms come from `engine-bench/ab/prefill201-picklevel-ab.py`,
+  which is the instrument to re-run once there is a hypothesis worth pricing.
 
 ## Performance
 
-Every number in this section comes from **one session on one box**: RTX 4060 Laptop
-+ Core Ultra 7 155H, 21-22 GB free, every lane capped at 8 threads, 32768-token
-context, 64-token greedy budget, `serve` plus one streaming `/v1/chat/completions`
-request per visit, two full-length requests discarded as warm-up before any median.
-Model `qwen36-35b` (22.78 GiB, 43 int4-packed shards), session `2026-11-21T01:39Z`.
-The table is generated from the session file: `python benchmarks/results.py sync`
-rewrites it, so typing a number into it changes nothing.
+Every number in this section comes from **one box**: RTX 4060 Laptop + Core Ultra 7 155H,
+21-22 GB free, every lane capped at 8 threads, 32768-token context, 64-token greedy
+budget, `serve` plus one streaming `/v1/chat/completions` request per visit, two
+full-length requests discarded as warm-up before any median. Model `qwen36-35b`
+(22.78 GiB, 43 int4-packed shards). Each row names the session it was measured in, and a
+verdict is only ever drawn inside one session: two rows from different sessions are
+levels, not a ranking of each other. The table is generated from the session files:
+`python benchmarks/results.py sync` rewrites it, so typing a number into it changes
+nothing.
 
 Two protocols appear here and they answer different questions:
 
@@ -112,18 +115,19 @@ Two protocols appear here and they answer different questions:
 | Lane | Session | Fennec | Comparator | Result |
 |---|---|---|---|---|
 | CPU decode | `2026-11-21T01:39:40Z` | **143.6 ms/token** | Colibri 169.4 ms/token | **Fennec faster** - 15.2% median gap against a 14.6% run-to-run spread, ahead in 4 of 4 paired rounds |
-| Vulkan decode | `2026-11-21T01:39:40Z` | **66.0 ms/token** | Colibri 84.7 ms/token | **Fennec faster** - 22.1% median gap against a 14.5% run-to-run spread, ahead in 4 of 4 paired rounds |
-| Served time to first token (device tier) | `2026-11-21T01:39:40Z` | **2.094 s** | Colibri 1.125 s | **behind** - task #191 settled the chunked route by measurement: serving `prefill_device` cost +0.57 to +0.64 s over the per-token device path (ABBA 4 of 4, both orders, session 2026-11-15T20:24Z), so `serve` is behind the host-tier gate until the expert union splits by pick rather than by token (#201) |
-| CUDA decode vs Strata (ctx 8192) | `2026-11-21T16:55:37Z` | **60.4 ms/token** | Strata 36.6 ms/token | **behind** - Strata's drafter, not a faster kernel, buys it 1.53x on this box: the cell that changed nothing but `--mtp` measured 23.81 ms/token with it and 36.46 without (engine-bench/raw/strata-mtp-attribution.json), on a draft block Fennec's own checkpoint already carries unread - 529 `mtp.*` tensors, 0.50 GiB, `mtp_num_hidden_layers: 1` - and no code path uses (#482). The residual is per-pass cost, 36.46 against Fennec's 60.4 with speculation off, which is the host expert read #464 found issue-limited. Three disclosures: every Strata token came back in `reasoning_content` instead of the answer field; it needed a `{% generation %}` chat-template pack plus 81.9 s of cold start against Fennec's 24.0 s; and the attribution cell ran alone while this row is paired, so its ratio travels and its levels do not. |
+| Vulkan decode | `2026-11-21T20:22:21Z` | **67.6 ms/token** | Colibri 58.4 ms/token | **behind** - 15.7% median gap against a 5.0% run-to-run spread, 4 of 4 paired rounds to Colibri; coverage is counted now, and it does not carry this gap. The harness snapshots each engine's own expert counters on every visit: Fennec answers a median of 20,514 of 31,040 routed picks on the card (66.1%, `results-backend-matrix.vulkan-experts-2026-11-21T2122Z.json`; 66.4% in the paired session below), where Colibri's log accounts `device 23503 of 33600 routed experts (69.9%)`. Each engine counts its own turn, so the percentages compare and the counts do not, and 3.5 points moved off the host lane is a tenth of a 33.6-point host share - about 1.4 ms of this 9.2 ms/token on the engine's own lane bill, which is the arithmetic #436 exists to replace with a measurement. That estimate is why #471 (the int8 trunk Colibri uses to buy its extra slots: `362 matrices resident, 1863.9 MiB; placed int8 291` against Fennec's `dense 68.2 MiB/layer` in f16) is no longer the headline for this row. The direct proof that coverage is not the term: the 2026-11-15 build (`e4d0ec9`) was rebuilt and paired against the current tree in ONE session, and the current tree was 14.135 ms/token faster - 67.460 against 81.841, 4 of 4 rounds, both orders agreeing - with their pick counts 26 apart out of 31,040 (20,597 against 20,623, both 66.4%), in benchmarks/artifacts/raw/ab-2026-11-21-binaries-vulkan/. What separated those arms is how much of the card the plan committed (6.46 of 7.77 GiB total against 5.30 of 6.60 GiB free, i.e. #460), not what was on it. So the same pair also closes the other candidate this row carried - that Fennec's level had fallen 17.9% since the 57.302 ms/token session - because that figure does not reproduce on the binary that printed it and a level does not cross sessions. What is left is per-pass cost and concurrency: Colibri hides its host lane (`waited 123.3 ms (91% of device time hidden)`) while Fennec's plan bills 14.31 ms of cpu lane with 1.19 ms of it concurrent (#437), and the kernels underneath both lanes are the Vulkan f16 gemv and f32 GDN residual of #472. |
+| Served time to first token (device tier) | `2026-11-21T20:22:21Z` | **1.992 s** | Colibri 0.797 s | **behind** - 149.9% median gap against a 9.7% run-to-run spread, 4 of 4 paired rounds to Colibri; the prompt still goes through this tier one token at a time, and that is a measured choice: the batched device chunk served on CUDA (8.1-8.4 ms off every prompt token at 34, 126 and 531 tokens, both orders) lost the identical run on Vulkan by 27.5 ms per prompt token at the served length, +0.730 s in one order and +0.987 s in the other, with its decode step unmoved (benchmarks/artifacts/raw/ab-2026-11-21-prefill-201-vulkan/picklevel.json), so `Model::prefill_device_chunked` answers CUDA and not the tier test. Colibri instead runs the prompt as one batched step - its log says `a step of 36 rows` for a 36-token prompt - so each expert it reads serves the whole prompt. Why the chunk pays on SPIR-V what it does not pay through the CUDA driver is not measured. |
+| CUDA decode vs Strata (ctx 8192) | `2026-11-21T20:53:29Z` | **58.9 ms/token** | Strata 38.6 ms/token | **parity, not a win** - 52.7% gap sits inside the 58.6% spread of the same pair (0/4 rounds to Fennec); the gap left after speculation is per-pass cost. #481 priced Strata's drafter at 1.53x - the cell that changed nothing but `--mtp` measured 23.81 ms/token with it and 36.46 without (engine-bench/raw/strata-mtp-attribution.json) - and the drafter is on in this row (`drafts accepted 43 of 44 (length)`, Strata's own accounting), yet the paired cell reads 38.6 ms/token against Fennec's 58.9, i.e. its un-speculated level, over four visits spread 29.5 to 52.3. What is on the table is therefore the host expert read #464 found issue-limited rather than bandwidth-limited, plus a draft block Fennec's own checkpoint already carries unread - 529 `mtp.*` tensors, 0.50 GiB, `mtp_num_hidden_layers: 1` - that no code path uses (#482). Two disclosures: every Strata token came back in `reasoning_content` instead of the answer field, and it needed a `{% generation %}` chat-template pack plus 81.3 s of cold start against Fennec's 28.5 s. The attribution cell ran alone while this row is paired, so its ratio travels and its levels do not. |
 | CUDA decode vs llama.cpp | `2026-11-21T01:39:40Z` | **65.2 ms/token** | llama.cpp 47.9 ms/token | both rows are block medians of the same session, so this is a level difference and not an ABBA verdict; llama.cpp reads a Q4_K_M GGUF of the checkpoint while Fennec reads the suite's int4 container, which is the first thing to hold constant before calling it a kernel gap (open as task #459) |
 
-Every row is re-derived from the ABBA session file it names; the medians are the median of paired visits after two discarded full-length warm-ups, and the spread is the run-to-run range of the same pair on this box. Sources: `results-backend-matrix.abba-2026-11-15T0941Z.json`, `results-backend-matrix.abba-vulkan-postkernel-2026-11-15T1047Z.json`, `results-backend-matrix.abba-2026-11-21T0139Z.json`, `results-backend-matrix.abba-2026-11-21T1655Z.json`, `results-backend-matrix.blocked-2026-11-21T1830Z.json`.
+Every row is re-derived from the ABBA session file it names; the medians are the median of paired visits after two discarded full-length warm-ups, and the spread is the run-to-run range of the same pair on this box. Sources: `results-backend-matrix.abba-2026-11-15T0941Z.json`, `results-backend-matrix.abba-vulkan-postkernel-2026-11-15T1047Z.json`, `results-backend-matrix.abba-2026-11-21T0139Z.json`, `results-backend-matrix.abba-2026-11-21T1655Z.json`, `results-backend-matrix.blocked-2026-11-21T1830Z.json`, `results-backend-matrix.abba-vulkan-tokengate-2026-11-21T2022Z.json`, `results-backend-matrix.abba-cuda-chunk-2026-11-21T2053Z.json`.
 <!-- /fennec-results:bench -->
 
 ### Fennec against llama.cpp 1.0.0
 
-llama.cpp is the first engine measured here that beats Fennec, and it does it on
-CUDA: **47.9 ms/token against Fennec's 65.2** in the same session. That is a level
+llama.cpp is one of three engines measured here that beat Fennec on at least one lane
+(the other two are Strata on CUDA and, in the paired row above, Colibri on Vulkan), and
+it does it on CUDA: **47.9 ms/token against Fennec's 65.2** in the same session. That is a level
 difference between two block rows, not a verdict, and the two engines are not reading
 the same bytes - llama.cpp loads a Q4_K_M GGUF of the checkpoint while Fennec loads
 the suite's int4 container. Holding that constant is the first step of the open CUDA
@@ -184,12 +188,15 @@ A missing column is not a tie. These were attempted and could not run on this bo
 
 ### Still open, measured
 
-- **Served time to first token trails Colibri on the device tier** (the `loss` row in
-  the table above). The served path prefills token by token on purpose: the batched
-  `prefill_device` was wired in and measured **worse** - +0.57 to +0.64 s over the
-  per-token device path, 4 of 4 ABBA rounds with both orders agreeing, session
-  `2026-11-15T20:24Z` - so the gate went back to the host tier until the expert union
-  splits by pick rather than by token.
+- **Served time to first token trails Colibri on the Vulkan tier** (the `loss` row in
+  the table above). The batched device prompt is now wired into `serve` and served where
+  it won: CUDA took 8.1-8.4 ms off every prompt token at 34, 126 and 531 tokens, both
+  orders. Vulkan refused the same chunk in the same script - 27.5 ms per prompt token
+  *slower* at the served length, both orders - so its gate stays on the per-token loop,
+  and that loop pays a full expert read per prompt token. Colibri does not: its own log
+  describes the prompt as one step of 36 rows, so the weight it reads serves 36 tokens.
+  **Why the chunk costs time on SPIR-V and buys it through the CUDA driver is not
+  measured** - that is the open question, and the next TTFT lever on this tier.
 - **The CUDA decode deficit against llama.cpp**, described above.
 - **Kernel headroom on Vulkan**: the device-timing probe
   `tests/gpu.rs::mixer_kernel_shapes` - `#[ignore]`d, so it runs under
@@ -345,7 +352,7 @@ Fennec includes a BPE tokenizer id-for-id identical to Hugging Face:
 > - **Apple Metal**: Compile-verified but not performance-measured
 > - **NPU DirectML**: Refused by driver; use OpenVINO backend instead
 > - **Chat template**: Missing think opener (Colibri emits `\n\n`, Fennec emits nothing)
-> - **Served device prefill**: the batched device path is built but not wired into `serve`, so device TTFT trails Colibri (see Performance)
+> - **Served device prefill**: the batched device path is served on CUDA and withheld on Vulkan, where the same paired run measured it 27.5 ms/prompt-token slower; Vulkan device TTFT therefore trails Colibri (see Performance)
 
 ## Project Structure
 
