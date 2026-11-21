@@ -88,64 +88,120 @@ layers in batches, so a weight block is read once for the chunk instead of once 
 
 ## Performance
 
-Decode on `qwen36-35b`, measured against
-[Colibri](https://github.com/JustVugg/colibri) on the same box inside one session
-(RTX 4060 Laptop + Core Ultra 7 155H, 21-22 GB free, 8 threads, 32768-token
-context, 64-token greedy budget, session `2026-11-15T09:28Z`).
+Every number in this section comes from **one session on one box**: RTX 4060 Laptop
++ Core Ultra 7 155H, 21-22 GB free, every lane capped at 8 threads, 32768-token
+context, 64-token greedy budget, `serve` plus one streaming `/v1/chat/completions`
+request per visit, two full-length requests discarded as warm-up before any median.
+Model `qwen36-35b` (22.78 GiB, 43 int4-packed shards), session `2026-11-21T01:39Z`.
+The table is generated from the session file: `python benchmarks/results.py sync`
+rewrites it, so typing a number into it changes nothing.
 
-Each lane was measured **alternately** - Colibri, Fennec, then Fennec, Colibri -
-one request per visit after two discarded full-length warm-ups, four rounds.
-Block-ordering the two engines puts the box's own drift inside the gap being
-measured: the same unchanged Fennec binary has read 85.1 ms/token in one block
-session and 121.3 in another. So the verdict below is the per-round difference,
-which is what both orders agree on, and the levels are each engine's median over
-its four visits.
+Two protocols appear here and they answer different questions:
 
-| Lane | Fennec | Colibri | Per-round result |
-|------|--------|---------|------------------|
-| **CPU** | **115.6 ms/token** (8.77 tok/s) | 137.4 ms/token (7.75 tok/s) | **Fennec faster in 4 of 4 rounds, by 10.9-16.3% (median 13.7%)** |
-| **CPU+GPU (Vulkan)**, int4 kernel before the swap | 68.7 ms/token (14.61 tok/s) | **66.2 ms/token** (15.94 tok/s) | Colibri faster in 4 of 4 rounds, by 3.8-12.7% (median 7.3%) |
-| **CPU+GPU (Vulkan)**, int4 kernel after the swap, session `2026-11-15T10:47Z` | 57.3 ms/token (17.61 tok/s) | 57.5 ms/token (17.68 tok/s) | Fennec faster in 3 of 4 rounds, median delta -0.24 ms/token — **the two orders disagree, so this is parity, not a win** |
+- **ABBA paired** - Fennec and one comparator alternate inside the session, four
+  rounds, both orders. This puts the box's own drift inside the gap being measured:
+  the same unchanged binary has read 85.1 ms/token in one block session and 121.3 in
+  another. A lane names a winner only when the `ab` and `ba` orders land on the same
+  side; when they disagree, the verdict is parity.
+- **Block** - each engine measured back to back in its own half of the session. Block
+  rows rank against other block rows and never against a paired row.
 
-- **The CPU lane is a win**, and it is the lane that decides machines without a
-  usable GPU: 8.77 against 7.75 tok/s at the same 8-thread cap.
-- **The Vulkan deficit is gone.** Swapping `gemv_q4.comp` to eight lanes per row
-  removed the consistent +4.7 ms/token that the 09:28Z session measured; the
-  re-run sits on top of Colibri's level. It is not a win: `ab` read +3.2 ms and
-  `ba` read -1.5 ms, and the protocol requires both orders to agree before a
-  winner is named. There is still known room: the device-timing probe
+### Fennec against Colibri
+
+<!-- fennec-results:bench -->
+| Lane | Session | Fennec | Comparator | Result |
+|---|---|---|---|---|
+| CPU decode | `2026-11-21T01:39:40Z` | **143.6 ms/token** | Colibri 169.4 ms/token | **Fennec faster** - 15.2% median gap against a 14.6% run-to-run spread, ahead in 4 of 4 paired rounds |
+| Vulkan decode | `2026-11-21T01:39:40Z` | **66.0 ms/token** | Colibri 84.7 ms/token | **Fennec faster** - 22.1% median gap against a 14.5% run-to-run spread, ahead in 4 of 4 paired rounds |
+| Served time to first token (device tier) | `2026-11-21T01:39:40Z` | **2.094 s** | Colibri 1.125 s | **behind** - task #191 settled the chunked route by measurement: serving `prefill_device` cost +0.57 to +0.64 s over the per-token device path (ABBA 4 of 4, both orders, session 2026-11-15T20:24Z), so `serve` is behind the host-tier gate until the expert union splits by pick rather than by token (#201) |
+| CUDA decode vs llama.cpp | `2026-11-21T01:39:40Z` | **65.2 ms/token** | llama.cpp 47.9 ms/token | both rows are block medians of the same session, so this is a level difference and not an ABBA verdict; llama.cpp reads a Q4_K_M GGUF of the checkpoint while Fennec reads the suite's int4 container, which is the first thing to hold constant before calling it a kernel gap (open as task #459) |
+
+Every row is re-derived from the ABBA session file it names; the medians are the median of paired visits after two discarded full-length warm-ups, and the spread is the run-to-run range of the same pair on this box. Sources: `results-backend-matrix.abba-2026-11-15T0941Z.json`, `results-backend-matrix.abba-vulkan-postkernel-2026-11-15T1047Z.json`, `results-backend-matrix.abba-2026-11-21T0139Z.json`.
+<!-- /fennec-results:bench -->
+
+### Fennec against llama.cpp 1.0.0
+
+llama.cpp is the first engine measured here that beats Fennec, and it does it on
+CUDA: **47.9 ms/token against Fennec's 65.2** in the same session. That is a level
+difference between two block rows, not a verdict, and the two engines are not reading
+the same bytes - llama.cpp loads a Q4_K_M GGUF of the checkpoint while Fennec loads
+the suite's int4 container. Holding that constant is the first step of the open CUDA
+task; the second is llama.cpp's `-cmoe` device-expert cache, whose variant measured here
+(`-ngl 99 -cmoe --moe-cache-mib 3584`) produced a 455.4 ms/token Vulkan row against plain
+auto-placed llama.cpp's 416.2 in the same session, so it bought nothing on this card and
+#461 closed it without porting. The gap is not one run's drift: the earlier block session
+`2026-11-21T01:20:01Z` on the same box read llama.cpp 45.9 against Fennec 61.3 ms/token,
+two block rows again, and that table survives in
+`engine-bench/logs/session-2026-11-21T0220.log`.
+
+On the lane where both engines take the same weights through their own auto planner,
+llama.cpp's Vulkan rows are far behind Fennec because its fitter put 14.4 GiB of the
+model in `CPU_Mapped` and left 5.2 GiB on the card: 416.2 and 455.4 ms/token against
+Fennec's 66.0. That pair is not the same protocol either (Fennec's Vulkan row is a
+paired median, llama.cpp's are block medians), so it is quoted as a level difference
+and not an ABBA verdict - a 6x gap is well outside what the protocol distinction moved
+anywhere else in this session. The same caution rules the CPU lane: llama.cpp's
+block row of `2026-11-21T01:39:40Z` reads 131.7 ms/token against Fennec's paired
+143.6, and because the two are different protocols that lane is recorded as unmeasured
+rather than as a tie.
+
+![Engine matrix overview](docs/matrix-overview.png)
+
+![Decode throughput](docs/matrix-decode.png)
+
+![Time to first token](docs/matrix-ttft.png)
+
+![Time per output token](docs/matrix-tpot.png)
+
+![Head latency](docs/matrix-head.png)
+
+![Total request time](docs/matrix-total.png)
+
+![Cold start](docs/matrix-coldstart.png)
+
+Each row's device is proved by a line quoted from that engine's own log, and the
+llama.cpp rows quote the memory split from a `-lv 4` run of the same argv on the same
+box - a placement captured with a different amount of free memory is a different
+statement, so the free-RAM figure is printed beside it.
+
+### Cells with no number
+
+A missing column is not a tie. These were attempted and could not run on this box:
+
+- **rabbit** - retired from the matrix by instruction on 2026-11-15; its last rows
+  stay in the archived session files and are never quoted as current.
+- **Colibri on CUDA** - its `qwen36.exe` carries no `coli_cuda.dll`, so `--gpu` exits
+  with "the engine binary is CPU-only". Building that tier needs nvcc and an MSVC
+  host compiler, neither of which is installed.
+- **Basalt** - needs an NVIDIA Blackwell (sm_120) device, the CUDA 13 runtime and
+  `.basalt` packs. This box has sm_89 and no pack exists for either suite model.
+- **Strata** - its `strata.exe` loads `cublas64_13.dll` at start and dies with
+  0xC0000135 without VS 2022 + CUDA Toolkit 13; its shipped launch configs are
+  Edge0-120B/145B only.
+- **Maple** - `deepgrove/maple-preview` is a 20B-A1B ternary MoE *model*, not an
+  engine: there is no server to launch and no flag to align with the other rows.
+
+### Still open, measured
+
+- **Served time to first token trails Colibri on the device tier** (the `loss` row in
+  the table above). The served path prefills token by token on purpose: the batched
+  `prefill_device` was wired in and measured **worse** - +0.57 to +0.64 s over the
+  per-token device path, 4 of 4 ABBA rounds with both orders agreeing, session
+  `2026-11-15T20:24Z` - so the gate went back to the host tier until the expert union
+  splits by pick rather than by token.
+- **The CUDA decode deficit against llama.cpp**, described above.
+- **Kernel headroom on Vulkan**: the device-timing probe
   `tests/gpu.rs::mixer_kernel_shapes` - `#[ignore]`d, so it runs under
-  `cargo test --release --offline --test gpu -- --ignored`, and it prints rather
-  than asserts, so these are one run's levels rather than a fixed pair - read
-  1134.1 us for one GDN layer's mixer as seven separate dispatches against
-  446.4 us as one barrier-free submit on 2026-11-15. Across the 30 GDN layers in
-  a token that is 35.4 ms against 13.4 ms.
-- Fennec's CUDA lane measured 56.5 ms/token (17.69 tok/s) later in the 09:28Z
-  session, block-ordered. Colibri has no CUDA tier on this box (its `qwen36.exe`
-  carries no `coli_cuda.dll`), so that cell is recorded as unavailable with the
-  evidence rather than as a comparator, and 56.5 ms is not a like-for-like number
-  against the two paired levels above.
-- Time to first token still favours Colibri when a device is attached: 1.42 s
-  against 0.67 s on the same 27-token prompt (64-token budget, ctx 32768) in the
-  10:47Z session. The served device tier prefills token by token on purpose: the
-  batched `prefill_device` was served and measured **worse** - 2.014-2.120 s
-  against 1.419-1.540 s for the same 25-token prompt, +0.57 to +0.64 s in 4 of 4
-  ABBA rounds with both orders agreeing - so the gate is back on the host tier
-  until the expert union splits by pick rather than by token. This is the open
-  item, not a closed one.
-
-Earlier builds of this engine measured 154.5 ms/token on the CPU lane and 73.2 on
-Vulkan. Both came from their own sessions, so against today's paired levels they
-are indicative of the direction and size of the kernel work - the int8 host trunk,
-the four-accumulator int4 host-expert dot, the vectorised half-precision head, and
-the hardware-f16 shader path - rather than exact deltas.
+  `cargo test --release --offline --test gpu -- --ignored`, and it prints rather than
+  asserts, so these are one run's levels rather than a fixed pair - read 1134.1 us for
+  one GDN layer's mixer as seven separate dispatches against 446.4 us as one
+  barrier-free submit on 2026-11-15. Across the 30 GDN layers in a token that is 35.4 ms
+  against 13.4 ms.
 
 > [!NOTE]
-> Quote the paired per-round result, never a level carried over from another
-> session. Two engines measuring at once, or two block sessions on an otherwise
-> quiet box, move CPU-lane medians by tens of ms/token - enough to flip a verdict.
-> CUDA requires NVIDIA drivers; Vulkan works on any compatible GPU; CPU mode uses
-> AVX2 int4 and int8 kernels.
+> Quote the paired per-round result, never a level carried over from another session,
+> and never rank a block row against a paired row. CUDA requires NVIDIA drivers;
+> Vulkan works on any compatible GPU; CPU mode uses AVX2 int4 and int8 kernels.
 
 ## Hardware Support
 
@@ -326,5 +382,6 @@ MIT License - see LICENSE file for details.
 
 **1.0.0** - the working version in `Cargo.toml`. Nothing at 1.0.0 has been published:
 this repo carries no tags and no releases, and the published Fennec ladder (`v0.1.0` …
-`v0.9.0`, newest 2026-11-11T19:29Z) lives in the nine suite repos. Measured on this tree
-2026-11-15: `cargo test --release --offline` -> 119 passed, 0 failed, 3 ignored.
+`v0.9.0`, newest 2026-11-11T19:29Z) lives in the nine suite repos. The test count above
+is generated from the suite's results hub, so it is the current run of
+`cargo test --release --offline` on this tree rather than a remembered one.

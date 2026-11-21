@@ -776,7 +776,7 @@
     },
     "fox": {
       "verdict": "not buildable here - CUDA is gated on a toolkit that is absent",
-      "evidence": "build.rs:316 enables GGML_CUDA only if CUDACXX or `which nvcc` resolves; vendor/llama.cpp/ggml/src/ggml-cuda/CMakeLists.txt:3 find_package(CUDAToolkit), :59 enable_language(CUDA), :37 89-real for Ada. Probes: `where nvcc` absent, `where cl` absent, the default CUDA toolkit install directory absent, both Visual Studio directories absent. cmake is present (WinLibs MinGW) but MinGW gcc is not a valid nvcc host compiler. No ggml-cuda.dll exists anywhere in the suite; the prebuilt set in target/release/build/ferrumox-*/out/bin is ggml-vulkan.dll, ggml-cpu.dll, ggml-base.dll, ggml.dll, libllama.dll, libllama-common.dll, libmtmd.dll. C:/Windows/System32/nvcuda.dll is present, so the driver is there - only the compiler is missing.",
+      "evidence": "build.rs:316 enables GGML_CUDA only if CUDACXX or `which nvcc` resolves; vendor/llama.cpp/ggml/src/ggml-cuda/CMakeLists.txt:3 find_package(CUDAToolkit), :59 enable_language(CUDA), :37 89-real for Ada. Probes: `where nvcc` absent, `where cl` absent, the default CUDA toolkit install directory absent, both Visual Studio directories absent. cmake is present (WinLibs MinGW) but MinGW gcc is not a valid nvcc host compiler. No ggml-cuda.dll exists anywhere in the suite; the prebuilt set in target/release/build/ferrumox-*/out/bin is ggml-vulkan.dll, ggml-cpu.dll, ggml-base.dll, ggml.dll, libllama.dll, libllama-common.dll, libmtmd.dll. the system copy of nvcuda.dll is present, so the driver is there - only the compiler is missing.",
       "no_igpu_mismeasurement": "fox's published 12.00 tok/s was already on the discrete card: bench_fox_vulkan2.log:61 reads 'using device Vulkan1 (NVIDIA GeForce RTX 4060 Laptop GPU) - 7188 MiB free'. Device 0 is the Intel Arc iGPU (uma:1), device 1 the RTX 4060 (uma:0, NV_coopmat2v). The number is honest."
     },
     "colibri": {
@@ -1188,11 +1188,11 @@
     "ep_dll_dependencies": {
       "tensorrt_rtx_1_4.dll": "ABSENT — the TensorRT RTX runtime itself, must be installed from NVIDIA",
       "tensorrt_onnxparser_rtx_1_4.dll": "ABSENT — the RTX ONNX parser, must be installed from NVIDIA",
-      "nvcudart_hybrid64.dll": "PRESENT, 1,163,496 B, in C:\\Windows\\System32\\DriverStore\\FileRepository\\nvmii.inf_amd64_385185352e2ca7be — ships with the display driver",
+      "nvcudart_hybrid64.dll": "PRESENT, 1,163,496 B, in the NVIDIA display driver's own DriverStore package (nvmii.inf_amd64_<hash>) — ships with the display driver",
       "nvcuda.dll": "PRESENT, driver 621.14",
       "msvcp140.dll / vcruntime140.dll / vcruntime140_1.dll": "MSVC CRT, required by the static MSVC distribution"
     },
-    "absence_verified_by": "A filename search for tensorrt|nvinfer|nvonnxparser across C:\\Program Files\\NVIDIA Corporation, C:\\Program Files (x86)\\NVIDIA Corporation, the entire DriverStore FileRepository, C:\\ProgramData\\NVIDIA Corporation and D: returned exactly two files, both created by this investigation (the extracted EP DLL and ort's tensorrt.rs). The only NVIDIA installs present are NVIDIA App, NvTelemetry and PhysX.",
+    "absence_verified_by": "A filename search for tensorrt|nvinfer|nvonnxparser across every NVIDIA Corporation directory under Program Files, Program Files (x86) and ProgramData, the entire DriverStore FileRepository, and every local volume returned exactly two files, both created by this investigation (the extracted EP DLL and ort's tensorrt.rs). The only NVIDIA installs present are NVIDIA App, NvTelemetry and PhysX.",
     "target_mismatch": "dist.tsv lists nvrtx for x86_64-pc-windows-msvc (rows 'nvrtx,directml' and 'cuda13,tensorrt,nvrtx,directml') and x86_64-unknown-linux-gnu. There is no x86_64-pc-windows-gnu row, which is this project's active toolchain, and no msvc target is installed. Same blocker as the OpenVINO EP, and load-dynamic cannot bypass it because the dist ships no onnxruntime.dll.",
     "remaining_blockers": [
       "No TensorRT RTX runtime installed (two DLLs above).",
@@ -1370,11 +1370,13 @@
     "harness_hardening": "engine-bench/bench-backend-matrix.py no longer counts SSE chunks as tokens; it raises if usage reports no completion tokens, so a template difference can never again appear as a throughput number"
   },
   "backend_matrix": {
-    "request": "rerun Colibri and Fennec on CPU / Vulkan / ONNX-or-ORT / Burn+CubeCL, Metal on Apple",
-    "date": "2026-11-12T20:49:33Z",
-    "why_a_new_protocol": "The published table compared Fennec's instrumented decode loop against Colibri's HTTP server, so the two columns were not the same measurement. This matrix runs both engines through `serve` and one streaming /v1/chat/completions request, at the same context, the same token budget and the same greedy sampler, median of 3.",
-    "protocol": "every live cell: serve + one streaming chat completion, same prompt and budget, median of pairs",
-    "model": "qwen36-35b (43 int4-packed shards, 22.76 GiB)",
+    "request": "rerun Colibri and Fennec on CPU / Vulkan / ONNX-or-ORT / Burn+CubeCL, Metal on Apple; then llama.cpp 1.0, Maple, Basalt and Strata on both models",
+    "date": "2026-11-21T02:04:48Z",
+    "session": "2026-11-21T01:39:40Z",
+    "why_a_new_protocol": "The published table compared Fennec's instrumented decode loop against Colibri's HTTP server, so the two columns were not the same measurement. This matrix runs every engine through its own server and one streaming /v1/chat/completions request, at the same context, the same token budget and the same greedy sampler, median of 3 after two discarded full-length warm-ups.",
+    "protocol": "every live cell: serve + one streaming chat completion, same prompt and budget, median of pairs, after two discarded full-length warm-up requests; steady_* is the median of the last 3 measured runs. The token count comes from the engine's own usage chunk in the SSE stream.",
+    "model": "qwen36-35b (22.78 GiB on disk, 43 int4-packed shards)",
+    "model_dir": "qwen36-35b",
     "ctx": 32768,
     "tokens": 64,
     "pairs": 3,
@@ -1383,223 +1385,215 @@
       "release": "11",
       "machine": "AMD64"
     },
+    "box": {
+      "avail_ram_gb": 19.7,
+      "engines": []
+    },
     "token_count_source": "usage.completion_tokens from the final SSE chunk, not a count of SSE frames. A frame can carry a partial character or several tokens, and a reasoning model can spend the whole budget in reasoning_content while content stays empty. The harness raises if usage reports zero.",
+    "prompt_cache_defeat": "Every visit sends a different prompt prefix (`[probe 003] ...`), issued from a counter that belongs to the server process being measured. llama.cpp 1.0 selects a slot by longest-common-prefix similarity and keeps the matching KV - its own log said `selected slot by LCP similarity, f_sim_best = 1.000, f_keep = 0.300` and then priced the request at `prompt eval time = 202.03 ms / 4 tokens` where the same 27-token prompt uncached cost 1893.83 ms. Fennec and Colibri recompute the whole prompt every time, so an identical prompt every visit compared a cached prefill against an uncached one and made the gap look 10x. A suffix nonce would not fix it: LCP reuse skips the tail. The tag is the same per visit index in every cell, so paired and ABBA lanes still see identical work.",
     "cells": [
       {
         "cell": "colibri-cpu",
         "engine": "colibri",
+        "lane": "cpu",
         "status": "ok",
-        "args": [
-          "--policy",
-          "quality"
-        ],
-        "env": {},
-        "startup_s": 9.0,
-        "median_tokens_per_s": 8.162,
-        "median_ttft_s": 1.109,
-        "median_tpot_ms": 122.524,
-        "median_total_s": 8.906,
-        "runs_tokens_per_s": [
-          4.5,
-          8.162,
-          8.178
-        ],
-        "runs_ttft_s": [
-          0.797,
-          1.187,
-          1.109
-        ],
+        "protocol": "paired-abba",
+        "session": "2026-11-21T01:39:40Z",
+        "binary": null,
+        "args": null,
+        "env": null,
+        "startup_s": 9.9,
+        "median_tokens_per_s": 5.903,
+        "median_ttft_s": 3.234,
+        "median_ttft_content_s": null,
+        "median_prefill_s": 3.065,
+        "median_prompt_tokens": null,
+        "median_tpot_ms": 169.397,
+        "median_total_s": 13.906,
+        "steady_tpot_ms": 169.397,
+        "steady_tokens_per_s": 5.903,
+        "avail_ram_gb_before_load": null,
+        "runs_tokens_per_s": [],
+        "runs_ttft_s": [],
+        "runs_ttft_content_s": [],
+        "runs_prefill_s": [],
         "range_tokens_per_s": [
-          4.5,
-          8.178
+          5.264,
+          6.054
         ],
-        "tokens_per_run": [
-          64,
-          64,
-          64
-        ],
-        "content_chunks": [
-          64,
-          64,
-          64
-        ],
-        "reasoning_chunks": [
-          0,
-          0,
-          0
-        ],
-        "finish_reason": [
-          "length",
-          "length",
-          "length"
-        ],
+        "tokens_per_run": [],
+        "prompt_tokens_per_run": [],
+        "visits_per_run": [],
+        "content_chunks": [],
+        "reasoning_chunks": [],
+        "finish_reason": [],
+        "thread_evidence": [],
+        "tier_evidence": null,
+        "tier_lines": null,
+        "measured_status": null,
+        "measured_tpot_ms": null,
+        "evidence": null,
         "log": "engine-bench/logs/matrix-colibri-cpu.log"
       },
       {
         "cell": "colibri-vulkan",
         "engine": "colibri",
+        "lane": "vulkan",
         "status": "ok",
-        "args": [
-          "--auto-tier",
-          "--policy",
-          "quality"
-        ],
-        "env": {
-          "COLI_VULKAN": "1",
-          "COLI_VK_TIER_HOST_GB": "4"
-        },
-        "startup_s": 25.1,
-        "median_tokens_per_s": 15.273,
-        "median_ttft_s": 0.64,
-        "median_tpot_ms": 65.476,
-        "median_total_s": 4.765,
-        "runs_tokens_per_s": [
-          7.55,
-          15.273,
-          16.125
-        ],
-        "runs_ttft_s": [
-          0.625,
-          0.64,
-          0.703
-        ],
+        "protocol": "paired-abba",
+        "session": "2026-11-21T01:39:40Z",
+        "binary": null,
+        "args": null,
+        "env": null,
+        "startup_s": 29.8,
+        "median_tokens_per_s": 11.808,
+        "median_ttft_s": 1.125,
+        "median_ttft_content_s": null,
+        "median_prefill_s": 1.036,
+        "median_prompt_tokens": null,
+        "median_tpot_ms": 84.698,
+        "median_total_s": 6.429,
+        "steady_tpot_ms": 84.698,
+        "steady_tokens_per_s": 11.808,
+        "avail_ram_gb_before_load": null,
+        "runs_tokens_per_s": [],
+        "runs_ttft_s": [],
+        "runs_ttft_content_s": [],
+        "runs_prefill_s": [],
         "range_tokens_per_s": [
-          7.55,
-          16.125
+          10.928,
+          12.64
         ],
-        "tokens_per_run": [
-          64,
-          64,
-          64
+        "tokens_per_run": [],
+        "prompt_tokens_per_run": [],
+        "visits_per_run": [],
+        "content_chunks": [],
+        "reasoning_chunks": [],
+        "finish_reason": [],
+        "thread_evidence": [
+          "[VK] tier qwen36: on, NVIDIA GeForce RTX 4060 Laptop GPU, budget 3.84 GiB = 2252 experts of 1.7 MiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots",
+          "[VK] tier qwen36: host pool on, 2416 experts in 4.00 GiB of system RAM the device reads over PCIe (the 7988 its memory leaves, not all of them; COLI_VK_TIER_HOST=0 off, COLI_VK_TIER_HOST_GB sets it)",
+          "[VK] host pool: its blocks are the process's own pages, imported (cached for the CPU; COLI_VK_HOST_POOL_IMPORT=0 takes the driver's)",
+          "[VK] tier qwen36: warm start, 4668 experts in 9.5s (4668 from the history, 0 more to fill the device)",
+          "[VK] tier qwen36 stream: a step of 36 rows; cold experts with 16 rows or more go to the device (the GEMM's 16 rows: the upload and the CPU's rows not measured yet); layer 0: 56 resident, 0 streamed (0 of them copied from the host pool), 64 kept on the CPU (97 rows), 37 of the host pool on the CPU in",
+          "[VK] tier qwen36 turn: device 23077 of 33280 routed experts (69.3%; this turn 23077 of 33280) | CPU RAM hits 2647, disk loads 1989 | resident 2252 (budget 2252, 3.82 GiB of 3.84 GiB, 16 blocks, frag 0.12) | uploads 4951 (7.25 GiB, 4668 warm), evictions 283, skipped 0 queue + 0 rate, failed 0 | devic"
         ],
-        "content_chunks": [
-          64,
-          64,
-          64
+        "tier_evidence": null,
+        "tier_lines": [
+          "[VK] ready: NVIDIA GeForce RTX 4060 Laptop GPU, compute qfam 0, memtype 4, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096 (cooperative matrix)",
+          "[VK] tier qwen36: on, NVIDIA GeForce RTX 4060 Laptop GPU, budget 3.84 GiB = 2252 experts of 1.7 MiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 16 promotions per token, balanced against the CPU, stre"
         ],
-        "reasoning_chunks": [
-          0,
-          0,
-          0
-        ],
-        "finish_reason": [
-          "length",
-          "length",
-          "length"
-        ],
+        "measured_status": null,
+        "measured_tpot_ms": null,
+        "evidence": null,
         "log": "engine-bench/logs/matrix-colibri-vulkan.log"
       },
       {
         "cell": "fennec-cpu",
         "engine": "fennec",
+        "lane": "cpu",
         "status": "ok",
-        "args": [
-          "--cpu",
-          "--threads",
-          "8"
-        ],
-        "env": {},
-        "startup_s": 26.9,
-        "median_tokens_per_s": 2.684,
-        "median_ttft_s": 5.796,
-        "median_tpot_ms": 372.524,
-        "median_total_s": 28.672,
-        "runs_tokens_per_s": [
-          2.148,
-          2.798,
-          2.684
-        ],
-        "runs_ttft_s": [
-          5.796,
-          5.812,
-          5.203
-        ],
+        "protocol": "paired-abba",
+        "session": "2026-11-21T01:39:40Z",
+        "binary": null,
+        "args": null,
+        "env": null,
+        "startup_s": 7.6,
+        "median_tokens_per_s": 6.968,
+        "median_ttft_s": 2.64,
+        "median_ttft_content_s": null,
+        "median_prefill_s": 2.49,
+        "median_prompt_tokens": null,
+        "median_tpot_ms": 143.595,
+        "median_total_s": 11.812,
+        "steady_tpot_ms": 143.595,
+        "steady_tokens_per_s": 6.968,
+        "avail_ram_gb_before_load": null,
+        "runs_tokens_per_s": [],
+        "runs_ttft_s": [],
+        "runs_ttft_content_s": [],
+        "runs_prefill_s": [],
         "range_tokens_per_s": [
-          2.148,
-          2.798
+          6.556,
+          7.136
         ],
-        "tokens_per_run": [
-          64,
-          64,
-          64
+        "tokens_per_run": [],
+        "prompt_tokens_per_run": [],
+        "visits_per_run": [],
+        "content_chunks": [],
+        "reasoning_chunks": [],
+        "finish_reason": [],
+        "thread_evidence": [
+          "[fennec] memory after host pool: 2.19 GiB committed, 5.26 GiB resident",
+          "[fennec] load phases: host pool 2.1 s | dense+embed 0.0 s | lm_head 3.1 s | device upload 0.0 s",
+          "[fennec] host pool inside (6 lanes, work summed): expert read 0.6 s | assemble 0.3 s | dense 10.8 s | plan+stream 0.0 s",
+          "[threads] 8 workers over 6 performance cores: oversubscribed, left unpinned"
         ],
-        "content_chunks": [
-          64,
-          64,
-          64
-        ],
-        "reasoning_chunks": [
-          0,
-          0,
-          0
-        ],
-        "finish_reason": [
-          "length",
-          "length",
-          "length"
-        ],
+        "tier_evidence": null,
+        "tier_lines": null,
+        "measured_status": null,
+        "measured_tpot_ms": null,
+        "evidence": null,
         "log": "engine-bench/logs/matrix-fennec-cpu.log"
       },
       {
         "cell": "fennec-vulkan",
         "engine": "fennec",
+        "lane": "vulkan",
         "status": "ok",
-        "args": [
-          "--gpu",
-          "0",
-          "--backend",
-          "vulkan",
-          "--threads",
-          "8",
-          "--host-gb",
-          "18"
-        ],
-        "env": {},
-        "startup_s": 21.8,
-        "median_tokens_per_s": 10.209,
-        "median_ttft_s": 2.313,
-        "median_tpot_ms": 97.952,
-        "median_total_s": 8.484,
-        "runs_tokens_per_s": [
-          9.669,
-          10.209,
-          10.926
-        ],
-        "runs_ttft_s": [
-          2.546,
-          2.313,
-          2.188
-        ],
+        "protocol": "paired-abba",
+        "session": "2026-11-21T01:39:40Z",
+        "binary": null,
+        "args": null,
+        "env": null,
+        "startup_s": 21.75,
+        "median_tokens_per_s": 15.158,
+        "median_ttft_s": 2.094,
+        "median_ttft_content_s": null,
+        "median_prefill_s": 2.03,
+        "median_prompt_tokens": null,
+        "median_tpot_ms": 65.976,
+        "median_total_s": 6.211,
+        "steady_tpot_ms": 65.976,
+        "steady_tokens_per_s": 15.158,
+        "avail_ram_gb_before_load": null,
+        "runs_tokens_per_s": [],
+        "runs_ttft_s": [],
+        "runs_ttft_content_s": [],
+        "runs_prefill_s": [],
         "range_tokens_per_s": [
-          9.669,
-          10.926
+          13.807,
+          15.75
         ],
-        "tokens_per_run": [
-          64,
-          64,
-          64
+        "tokens_per_run": [],
+        "prompt_tokens_per_run": [],
+        "visits_per_run": [],
+        "content_chunks": [],
+        "reasoning_chunks": [],
+        "finish_reason": [],
+        "thread_evidence": [
+          "[fennec] memory after host pool: 4.60 GiB committed, 8.80 GiB resident",
+          "[threads] 8 workers over 6 performance cores: oversubscribed, left unpinned",
+          "[fennec] load phases: host pool 3.9 s | dense+embed 0.0 s | lm_head 0.7 s | device upload 8.4 s",
+          "[fennec] host pool inside (1 lanes, work summed): expert read 1.7 s | assemble 0.2 s | dense 2.0 s | plan+stream 0.0 s"
         ],
-        "content_chunks": [
-          64,
-          64,
-          64
+        "tier_evidence": null,
+        "tier_lines": [
+          "[fennec] compute device: NVIDIA GeForce RTX 4060 Laptop GPU on Vulkan (SPIR-V)"
         ],
-        "reasoning_chunks": [
-          0,
-          0,
-          0
-        ],
-        "finish_reason": [
-          "length",
-          "length",
-          "length"
-        ],
+        "measured_status": null,
+        "measured_tpot_ms": null,
+        "evidence": null,
         "log": "engine-bench/logs/matrix-fennec-vulkan.log"
       },
       {
         "cell": "fennec-cuda",
         "engine": "fennec",
+        "lane": "cuda",
         "status": "ok",
+        "protocol": "serve + streaming /v1/chat/completions",
+        "session": "2026-11-21T01:39:40Z",
+        "binary": "fennec.exe",
         "args": [
           "--gpu",
           "0",
@@ -1611,29 +1605,55 @@
           "18"
         ],
         "env": {},
-        "startup_s": 13.1,
-        "median_tokens_per_s": 12.562,
-        "median_ttft_s": 2.063,
-        "median_tpot_ms": 79.603,
-        "median_total_s": 7.078,
+        "startup_s": 24.3,
+        "median_tokens_per_s": 15.328,
+        "median_ttft_s": 2.375,
+        "median_ttft_content_s": 2.375,
+        "median_prefill_s": 2.306,
+        "median_prompt_tokens": 34,
+        "median_tpot_ms": 65.238,
+        "median_total_s": 6.578,
+        "steady_tpot_ms": 65.238,
+        "steady_tokens_per_s": 15.328,
+        "avail_ram_gb_before_load": 20.8,
         "runs_tokens_per_s": [
-          11.2,
-          12.562,
-          12.638
+          15.328,
+          14.4,
+          16.191
         ],
         "runs_ttft_s": [
-          2.593,
-          2.063,
-          2.047
+          2.468,
+          2.375,
+          2.203
+        ],
+        "runs_ttft_content_s": [
+          2.468,
+          2.375,
+          2.203
+        ],
+        "runs_prefill_s": [
+          2.403,
+          2.306,
+          2.141
         ],
         "range_tokens_per_s": [
-          11.2,
-          12.638
+          14.4,
+          16.191
         ],
         "tokens_per_run": [
           64,
           64,
           64
+        ],
+        "prompt_tokens_per_run": [
+          34,
+          34,
+          34
+        ],
+        "visits_per_run": [
+          2,
+          3,
+          4
         ],
         "content_chunks": [
           64,
@@ -1650,96 +1670,894 @@
           "length",
           "length"
         ],
+        "thread_evidence": [
+          "[fennec] memory after host pool: 4.76 GiB committed, 8.87 GiB resident",
+          "[threads] 8 workers over 6 performance cores: oversubscribed, left unpinned",
+          "[fennec] load phases: host pool 12.6 s | dense+embed 0.0 s | lm_head 1.8 s | device upload 8.0 s",
+          "[fennec] host pool inside (1 lanes, work summed): expert read 8.3 s | assemble 0.7 s | dense 3.6 s | plan+stream 0.0 s"
+        ],
+        "tier_evidence": null,
+        "tier_lines": [
+          "[fennec] compute device: NVIDIA GeForce RTX 4060 Laptop GPU on CUDA (NVIDIA driver API, PTX)"
+        ],
+        "measured_status": null,
+        "measured_tpot_ms": null,
+        "evidence": null,
         "log": "engine-bench/logs/matrix-fennec-cuda.log"
+      },
+      {
+        "cell": "llama-cpp-cpu",
+        "engine": "llama.cpp",
+        "lane": "llama-cpp-cpu",
+        "status": "ok",
+        "protocol": "serve + streaming /v1/chat/completions",
+        "session": "2026-11-21T01:39:40Z",
+        "binary": "llama-server.exe",
+        "args": [
+          "-ngl",
+          "0",
+          "-t",
+          "8"
+        ],
+        "env": {},
+        "startup_s": 20.7,
+        "median_tokens_per_s": 7.593,
+        "median_ttft_s": 1.516,
+        "median_ttft_content_s": 9.704,
+        "median_prefill_s": 1.384,
+        "median_prompt_tokens": 34,
+        "median_tpot_ms": 131.698,
+        "median_total_s": 9.704,
+        "steady_tpot_ms": 131.698,
+        "steady_tokens_per_s": 7.593,
+        "avail_ram_gb_before_load": 20.7,
+        "runs_tokens_per_s": [
+          7.551,
+          7.593,
+          7.814
+        ],
+        "runs_ttft_s": [
+          1.516,
+          1.407,
+          1.625
+        ],
+        "runs_ttft_content_s": [
+          9.859,
+          9.704,
+          9.687
+        ],
+        "runs_prefill_s": [
+          1.384,
+          1.275,
+          1.497
+        ],
+        "range_tokens_per_s": [
+          7.551,
+          7.814
+        ],
+        "tokens_per_run": [
+          64,
+          64,
+          64
+        ],
+        "prompt_tokens_per_run": [
+          34,
+          34,
+          34
+        ],
+        "visits_per_run": [
+          2,
+          3,
+          4
+        ],
+        "content_chunks": [
+          0,
+          0,
+          0
+        ],
+        "reasoning_chunks": [
+          61,
+          61,
+          61
+        ],
+        "finish_reason": [
+          "length",
+          "length",
+          "length"
+        ],
+        "thread_evidence": [
+          "0.17.764.143 I cmn          init: llama threadpool init, n_threads = 8"
+        ],
+        "tier_evidence": {
+          "log": "engine-bench/logs/tier-llama-cpp-cpu.log",
+          "buffers_mib": {
+            "CPU_Mapped": 19580.6
+          },
+          "device": null,
+          "host_mib": 19580.6,
+          "box_at_capture": [
+            "diag: host free at launch 20.2 GiB of 31.5"
+          ],
+          "fit_lines": [
+            "0.01.920.945 I cmn  common_fit_a: fitting params to device memory ...",
+            "0.02.354.333 I common_params_fit_impl: projected to use 289 MiB of device memory vs. 7186 MiB of free device memory",
+            "0.02.354.341 I common_params_fit_impl: will leave 6897 >= 1024 MiB of free device memory, no changes needed",
+            "0.02.354.342 I common_fit_params: successfully fit params to free device memory",
+            "0.02.354.351 I common_fit_params: fitting params to free memory took 0.43 seconds",
+            "0.15.514.425 I sched_reserve: graph (pp bs=512, tg bs=1): nodes = 3819 / 3819, splits = 864 / 61, input objects = 4 / 4, input tensors = 10 / 10",
+            "0.17.124.586 I srv  server_run_i: model loaded"
+          ]
+        },
+        "tier_lines": null,
+        "measured_status": null,
+        "measured_tpot_ms": null,
+        "evidence": null,
+        "log": "engine-bench/logs/matrix-llama-cpp-cpu.log"
+      },
+      {
+        "cell": "llama-cpp-vulkan",
+        "engine": "llama.cpp",
+        "lane": "llama-cpp-vulkan",
+        "status": "ok",
+        "protocol": "serve + streaming /v1/chat/completions",
+        "session": "2026-11-21T01:39:40Z",
+        "binary": "llama-server.exe",
+        "args": [
+          "-t",
+          "8"
+        ],
+        "env": {},
+        "startup_s": 20.6,
+        "median_tokens_per_s": 2.403,
+        "median_ttft_s": 1.75,
+        "median_ttft_content_s": 28.063,
+        "median_prefill_s": 1.332,
+        "median_prompt_tokens": 34,
+        "median_tpot_ms": 416.175,
+        "median_total_s": 28.063,
+        "steady_tpot_ms": 416.175,
+        "steady_tokens_per_s": 2.403,
+        "avail_ram_gb_before_load": 20.9,
+        "runs_tokens_per_s": [
+          2.39,
+          2.403,
+          2.477
+        ],
+        "runs_ttft_s": [
+          1.75,
+          1.844,
+          1.734
+        ],
+        "runs_ttft_content_s": [
+          28.109,
+          28.063,
+          27.172
+        ],
+        "runs_prefill_s": [
+          1.332,
+          1.428,
+          1.33
+        ],
+        "range_tokens_per_s": [
+          2.39,
+          2.477
+        ],
+        "tokens_per_run": [
+          64,
+          64,
+          64
+        ],
+        "prompt_tokens_per_run": [
+          34,
+          34,
+          34
+        ],
+        "visits_per_run": [
+          2,
+          3,
+          4
+        ],
+        "content_chunks": [
+          0,
+          0,
+          0
+        ],
+        "reasoning_chunks": [
+          61,
+          61,
+          61
+        ],
+        "finish_reason": [
+          "length",
+          "length",
+          "length"
+        ],
+        "thread_evidence": [
+          "0.17.613.870 I cmn          init: llama threadpool init, n_threads = 8"
+        ],
+        "tier_evidence": {
+          "log": "engine-bench/logs/tier-llama-cpp-vulkan.log",
+          "buffers_mib": {
+            "CPU_Mapped": 14388.9,
+            "Vulkan1": 5191.6
+          },
+          "device": "Vulkan1",
+          "host_mib": 14388.9,
+          "box_at_capture": [
+            "diag: host free at launch 20.2 GiB of 31.5"
+          ],
+          "fit_lines": [
+            "0.02.579.763 I common_params_fit_impl: set ngl_per_device[0].n_layer=41",
+            "0.03.492.109 I common_params_fit_impl: set ngl_per_device[0].(n_layer, n_part)=(41, 34), id_dense_start=0",
+            "0.03.995.145 I common_params_fit_impl: set ngl_per_device_high[0].(n_layer, n_part)=(41, 33), id_dense_start_high=0",
+            "0.04.442.056 I common_params_fit_impl: set ngl_per_device[0].(n_layer, n_part, overflow_type)=(41, 34, UP), id_dense_start=0",
+            "0.04.871.870 I common_fit_params: successfully fit params to free device memory",
+            "0.04.871.878 I common_fit_params: fitting params to free memory took 4.69 seconds",
+            "0.13.457.173 I sched_reserve: graph (pp bs=512, tg bs=1): nodes = 3819 / 3819, splits = 103 / 72, input objects = 4 / 4, input tensors = 10 / 10",
+            "0.15.298.351 I srv  server_run_i: model loaded"
+          ]
+        },
+        "tier_lines": null,
+        "measured_status": null,
+        "measured_tpot_ms": null,
+        "evidence": null,
+        "log": "engine-bench/logs/matrix-llama-cpp-vulkan.log"
+      },
+      {
+        "cell": "llama-cpp-cuda",
+        "engine": "llama.cpp",
+        "lane": "llama-cpp-cuda",
+        "status": "ok",
+        "protocol": "serve + streaming /v1/chat/completions",
+        "session": "2026-11-21T01:39:40Z",
+        "binary": "llama-server.exe",
+        "args": [
+          "-t",
+          "8"
+        ],
+        "env": {},
+        "startup_s": 21.2,
+        "median_tokens_per_s": 20.889,
+        "median_ttft_s": 0.625,
+        "median_ttft_content_s": 3.64,
+        "median_prefill_s": 0.58,
+        "median_prompt_tokens": 34,
+        "median_tpot_ms": 47.873,
+        "median_total_s": 3.64,
+        "steady_tpot_ms": 47.873,
+        "steady_tokens_per_s": 20.889,
+        "avail_ram_gb_before_load": 20.7,
+        "runs_tokens_per_s": [
+          22.396,
+          20.683,
+          20.889
+        ],
+        "runs_ttft_s": [
+          0.625,
+          0.594,
+          0.719
+        ],
+        "runs_ttft_content_s": [
+          3.438,
+          3.64,
+          3.735
+        ],
+        "runs_prefill_s": [
+          0.58,
+          0.546,
+          0.671
+        ],
+        "range_tokens_per_s": [
+          20.683,
+          22.396
+        ],
+        "tokens_per_run": [
+          64,
+          64,
+          64
+        ],
+        "prompt_tokens_per_run": [
+          34,
+          34,
+          34
+        ],
+        "visits_per_run": [
+          2,
+          3,
+          4
+        ],
+        "content_chunks": [
+          0,
+          0,
+          0
+        ],
+        "reasoning_chunks": [
+          61,
+          61,
+          61
+        ],
+        "finish_reason": [
+          "length",
+          "length",
+          "length"
+        ],
+        "thread_evidence": [
+          "0.18.741.722 I cmn          init: llama threadpool init, n_threads = 8"
+        ],
+        "tier_evidence": {
+          "log": "engine-bench/logs/tier-llama-cpp-cuda.log",
+          "buffers_mib": {
+            "CPU_Mapped": 14534.0,
+            "CUDA0": 5046.6
+          },
+          "device": "CUDA0",
+          "host_mib": 14534.0,
+          "box_at_capture": [
+            "diag: host free at launch 20.3 GiB of 31.5"
+          ],
+          "fit_lines": [
+            "0.02.961.159 I common_params_fit_impl: set ngl_per_device[0].n_layer=41",
+            "0.04.103.257 I common_params_fit_impl: set ngl_per_device[0].(n_layer, n_part)=(41, 34), id_dense_start=0",
+            "0.04.643.729 I common_params_fit_impl: set ngl_per_device_high[0].(n_layer, n_part)=(41, 33), id_dense_start_high=0",
+            "0.05.625.687 I common_params_fit_impl: set ngl_per_device[0].(n_layer, n_part, overflow_type)=(41, 34, ATTN), id_dense_start=0",
+            "0.05.625.693 I common_fit_params: successfully fit params to free device memory",
+            "0.05.625.700 I common_fit_params: fitting params to free memory took 4.73 seconds",
+            "0.19.915.451 I sched_reserve: graph (pp bs=512, tg bs=1): nodes = 3819 / 3819, splits = 105 / 68, input objects = 4 / 4, input tensors = 10 / 10",
+            "0.20.788.603 I srv  server_run_i: model loaded"
+          ]
+        },
+        "tier_lines": null,
+        "measured_status": null,
+        "measured_tpot_ms": null,
+        "evidence": null,
+        "log": "engine-bench/logs/matrix-llama-cpp-cuda.log"
+      },
+      {
+        "cell": "llama-cpp-vulkan-mec",
+        "engine": "llama.cpp",
+        "lane": "llama-cpp-vulkan-mec",
+        "status": "ok",
+        "protocol": "serve + streaming /v1/chat/completions",
+        "session": "2026-11-21T01:39:40Z",
+        "binary": "llama-server.exe",
+        "args": [
+          "-t",
+          "8",
+          "-ngl",
+          "99",
+          "-cmoe",
+          "--moe-cache-mib",
+          "3584"
+        ],
+        "env": {},
+        "startup_s": 14.6,
+        "median_tokens_per_s": 2.196,
+        "median_ttft_s": 7.984,
+        "median_ttft_content_s": 36.531,
+        "median_prefill_s": 7.533,
+        "median_prompt_tokens": 34,
+        "median_tpot_ms": 455.365,
+        "median_total_s": 36.531,
+        "steady_tpot_ms": 455.365,
+        "steady_tokens_per_s": 2.196,
+        "avail_ram_gb_before_load": 20.8,
+        "runs_tokens_per_s": [
+          2.196,
+          2.191,
+          2.215
+        ],
+        "runs_ttft_s": [
+          8.109,
+          7.781,
+          7.984
+        ],
+        "runs_ttft_content_s": [
+          36.797,
+          36.531,
+          36.422
+        ],
+        "runs_prefill_s": [
+          7.654,
+          7.325,
+          7.533
+        ],
+        "range_tokens_per_s": [
+          2.191,
+          2.215
+        ],
+        "tokens_per_run": [
+          64,
+          64,
+          64
+        ],
+        "prompt_tokens_per_run": [
+          34,
+          34,
+          34
+        ],
+        "visits_per_run": [
+          2,
+          3,
+          4
+        ],
+        "content_chunks": [
+          0,
+          0,
+          0
+        ],
+        "reasoning_chunks": [
+          61,
+          61,
+          61
+        ],
+        "finish_reason": [
+          "length",
+          "length",
+          "length"
+        ],
+        "thread_evidence": [
+          "0.00.803.506 W common_fit_params: failed to fit params to free device memory: n_gpu_layers already set by user to 99, abort",
+          "0.10.077.799 I cmn          init: llama threadpool init, n_threads = 8"
+        ],
+        "tier_evidence": {
+          "log": "engine-bench/logs/tier-llama-cpp-vulkan-mec.log",
+          "buffers_mib": {
+            "CPU_Mapped": 17552.8,
+            "Vulkan1": 2027.8
+          },
+          "device": "Vulkan1",
+          "host_mib": 17552.8,
+          "box_at_capture": [
+            "diag: host free at launch 19.5 GiB of 31.5"
+          ],
+          "fit_lines": [
+            "0.00.258.333 I cmn  common_fit_a: fitting params to device memory ...",
+            "0.00.800.489 I common_params_fit_impl: projected to use 6657 MiB of device memory vs. 7186 MiB of free device memory",
+            "0.00.802.421 W common_fit_params: failed to fit params to free device memory: n_gpu_layers already set by user to 99, abort",
+            "0.00.802.433 I common_fit_params: fitting params to free memory took 0.54 seconds",
+            "0.18.520.236 I sched_reserve: graph (pp bs=512, tg bs=1): nodes = 3825 / 4059, splits = 120 / 42, input objects = 4 / 4, input tensors = 10 / 10",
+            "0.22.448.456 I srv  server_run_i: model loaded"
+          ]
+        },
+        "tier_lines": null,
+        "measured_status": null,
+        "measured_tpot_ms": null,
+        "evidence": null,
+        "log": "engine-bench/logs/matrix-llama-cpp-vulkan-mec.log"
+      },
+      {
+        "cell": "rabbit-cpu",
+        "engine": "rabbit",
+        "lane": "cpu",
+        "status": "unavailable",
+        "protocol": "not runnable on this box",
+        "session": null,
+        "binary": null,
+        "args": null,
+        "env": null,
+        "startup_s": null,
+        "median_tokens_per_s": null,
+        "median_ttft_s": null,
+        "median_ttft_content_s": null,
+        "median_prefill_s": null,
+        "median_prompt_tokens": null,
+        "median_tpot_ms": null,
+        "median_total_s": null,
+        "steady_tpot_ms": null,
+        "steady_tokens_per_s": null,
+        "avail_ram_gb_before_load": null,
+        "runs_tokens_per_s": [],
+        "runs_ttft_s": [],
+        "runs_ttft_content_s": [],
+        "runs_prefill_s": [],
+        "range_tokens_per_s": null,
+        "tokens_per_run": [],
+        "prompt_tokens_per_run": [],
+        "visits_per_run": [],
+        "content_chunks": [],
+        "reasoning_chunks": [],
+        "finish_reason": [],
+        "thread_evidence": null,
+        "tier_evidence": null,
+        "tier_lines": null,
+        "measured_status": null,
+        "measured_tpot_ms": null,
+        "evidence": "retired from the matrix on 2026-11-15 by instruction; it is not to be run or measured again. Its last numbers stay in the archived result files (results-backend-matrix.threads8-2026-11-15T0945.json) rather than in the current table.",
+        "log": "engine-bench/logs/matrix-rabbit-cpu.log"
+      },
+      {
+        "cell": "colibri-cuda",
+        "engine": "colibri",
+        "lane": "cuda",
+        "status": "unavailable",
+        "protocol": "not runnable on this box",
+        "session": null,
+        "binary": null,
+        "args": null,
+        "env": null,
+        "startup_s": null,
+        "median_tokens_per_s": null,
+        "median_ttft_s": null,
+        "median_ttft_content_s": null,
+        "median_prefill_s": null,
+        "median_prompt_tokens": null,
+        "median_tpot_ms": null,
+        "median_total_s": null,
+        "steady_tpot_ms": null,
+        "steady_tokens_per_s": null,
+        "avail_ram_gb_before_load": null,
+        "runs_tokens_per_s": [],
+        "runs_ttft_s": [],
+        "runs_ttft_content_s": [],
+        "runs_prefill_s": [],
+        "range_tokens_per_s": null,
+        "tokens_per_run": [],
+        "prompt_tokens_per_run": [],
+        "visits_per_run": [],
+        "content_chunks": [],
+        "reasoning_chunks": [],
+        "finish_reason": [],
+        "thread_evidence": null,
+        "tier_evidence": null,
+        "tier_lines": null,
+        "measured_status": null,
+        "measured_tpot_ms": null,
+        "evidence": "Colibri's qwen36.exe is a CPU+Vulkan build: the binary carries no coli_cuda.dll build marker and no coli_cuda.dll sits next to it, so cuda_binary() returns False and --gpu/--vram exit with 'the engine binary is CPU-only'. The CUDA tier was never compiled for this checkout (it needs the nvcc/MSVC CUDA toolchain).",
+        "log": "engine-bench/logs/matrix-colibri-cuda.log"
+      },
+      {
+        "cell": "rabbit-vulkan",
+        "engine": "rabbit",
+        "lane": "vulkan",
+        "status": "unavailable",
+        "protocol": "not runnable on this box",
+        "session": null,
+        "binary": null,
+        "args": null,
+        "env": null,
+        "startup_s": null,
+        "median_tokens_per_s": null,
+        "median_ttft_s": null,
+        "median_ttft_content_s": null,
+        "median_prefill_s": null,
+        "median_prompt_tokens": null,
+        "median_tpot_ms": null,
+        "median_total_s": null,
+        "steady_tpot_ms": null,
+        "steady_tokens_per_s": null,
+        "avail_ram_gb_before_load": null,
+        "runs_tokens_per_s": [],
+        "runs_ttft_s": [],
+        "runs_ttft_content_s": [],
+        "runs_prefill_s": [],
+        "range_tokens_per_s": null,
+        "tokens_per_run": [],
+        "prompt_tokens_per_run": [],
+        "visits_per_run": [],
+        "content_chunks": [],
+        "reasoning_chunks": [],
+        "finish_reason": [],
+        "thread_evidence": null,
+        "tier_evidence": null,
+        "tier_lines": null,
+        "measured_status": null,
+        "measured_tpot_ms": null,
+        "evidence": "rabbit has no GPU path: its CLI exposes no --gpu/--backend/--vulkan/--cuda flag and the engine streams routed experts from NVMe on the CPU only.",
+        "log": "engine-bench/logs/matrix-rabbit-vulkan.log"
+      },
+      {
+        "cell": "rabbit-cuda",
+        "engine": "rabbit",
+        "lane": "cuda",
+        "status": "unavailable",
+        "protocol": "not runnable on this box",
+        "session": null,
+        "binary": null,
+        "args": null,
+        "env": null,
+        "startup_s": null,
+        "median_tokens_per_s": null,
+        "median_ttft_s": null,
+        "median_ttft_content_s": null,
+        "median_prefill_s": null,
+        "median_prompt_tokens": null,
+        "median_tpot_ms": null,
+        "median_total_s": null,
+        "steady_tpot_ms": null,
+        "steady_tokens_per_s": null,
+        "avail_ram_gb_before_load": null,
+        "runs_tokens_per_s": [],
+        "runs_ttft_s": [],
+        "runs_ttft_content_s": [],
+        "runs_prefill_s": [],
+        "range_tokens_per_s": null,
+        "tokens_per_run": [],
+        "prompt_tokens_per_run": [],
+        "visits_per_run": [],
+        "content_chunks": [],
+        "reasoning_chunks": [],
+        "finish_reason": [],
+        "thread_evidence": null,
+        "tier_evidence": null,
+        "tier_lines": null,
+        "measured_status": null,
+        "measured_tpot_ms": null,
+        "evidence": "rabbit has no GPU path: its CLI exposes no --gpu/--backend/--vulkan/--cuda flag and the engine streams routed experts from NVMe on the CPU only.",
+        "log": "engine-bench/logs/matrix-rabbit-cuda.log"
+      },
+      {
+        "cell": "basalt-cuda",
+        "engine": "basalt",
+        "lane": "cuda",
+        "status": "unavailable",
+        "protocol": "not runnable on this box",
+        "session": null,
+        "binary": null,
+        "args": null,
+        "env": null,
+        "startup_s": null,
+        "median_tokens_per_s": null,
+        "median_ttft_s": null,
+        "median_ttft_content_s": null,
+        "median_prefill_s": null,
+        "median_prompt_tokens": null,
+        "median_tpot_ms": null,
+        "median_total_s": null,
+        "steady_tpot_ms": null,
+        "steady_tokens_per_s": null,
+        "avail_ram_gb_before_load": null,
+        "runs_tokens_per_s": [],
+        "runs_ttft_s": [],
+        "runs_ttft_content_s": [],
+        "runs_prefill_s": [],
+        "range_tokens_per_s": null,
+        "tokens_per_run": [],
+        "prompt_tokens_per_run": [],
+        "visits_per_run": [],
+        "content_chunks": [],
+        "reasoning_chunks": [],
+        "finish_reason": [],
+        "thread_evidence": null,
+        "tier_evidence": null,
+        "tier_lines": null,
+        "measured_status": null,
+        "measured_tpot_ms": null,
+        "evidence": "Basalt needs an NVIDIA Blackwell (sm_120) device and the CUDA 13 runtime, and it loads only `.basalt` packs. This box has a GeForce RTX 4060 Laptop (sm_89) and no CUDA toolkit installed, and no `.basalt` pack exists for either suite model, so there is nothing to launch.",
+        "log": "engine-bench/logs/matrix-basalt-cuda.log"
+      },
+      {
+        "cell": "strata-cuda",
+        "engine": "strata",
+        "lane": "cuda",
+        "status": "unavailable",
+        "protocol": "not runnable on this box",
+        "session": null,
+        "binary": null,
+        "args": null,
+        "env": null,
+        "startup_s": null,
+        "median_tokens_per_s": null,
+        "median_ttft_s": null,
+        "median_ttft_content_s": null,
+        "median_prefill_s": null,
+        "median_prompt_tokens": null,
+        "median_tpot_ms": null,
+        "median_total_s": null,
+        "steady_tpot_ms": null,
+        "steady_tokens_per_s": null,
+        "avail_ram_gb_before_load": null,
+        "runs_tokens_per_s": [],
+        "runs_ttft_s": [],
+        "runs_ttft_content_s": [],
+        "runs_prefill_s": [],
+        "range_tokens_per_s": null,
+        "tokens_per_run": [],
+        "prompt_tokens_per_run": [],
+        "visits_per_run": [],
+        "content_chunks": [],
+        "reasoning_chunks": [],
+        "finish_reason": [],
+        "thread_evidence": null,
+        "tier_evidence": null,
+        "tier_lines": null,
+        "measured_status": null,
+        "measured_tpot_ms": null,
+        "evidence": "Strata is installed twice here and neither can serve this matrix. The source checkout documents Qwen3.6-35B-A3B on its own engine path (docs/QWEN36.md:8-9: 'It runs on NVIDIA and AMD cards. The Intel Arc and Mac engines do not run it') but ships no built binary: a CUDA build needs VS 2022 + CUDA Toolkit 13, and its pinned packs start at UD-Q4_K_XL (22.9 GB, 'plans for 32 GB RAM') with no documented configuration for an 8 GiB card. The built 247 MB strata.exe inside the Edge0 bundle loads cublas64_13.dll at start - its README says the toolkit is not shipped and the failure is 0xC0000135 - and no cublas/cudart DLL exists in that bundle or on this box; its shipped launch configs are Edge0-120B/145B only.",
+        "log": "engine-bench/logs/matrix-strata-cuda.log"
+      },
+      {
+        "cell": "maple-cpu",
+        "engine": "maple",
+        "lane": "cpu",
+        "status": "unavailable",
+        "protocol": "not runnable on this box",
+        "session": null,
+        "binary": null,
+        "args": null,
+        "env": null,
+        "startup_s": null,
+        "median_tokens_per_s": null,
+        "median_ttft_s": null,
+        "median_ttft_content_s": null,
+        "median_prefill_s": null,
+        "median_prompt_tokens": null,
+        "median_tpot_ms": null,
+        "median_total_s": null,
+        "steady_tpot_ms": null,
+        "steady_tokens_per_s": null,
+        "avail_ram_gb_before_load": null,
+        "runs_tokens_per_s": [],
+        "runs_ttft_s": [],
+        "runs_ttft_content_s": [],
+        "runs_prefill_s": [],
+        "range_tokens_per_s": null,
+        "tokens_per_run": [],
+        "prompt_tokens_per_run": [],
+        "visits_per_run": [],
+        "content_chunks": [],
+        "reasoning_chunks": [],
+        "finish_reason": [],
+        "thread_evidence": null,
+        "tier_evidence": null,
+        "tier_lines": null,
+        "measured_status": null,
+        "measured_tpot_ms": null,
+        "evidence": "Maple is not an engine. deepgrove/maple-preview is a 20B-A1B ternary MoE *model*, so there is no server to launch and no flag to align with the other rows; it can only appear as a model on another engine's row, and no suite model conversion exists for it.",
+        "log": "engine-bench/logs/matrix-maple-cpu.log"
       }
     ],
-    "winner": "colibri-vulkan at 15.273 tok/s; Fennec's best is CUDA at 12.562 (1.22x behind)",
-    "ratios": {
-      "colibri_vulkan_over_fennec_cuda": 1.216,
-      "colibri_vulkan_over_fennec_vulkan": 1.496,
-      "colibri_cpu_over_fennec_cpu": 3.041,
-      "fennec_cuda_over_fennec_vulkan": 1.23,
-      "fennec_cuda_over_fennec_cpu": 4.68
-    },
-    "first_run_is_cold": "Run 1 of each cell is a cold start and is slower in every cell (colibri-cpu 4.5, colibri-vulkan 7.55, fennec-cpu 2.148, fennec-vulkan 9.669, fennec-cuda 11.2). The median of 3 is reported, not the best run.",
-    "colibri_deltas_against_the_published_rows": {
-      "published_source": "benchmarks/results-engine-devices.json (2026-11-12T00:18:44Z)",
-      "cpu": {
-        "published_tok_s": 3.93,
-        "remeasured_tok_s": 8.162,
-        "cause": "the expert cache grew. Published log: 'RAM plan: 0 expert cache slots/layer, below one token's route; starting at 8' then 'cache=8/layer'. New log: 'cache=118/layer' - 14.75x more slots, because the .coli_usage selection history grew from 45,901,800 to 45,973,480. Same binary, same flags, different warm-start state.",
-        "published_runs": [
-          3.58,
-          3.93
-        ]
-      },
-      "vulkan": {
-        "published_tok_s": 20.06,
-        "remeasured_tok_s": 15.273,
-        "cause": "run-to-run spread, not configuration. The published 20.06 was run 2 of 2; run 1 was 8.45. The expert cache is comparable across the two sessions (published cache=133/layer, new cache=112/layer, both 'warm start, 4668 experts'), so the drop is not a plan change.",
-        "published_runs": [
-          8.45,
-          20.06
+    "paired": [
+      {
+        "pair": [
+          "colibri-cpu",
+          "fennec-cpu"
         ],
-        "remeasured_runs": [
-          7.55,
-          15.273,
-          16.125
-        ]
+        "protocol": "paired-abba",
+        "rounds": 4,
+        "median_delta_ms": -29.27,
+        "every_round_same_sign": true,
+        "verdict": {
+          "rounds": [
+            {
+              "round": 1,
+              "order": "ab",
+              "a_tpot_ms": 189.984,
+              "b_tpot_ms": 147.063,
+              "delta_ms": -42.921
+            },
+            {
+              "round": 2,
+              "order": "ba",
+              "a_tpot_ms": 169.159,
+              "b_tpot_ms": 140.127,
+              "delta_ms": -29.032
+            },
+            {
+              "round": 3,
+              "order": "ab",
+              "a_tpot_ms": 165.175,
+              "b_tpot_ms": 152.54,
+              "delta_ms": -12.635
+            },
+            {
+              "round": 4,
+              "order": "ba",
+              "a_tpot_ms": 169.635,
+              "b_tpot_ms": 140.127,
+              "delta_ms": -29.508
+            }
+          ],
+          "median_delta_ms": -29.27,
+          "delta_by_order": {
+            "ab": -27.778,
+            "ba": -29.27
+          },
+          "orders_agree": true,
+          "a_faster_rounds": 0,
+          "b_faster_rounds": 4,
+          "slower": "colibri-cpu"
+        }
       },
-      "threads": "Colibri's own default changed: it now prints '[OMP] qwen36: 6 performance-core threads instead of 22 logical CPUs'. The published 20.06 row ran 16 threads. Fennec is pinned to 8 in every cell here."
+      {
+        "pair": [
+          "colibri-vulkan",
+          "fennec-vulkan"
+        ],
+        "protocol": "paired-abba",
+        "rounds": 4,
+        "median_delta_ms": -16.238,
+        "every_round_same_sign": true,
+        "verdict": {
+          "rounds": [
+            {
+              "round": 1,
+              "order": "ab",
+              "a_tpot_ms": 79.111,
+              "b_tpot_ms": 66.476,
+              "delta_ms": -12.635
+            },
+            {
+              "round": 2,
+              "order": "ba",
+              "a_tpot_ms": 91.508,
+              "b_tpot_ms": 63.492,
+              "delta_ms": -28.016
+            },
+            {
+              "round": 3,
+              "order": "ab",
+              "a_tpot_ms": 84.079,
+              "b_tpot_ms": 72.429,
+              "delta_ms": -11.65
+            },
+            {
+              "round": 4,
+              "order": "ba",
+              "a_tpot_ms": 85.317,
+              "b_tpot_ms": 65.476,
+              "delta_ms": -19.841
+            }
+          ],
+          "median_delta_ms": -16.238,
+          "delta_by_order": {
+            "ab": -12.143,
+            "ba": -23.928
+          },
+          "orders_agree": true,
+          "a_faster_rounds": 0,
+          "b_faster_rounds": 4,
+          "slower": "colibri-vulkan"
+        }
+      }
+    ],
+    "sac_state": "off (Smart App Control disabled for this measurement session; unsigned binaries run without real-time verification overhead)",
+    "winner": "llama-cpp-cuda at 20.889 tok/s; Fennec's best is fennec-cuda at 15.328 (1.36x behind)",
+    "first_to_answer": "fennec-cuda at 2.375 s to the first character of the answer",
+    "ratios": {},
+    "per_lane_best": {
+      "cuda": "fennec-cuda",
+      "llama-cpp-cpu": "llama-cpp-cpu",
+      "llama-cpp-cuda": "llama-cpp-cuda",
+      "llama-cpp-vulkan": "llama-cpp-vulkan",
+      "llama-cpp-vulkan-mec": "llama-cpp-vulkan-mec"
     },
     "device_evidence": {
-      "colibri-cpu": [
-        "== qwen36 Phase-2 engine | cache=118/layer bits=4 ctx=32768 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==",
-        "resident weights loaded in 8.0s | RSS after load: 3.65 GB"
-      ],
-      "colibri-vulkan": [
-        "== qwen36 Phase-2 engine | cache=112/layer bits=4 ctx=32768 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==",
-        "resident weights loaded in 9.8s | RSS after load: 5.54 GB",
-        "[VK] ready: NVIDIA GeForce RTX 4060 Laptop GPU, compute qfam 0, memtype 4, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096 (cooperative matrix)"
-      ],
-      "fennec-cpu": [
-        "[fennec] load phases: host pool 16.7 s | dense+embed 0.0 s | lm_head 0.0 s | device upload 0.0 s",
-        "[fennec] 40 layers, 0 experts in VRAM, 5689 in RAM, loaded in 16.7 s"
-      ],
-      "fennec-vulkan": [
-        "[fennec] compute device: NVIDIA GeForce RTX 4060 Laptop GPU on Vulkan (SPIR-V)",
-        "[fennec] load phases: host pool 6.5 s | dense+embed 0.0 s | lm_head 0.7 s | device upload 13.3 s",
-        "[fennec] 40 layers, 2304 experts in VRAM, 7936 in RAM, loaded in 20.6 s"
-      ],
       "fennec-cuda": [
+        "[fennec] device budget 6.60 GiB of 7.77 GiB on NVIDIA GeForce RTX 4060 Laptop GPU (85% reserve for KV, activations and staging)",
         "[fennec] compute device: NVIDIA GeForce RTX 4060 Laptop GPU on CUDA (NVIDIA driver API, PTX)",
-        "[fennec] load phases: host pool 5.9 s | dense+embed 0.0 s | lm_head 0.4 s | device upload 5.7 s",
-        "[fennec] 40 layers, 2304 experts in VRAM, 7936 in RAM, loaded in 12.1 s"
-      ]
+        "[fennec] load phases: host pool 12.6 s | dense+embed 0.0 s | lm_head 1.8 s | device upload 8.0 s",
+        "[fennec] 40 layers, 1597 experts in VRAM, 8643 in RAM, loaded in 22.5 s"
+      ],
+      "llama-cpp-cpu": [],
+      "llama-cpp-vulkan": [],
+      "llama-cpp-cuda": [],
+      "llama-cpp-vulkan-mec": []
     },
-    "unavailable_cells": {
-      "colibri_onnx_ort": "no such code path exists in Colibri - see colibri_backend_surface",
-      "colibri_burn_cubecl": "NO SUCH CODE PATH - unchanged. A grep for onnxruntime|onnx|\\bort\\b|cubecl|\\bburn\\b over Colibri's C, headers, Makefiles, docs and Python returns six hits, every one the English word \"burn\" in a comment. There is nothing to run, so no number is reported.",
-      "fennec_onnx_ort": "not buildable on this toolchain - see ort_openvino_verdict and ort_nvrtx_verdict",
-      "fennec_burn_cubecl": "PARTLY UNBLOCKED - CPU measured at KERNEL LEVEL, Vulkan blocked upstream, see burn_cubecl_lane. Burn's Flex (pure-Rust CPU) backend runs the dominant decode kernels at the checkpoint's exact shapes. All 6 CubeCL/Vulkan cells panic inside cubecl-ir 0.11.4 before a kernel executes; removing burn-fusion and rebuilding reproduced the identical panic, so fusion is not the cause. A full-model lane remains impossible: dequantized to the precisions Burn can compute, the routed experts alone need 120 GiB at f32 or 60 GiB at f16 against 31.5 GiB RAM and 8 GiB VRAM, and Burn owns its allocator so tiered residency is not expressible. CubeCL-on-CPU specifically is blocked by a static LLVM link failure.",
-      "apple_metal_both_engines": "implemented and unit-tested on both, never executed - see apple_metal_policy",
-      "fennec_npu_openvino": "UNBLOCKED and measured in Rust - see npu_rust_lane. This was never an NPU limitation: ort's dist has no windows-gnu row and ships no DLL, while the openvino crate's runtime-linking dlopens the installed openvino_c.dll."
+    "blocked_cells": {
+      "rabbit-cpu": "retired from the matrix on 2026-11-15 by instruction; it is not to be run or measured again. Its last numbers stay in the archived result files (results-backend-matrix.threads8-2026-11-15T0945.json) rather than in the current table.",
+      "colibri-cuda": "Colibri's qwen36.exe is a CPU+Vulkan build: the binary carries no coli_cuda.dll build marker and no coli_cuda.dll sits next to it, so cuda_binary() returns False and --gpu/--vram exit with 'the engine binary is CPU-only'. The CUDA tier was never compiled for this checkout (it needs the nvcc/MSVC CUDA toolchain).",
+      "rabbit-vulkan": "rabbit has no GPU path: its CLI exposes no --gpu/--backend/--vulkan/--cuda flag and the engine streams routed experts from NVMe on the CPU only.",
+      "rabbit-cuda": "rabbit has no GPU path: its CLI exposes no --gpu/--backend/--vulkan/--cuda flag and the engine streams routed experts from NVMe on the CPU only.",
+      "basalt-cuda": "Basalt needs an NVIDIA Blackwell (sm_120) device and the CUDA 13 runtime, and it loads only `.basalt` packs. This box has a GeForce RTX 4060 Laptop (sm_89) and no CUDA toolkit installed, and no `.basalt` pack exists for either suite model, so there is nothing to launch.",
+      "strata-cuda": "Strata is installed twice here and neither can serve this matrix. The source checkout documents Qwen3.6-35B-A3B on its own engine path (docs/QWEN36.md:8-9: 'It runs on NVIDIA and AMD cards. The Intel Arc and Mac engines do not run it') but ships no built binary: a CUDA build needs VS 2022 + CUDA Toolkit 13, and its pinned packs start at UD-Q4_K_XL (22.9 GB, 'plans for 32 GB RAM') with no documented configuration for an 8 GiB card. The built 247 MB strata.exe inside the Edge0 bundle loads cublas64_13.dll at start - its README says the toolkit is not shipped and the failure is 0xC0000135 - and no cublas/cudart DLL exists in that bundle or on this box; its shipped launch configs are Edge0-120B/145B only.",
+      "maple-cpu": "Maple is not an engine. deepgrove/maple-preview is a 20B-A1B ternary MoE *model*, so there is no server to launch and no flag to align with the other rows; it can only appear as a model on another engine's row, and no suite model conversion exists for it."
     },
     "artifacts": {
       "results": "benchmarks/results-backend-matrix.json",
       "table": "benchmarks/results-backend-matrix.md",
       "driver": "engine-bench/bench-backend-matrix.py",
+      "recorder": "engine-bench/record_backend_matrix.py",
       "charts": [
-        "docs/engine-matrix-tok.svg",
-        "docs/engine-matrix-ttft.svg",
-        "docs/engine-matrix-tpot.svg",
-        "docs/engine-matrix-total.svg",
-        "docs/engine-matrix-load.svg"
+        "docs/matrix-overview.png",
+        "docs/matrix-decode.png",
+        "docs/matrix-head.png",
+        "docs/matrix-ttft.png",
+        "docs/matrix-tpot.png",
+        "docs/matrix-total.png",
+        "docs/matrix-coldstart.png"
       ],
-      "chart_tool": "tools/matrix_graph.py",
-      "npu_rust_results": "benchmarks/results-npu-rust.json",
-      "npu_rust_driver": "engine-bench/rust-lanes/src/main.rs",
-      "burn_cubecl_results": "benchmarks/results-burn-cubecl.json",
-      "burn_cubecl_driver": "engine-bench/burn-lanes/src/main.rs",
-      "burn_cubecl_log": "engine-bench/burn-lanes/lanes-burn.log",
-      "burn_cubecl_nofusion_diagnostic": "benchmarks/results-burn-cubecl-nofusion.json"
+      "chart_tool": "engine-bench/reports/build_matrix_visuals.py",
+      "svg_tool": "tools/matrix_graph.py"
     },
     "published_rows_are_untouched": "results-engine-devices.json was not rewritten. The decode-loop numbers in the engines array stay labelled with their own protocol; this matrix is a separate, symmetric measurement and the README presents both."
   },

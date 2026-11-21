@@ -26,9 +26,13 @@ OUT = HERE / "docs"
 LABEL = {
     "colibri-cpu": ("Colibri (CPU)", "JustVugg/colibri", "CPU only"),
     "colibri-vulkan": ("Colibri (Vulkan)", "JustVugg/colibri", "CPU + GPU"),
-    "fennec-cpu": ("Fennec 2.5.0 (CPU)", "Liso7150/fennec", "CPU only"),
-    "fennec-vulkan": ("Fennec 2.5.0 (Vulkan)", "Liso7150/fennec", "CPU + GPU"),
-    "fennec-cuda": ("Fennec 2.5.0 (CUDA)", "Liso7150/fennec", "CPU + GPU"),
+    "fennec-cpu": ("Fennec (CPU)", "Liso7150/fennec", "CPU only"),
+    "fennec-vulkan": ("Fennec (Vulkan)", "Liso7150/fennec", "CPU + GPU"),
+    "fennec-cuda": ("Fennec (CUDA)", "Liso7150/fennec", "CPU + GPU"),
+    "llama-cpp-cpu": ("llama.cpp (CPU)", "ggml-org/llama.cpp", "CPU only"),
+    "llama-cpp-vulkan": ("llama.cpp (Vulkan)", "ggml-org/llama.cpp", "CPU + GPU"),
+    "llama-cpp-cuda": ("llama.cpp (CUDA)", "ggml-org/llama.cpp", "CPU + GPU"),
+    "llama-cpp-vulkan-mec": ("llama.cpp (Vulkan -cmoe)", "ggml-org/llama.cpp", "CPU + GPU"),
 }
 
 
@@ -51,10 +55,13 @@ def main() -> None:
         raise SystemExit("no ok cells in the matrix JSON")
     rows.sort(key=lambda r: -r["tok_s"])
 
-    sub = (f"One protocol for both engines: serve + one streaming completion, "
-           f"{data['tokens']} tokens, ctx {data['ctx']}, median of {data['pairs']}, "
-           f"measured {data['measured_at']}. Token counts come from "
-           f"usage.completion_tokens, not from counting SSE chunks.")
+    engines = sorted({r["repo"] for r in rows})
+    sub = (f"One protocol for {len(engines)} engines: serve + one streaming chat completion, "
+           f"{data['tokens']} tokens, ctx {data['ctx']}, measured {data['measured_at']}. Block "
+           f"cells are the median of {data['pairs']} runs; the ABBA lanes are the median of "
+           f"{data['rounds']} alternating visits. Token counts come from "
+           "usage.completion_tokens, not from counting SSE chunks. llama.cpp rows load a Q4_K_M "
+           "GGUF of the same checkpoint, the others the suite's int4 container.")
     charts = [
         ("engine-matrix-tok.svg", "tok_s", "tokens / second, higher is better",
          "Serve throughput — same checkpoint, same protocol, both engines", sub,
