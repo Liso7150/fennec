@@ -370,11 +370,12 @@ impl Server {
             if let Some((r, window)) = model.save_rates(p, model.rates_borrows) {
                 let g = |v: Option<f64>| v.map(|x| format!("{x:.1}")).unwrap_or_else(|| "-".into());
                 eprintln!(
-                    "[fennec] rates file {p} now holds: host {} GB/s, disk {}, quant {} | this turn {}",
+                    "[fennec] rates file {p} now holds: host {} GB/s, disk {}, quant {} | this turn {} | shape {}",
                     g(r.host_gbs),
                     g(r.disk_gbs),
                     g(r.quant_gbs),
-                    window
+                    window,
+                    r.shape_note()
                 );
             }
         }
@@ -593,9 +594,14 @@ impl Server {
                     // A dense checkpoint routes nothing, so its layers report
                     // zero hits rather than an error: the shape stays the same.
                     let moe = l.moe.as_ref();
+                    // `host_hits` stays the tier's pick coverage for anything
+                    // reading this endpoint: the prefill picks are answers the RAM
+                    // tier gave, even though the engine prices them on their own
+                    // window. `union_picks` carries the split.
                     json!({"layer": first + i,
                            "device_hits": moe.map_or(0, |m| m.dev_hits.load(Relaxed)),
-                           "host_hits": moe.map_or(0, |m| m.host_hits.load(Relaxed)),
+                           "host_hits": moe.map_or(0, |m| m.host_hits.load(Relaxed) + m.union_picks.load(Relaxed)),
+                           "union_picks": moe.map_or(0, |m| m.union_picks.load(Relaxed)),
                            "disk_hits": moe.map_or(0, |m| m.disk_hits.load(Relaxed))})
                 }).collect();
                 write_json(sock, 200, &json!({"layers": layers, "num_experts": self.cfg.num_experts,

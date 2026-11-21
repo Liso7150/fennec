@@ -150,12 +150,41 @@ pub struct Bandwidth {
 impl Bandwidth {
     /// RTX 4060 Laptop (8 GiB GDDR6, PCIe 4.0 x8) with DDR5-5600 in two channels.
     ///
-    /// `host_gbs` is 17, not the 45 the spec sheet claims: `fennec bench` streams
-    /// the MoE block at 18.5 GB/s and the lm_head at 15.4-17 GB/s on this box,
-    /// and a plan priced at the marketing number predicts three times the tokens
-    /// per second the stopwatch then refuses to produce. The CPU reads its own
-    /// RAM at that rate whether or not a GPU is attached, so both profiles share
-    /// it; only `device_gbs` differs.
+    /// `host_gbs` is 17, not the 45 the spec sheet claims. That 17 came from
+    /// `fennec bench`'s copy loop (18.5 GB/s over the MoE block, 15.4-17 over
+    /// lm_head), and #464 finally measured what the tier really does: the int4
+    /// expert GEMV holds 31-37 GB/s on private pages from 8 to 16 workers against
+    /// a 63.6 GB/s read ceiling, so the kernel - not the RAM - is the limit, and
+    /// it is already issue-limited at the shipped worker count. Two consequences
+    /// for this constant, both of which it now honors:
+    ///
+    /// - The seed stays a *served* rate, not the kernel's best. The per-turn
+    ///   windows the engine logs read 3.1 GB/s on the CUDA lane (33645 MB in
+    ///   10827 ms) and 5.1-8.0 on the CPU lane (17222 MB in 3404 ms, 64592 in 8121,
+    ///   54669 in 7820), so 17 is high against every served window this box has
+    ///   recorded - and those windows are themselves generous, because until #473
+    ///   they blended the decode tier with the prefill union and double-billed the
+    ///   union's bytes: the r20 CPU arm reported 759 MB/token against the 542 MiB a
+    ///   token can read even when every one of its 320 picks comes from RAM. The
+    ///   decode-only rate is what the next serve session reports; this constant is a
+    ///   seed, and `Measured::host_gbs` replaces it as soon as a run of the same
+    ///   tier shape has timed one.
+    /// - It must not be read as a ceiling to buy back with more threads. The
+    ///   marginal byte past ~8 workers is already free of bandwidth pressure
+    ///   (efficiency falls 85-91 % to 57-62 % while GB/s stays flat), so a plan
+    ///   that expects a tier to get proportionally faster per worker is wrong
+    ///   twice over. The planner has no worker axis to get it wrong on, which is
+    ///   the one part of #473 that needed no code.
+    ///
+    /// The CPU reads its own RAM at that rate whether or not a GPU is attached, so
+    /// both profiles share it; only `device_gbs` differs.
+    ///
+    /// Two findings from #464 that would otherwise get re-bought: reading the same
+    /// packs as *file-mapped* pages costs 79-101 % of the private-buffer time
+    /// (freeing 12 GiB of commit for a few percent, which is the trade the brief
+    /// asks for), and randomising the pick order changes the time by
+    /// -3.8 %...+3.6 % - the router's hot list is already effectively random, so no
+    /// placement wins by reordering it.
     pub fn laptop_4060() -> Bandwidth {
         Bandwidth {
             device_gbs: 272.0,
@@ -167,7 +196,10 @@ impl Bandwidth {
     }
 
     /// CPU-only decode: everything is read from system RAM, so the device tier
-    /// is a second name for the host tier and every bandwidth is the host's.
+    /// is a second name for the host tier and every bandwidth is the host's. Same
+    /// 17 GB/s and the same provenance, with one difference worth naming: with no
+    /// device batch competing for the memory controller, this is the lane where
+    /// the seed is closest to what a served window reports.
     pub fn cpu_only() -> Bandwidth {
         Bandwidth {
             device_gbs: 17.0,
@@ -221,11 +253,17 @@ pub struct Measured {
     /// sample wins, as with `disk_gbs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quant_gbs: Option<f64>,
-    /// Decimal GB/s the host tier sustained while computing picks, which is the
-    /// only window a placement decision is made in. `Model::host_traffic` times
-    /// it on the decode path and the batched-prefill union separately, because
-    /// the load that fills the tier runs several times faster than the work that
-    /// reads it (r13). The warmest sample wins: see `merge`.
+    /// Decimal GB/s the host tier sustained while computing decode picks, which
+    /// is the only window a placement decision is made in. `Model::host_traffic`
+    /// times it on the decode path; the batched-prefill union, which reads one
+    /// pack per expert instead of one per pick, is timed on its own and never
+    /// priced here (#473). The warmest sample of the same shape wins: see `merge`.
+    ///
+    /// This is a served-path *achievement*, not a property of the memory. It is
+    /// taken while the device batch is in flight and the workers share the
+    /// controller with everything else in the token, so it is the right number to
+    /// quote as contention and the wrong one to quote as what the RAM can do: #464
+    /// measured the same packs read at 31-37 GB/s on an idle box.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_gbs: Option<f64>,
     /// Matrix bytes held per byte committed by the RAM tier: 9.0-ish when every
@@ -238,6 +276,18 @@ pub struct Measured {
     /// a borrowed `disk_gbs` from a copied one instead of guessing from the box.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub borrows: bool,
+    /// Worker threads one decode pick was split over, and the matrix bytes such a
+    /// pick reads: the two facts that decide whether two samples of `host_gbs` or
+    /// `disk_gbs` describe the same machine's work. Both have changed under a
+    /// still-valid rates file - #463 had the tier computing at `threads = 1` for
+    /// the life of the process, #419 changed the fill, #225 and #464 changed the
+    /// pack from 1.69 MiB to 0.85 and back - and a rate cannot outlive its shape.
+    /// Absent in a file written before the shape was recorded, which `merge`
+    /// treats as a mismatch rather than as a wildcard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threads: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pick_bytes: Option<u64>,
 }
 
 impl Measured {
@@ -273,22 +323,37 @@ impl Measured {
     /// borrowed expert and records a host tier near what cold memory did once;
     /// the passes after it hit pages the OS still holds, and those are the ones a
     /// placement decision lasts over, because RAM that is resident stays resident
-    /// for the life of the plan. So the host rate keeps its best sample. The
-    /// streamed tier is the mirror image: the same pack read a second time comes
-    /// out of the OS cache at over 20 GB/s, which is a fact about the cache and
-    /// not about the drive, and the only sample that prices the streamed lane is
-    /// the one that had to go to disk. So disk and quantise keep their worst.
-    /// Measured on one box, four runs apart, the same 8 GiB borrowed tier: 3.5
-    /// GB/s on a cold cache and 11.5 on a warm one, disk 4.4 cold and 22.9 warm.
+    /// for the life of the plan. So the host rate keeps its best sample - bounded
+    /// now, because #464 measured the warming itself: the same packs read as
+    /// file-mapped pages cost 79-101 % of the time they cost in private buffers, so
+    /// the warmest honest sample is at most 1/0.79 = 1.27x the coldest one.
+    /// (The 5x gap that this file used to show between its stored rate and its own
+    /// logged windows came from blending the two paths, not from warmth - see
+    /// `Model::host_traffic`.) The streamed tier is the mirror image: the same pack
+    /// read a second time comes out of the OS cache at over 20 GB/s, which is a
+    /// fact about the cache and not about the drive, and the only sample that
+    /// prices the streamed lane is the one that had to go to disk. So disk and
+    /// quantise keep their worst. Measured on one box, four runs apart, the same
+    /// 8 GiB borrowed tier: 3.5 GB/s on a cold cache and 11.5 on a warm one, disk
+    /// 4.4 cold and 22.9 warm.
     ///
-    /// A change in the fill shape resets the traffic rates. A tier that memcpys
+    /// A change in the tier's shape resets the traffic rates. A tier that memcpys
     /// packs out of a mapping and one that reads a whole source and encodes it are
-    /// different machines as far as either number means anything, and the newest
-    /// shape is the one the next plan is built for.
+    /// different machines as far as either number means anything; so are 1 worker
+    /// and 16, and 1.69 MiB per pick and 0.85 (#463, #419, #225). The newest shape
+    /// is the one the next plan is built for, so it is the only shape whose
+    /// samples survive into it - which is also what stops `warmest` from being a
+    /// ratchet: a rate that can only ever go up, and that survived every rebuild
+    /// until now, held 21.7 GB/s on a box whose served windows never read above 8.
     pub fn merge(&mut self, fresh: &Measured) {
-        if fresh.borrows != self.borrows {
+        if !(self.borrows == fresh.borrows
+            && self.threads == fresh.threads
+            && self.pick_bytes == fresh.pick_bytes)
+        {
             *self = Measured {
                 borrows: fresh.borrows,
+                threads: fresh.threads,
+                pick_bytes: fresh.pick_bytes,
                 ..Default::default()
             };
         }
@@ -299,6 +364,20 @@ impl Measured {
         // off the tier's own accounting. The newest run describes the newest build.
         if fresh.held_ratio.is_some() {
             self.held_ratio = fresh.held_ratio;
+        }
+    }
+
+    /// The conditions the traffic rates were earned under, for the lines that
+    /// quote them. "host 21.7 GB/s" was read as a property of the box for three
+    /// campaigns; it is a property of one shape, so the shape travels with it.
+    pub fn shape_note(&self) -> String {
+        match (self.threads, self.pick_bytes) {
+            (Some(t), Some(b)) => format!(
+                "{t} workers per pick, {:.2} MiB each",
+                b as f64 / 1_048_576.0
+            ),
+            (Some(t), None) => format!("{t} workers per pick, pack size unrecorded"),
+            (None, _) => "shape unrecorded".into(),
         }
     }
 }
@@ -814,12 +893,15 @@ mod tests {
             host_gbs: Some(12.1),
             held_ratio: Some(8.9),
             borrows: true,
+            threads: Some(8),
+            pick_bytes: Some(1_769_472),
         };
         m.save(&path).unwrap();
         let back = Measured::load(&path).unwrap();
         assert_eq!(back.disk_gbs, Some(17.4));
         assert_eq!(back.quant_gbs, None);
         assert!(back.borrows);
+        assert_eq!((back.threads, back.pick_bytes), (Some(8), Some(1_769_472)));
         // A rate the run never measured must not overwrite the seed profile:
         // `quant_gbs: None` means "this tier borrowed", not "encode is free".
         let mut bw = Bandwidth::laptop_4060();
@@ -831,10 +913,13 @@ mod tests {
         assert_eq!(bw.device_gbs, 272.0);
         // And a later turn of the same shape that saw no streaming must leave the
         // earned disk rate standing rather than writing its own silence over it.
+        let (th, pb) = (back.threads, back.pick_bytes);
         let mut kept = back;
         kept.merge(&Measured {
             host_gbs: Some(9.0),
             borrows: true,
+            threads: th,
+            pick_bytes: pb,
             ..Default::default()
         });
         assert_eq!(kept.disk_gbs, Some(17.4));
@@ -850,6 +935,8 @@ mod tests {
         slow.merge(&Measured {
             disk_gbs: Some(4.4),
             borrows: true,
+            threads: th,
+            pick_bytes: pb,
             ..Default::default()
         });
         assert_eq!(slow.disk_gbs, Some(4.4));
@@ -864,6 +951,70 @@ mod tests {
         assert_eq!(flipped.host_gbs, Some(1.6));
         assert!(!flipped.borrows, "the shape flag follows the newest run");
         std::fs::remove_file(&path).ok();
+    }
+
+    /// #473: a rate is a property of a shape, not of a box. The worker count and
+    /// the pack size have both changed under a rates file that stayed valid -
+    /// #463 left the tier computing at one thread, #225 and #464 moved the pack
+    /// between 1.69 and 0.85 MiB - and `warmest` carried the old sample forward as
+    /// the price of the new tier. That is how 21.7 GB/s came to price a tier whose
+    /// logged windows read 3-8.
+    #[test]
+    fn a_rate_does_not_survive_the_shape_that_earned_it() {
+        let mut m = Measured {
+            host_gbs: Some(21.7),
+            disk_gbs: Some(3.4),
+            borrows: true,
+            threads: Some(1),
+            pick_bytes: Some(1_769_472),
+            ..Default::default()
+        };
+        m.merge(&Measured {
+            host_gbs: Some(4.3),
+            borrows: true,
+            threads: Some(16),
+            pick_bytes: Some(1_769_472),
+            ..Default::default()
+        });
+        assert_eq!(m.host_gbs, Some(4.3), "warmest cannot ratchet across worker counts");
+        assert_eq!(m.disk_gbs, None, "the reset is the file, not the field that moved");
+        assert_eq!(m.threads, Some(16), "the newest shape is what the next plan is built for");
+        // An unlabelled file - every shape field absent, which is what every rates
+        // file on disk looked like before this - is not a wildcard either.
+        let mut legacy = Measured {
+            host_gbs: Some(21.7),
+            borrows: true,
+            ..Default::default()
+        };
+        legacy.merge(&Measured {
+            host_gbs: Some(4.3),
+            borrows: true,
+            threads: Some(16),
+            pick_bytes: Some(1_769_472),
+            ..Default::default()
+        });
+        assert_eq!(legacy.host_gbs, Some(4.3));
+        // Same shape both sides, and the rule is still the warmest pass: #464
+        // bounded what warmth can be worth (1.27x) rather than making it impossible.
+        let mut same = Measured {
+            host_gbs: Some(4.3),
+            threads: Some(16),
+            pick_bytes: Some(1_769_472),
+            ..Default::default()
+        };
+        same.merge(&Measured {
+            host_gbs: Some(4.9),
+            threads: Some(16),
+            pick_bytes: Some(1_769_472),
+            ..Default::default()
+        });
+        assert_eq!(same.host_gbs, Some(4.9));
+        assert_eq!(same.shape_note(), "16 workers per pick, 1.69 MiB each");
+        assert_eq!(
+            Measured { threads: Some(8), ..Default::default() }.shape_note(),
+            "8 workers per pick, pack size unrecorded"
+        );
+        assert_eq!(Measured::default().shape_note(), "shape unrecorded");
     }
 
     #[test]

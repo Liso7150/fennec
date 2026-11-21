@@ -8,6 +8,7 @@
 //! second assertion that pins the kernel to its own dequantised weights.
 
 use std::path::PathBuf;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 
 use fennec::config::{LayerKind, TextConfig};
@@ -438,7 +439,33 @@ fn grouped_expert_prefill_is_bit_identical_to_the_token_loop() {
     let buf = f32s(&x.data);
     let n = buf.len() / h;
     let mut grouped = vec![0f32; n * h];
+    // The batched union is the one host path `decode` never reaches - its only
+    // call site is `serve`'s chunked arm - so its accounting gets checked here, on
+    // a layer loaded from the real checkpoint. Routing is a pure function of the
+    // row, so the picks the chunk makes inside `prefill` are these ones.
+    let (slot, pack) = (m.slot.clone(), m.host_pick_bytes() as u64);
+    let picks: Vec<usize> = (0..n).flat_map(|r| m.route(&buf[r * h..(r + 1) * h]).ids).collect();
+    let mut resident: Vec<usize> =
+        picks.iter().copied().filter(|&id| slot[id] >= 0).collect();
+    resident.sort_unstable();
+    let mut unique = resident.clone();
+    unique.dedup();
+    let (res_picks, res_experts) = (resident.len() as u64, unique.len() as u64);
+    let (u0, b0, h0, d0) = (
+        m.union_picks.load(Relaxed),
+        m.host_union_bytes.load(Relaxed),
+        m.host_hits.load(Relaxed),
+        m.disk_hits.load(Relaxed),
+    );
     assert!(m.prefill(&buf, &mut grouped), "a {n}-row chunk groups its expert picks");
+    // What the union charged, held until the outputs are proven identical: the
+    // routing is `gemv_batch` here and `gemv` in the loop, and the accounting only
+    // means anything once those two agree bit for bit.
+    let (du, db) = (
+        m.union_picks.load(Relaxed) - u0,
+        m.host_union_bytes.load(Relaxed) - b0,
+    );
+    let (dh, dd) = (m.host_hits.load(Relaxed) - h0, m.disk_hits.load(Relaxed) - d0);
     let mut differ = 0usize;
     let mut ids = Vec::with_capacity(n * k);
     for r in 0..n {
@@ -461,6 +488,37 @@ fn grouped_expert_prefill_is_bit_identical_to_the_token_loop() {
         n * k - ids.len()
     );
     assert_eq!(differ, 0, "row outputs that differ from `n` calls of forward");
+    // One pack per *expert* the chunk touched, and nothing at all on the decode
+    // tiers. Folding the union's picks into `host_hits` while also summing its
+    // experts into `host_union_bytes` is what let the rate file claim 21.7 GB/s on
+    // a lane the profiler timed at 4.3 (see `Model::host_traffic`), and
+    // `Measured::merge` keeps the warmest sample, so the blend was always quoted as
+    // the price. Each path has to own its own traffic for a GB/s to mean anything.
+    assert_eq!(du, res_picks, "one union pick per resident pick of the chunk");
+    assert_eq!(db, res_experts * pack, "one pack per union expert, not one per pick");
+    assert_eq!(dh, 0, "a prefill pick is not a decode pick");
+    assert_eq!(dd, 0, "a prefill miss is not a decode miss");
+    // The same chunk walked one token at a time, which is what the tier's decode
+    // rate is priced on: `n` rows picked `res_picks` resident experts and each of
+    // those cost a full pack, reuse or no reuse.
+    let loop_picks = m.host_hits.load(Relaxed) - h0 - dh;
+    let loop_misses = m.disk_hits.load(Relaxed) - d0 - dd;
+    assert_eq!(loop_picks, res_picks, "the token loop bills its own picks once each");
+    assert_eq!(loop_misses, (n * k) as u64 - res_picks, "and its own misses");
+    assert_eq!(
+        m.decode_traffic().0 - h0 * pack,
+        loop_picks * pack,
+        "decode traffic is one pack per pick, union bytes excluded"
+    );
+    assert_eq!(m.union_traffic().0 - b0, db, "the union keeps its own bytes");
+    println!(
+        "  union accounting: {du} resident picks billed {} packs of {pack} B \
+         ({du} reads over {res_experts} experts, {} shared); the fold billed {} packs \
+         for the same {res_experts} weight reads",
+        db / pack,
+        du - res_experts,
+        du + db / pack,
+    );
     let mut one = vec![0f32; h];
     assert!(!m.prefill(&buf[..h], &mut one), "a single row has no union to group");
 }

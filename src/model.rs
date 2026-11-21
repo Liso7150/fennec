@@ -633,9 +633,19 @@ pub struct MoeLayer {
     /// guessing at - and the one a placement decision is priced with, so it is
     /// measured on the real work instead of on a copy loop.
     pub host_ns: AtomicU64,
+    /// Picks the batched-prefill union answered, and the nanoseconds its window
+    /// ran. Deliberately separate from `host_hits`/`host_ns`: the union reads one
+    /// pack per *expert* and reuses it across every pick of the chunk, so its
+    /// bytes-per-second is a different quantity from the decode tier's, and the
+    /// plan prices decode tokens. Folding the two together is what made the rate
+    /// file claim 21.7 GB/s on a tier the profiler timed at 4.3 (see
+    /// `host_traffic`), and `Measured::merge` keeps the warmest sample, so the
+    /// blend was always quoted as the price.
+    pub union_picks: AtomicU64,
+    pub union_ns: AtomicU64,
     /// Matrix bytes the batched-prefill union read. A pick is a pick in
-    /// `host_hits`, but the union touches each expert once for the whole chunk,
-    /// so the traffic on that path is not `host_hits` x pack and adding the two
+    /// `union_picks`, but the union touches each expert once for the whole chunk,
+    /// so the traffic on that path is not `union_picks` x pack and adding the two
     /// together would make the tier look faster than it moved.
     pub host_union_bytes: AtomicU64,
     /// Selections per expert id since this process started. The plan that hands
@@ -807,6 +817,8 @@ impl MoeLayer {
             overlap_ns: AtomicU64::new(0),
             host_ns: AtomicU64::new(0),
             host_union_bytes: AtomicU64::new(0),
+            union_picks: AtomicU64::new(0),
+            union_ns: AtomicU64::new(0),
             picks,
         })
     }
@@ -859,6 +871,8 @@ impl MoeLayer {
             overlap_ns: AtomicU64::new(0),
             host_ns: AtomicU64::new(0),
             host_union_bytes: AtomicU64::new(0),
+            union_picks: AtomicU64::new(0),
+            union_ns: AtomicU64::new(0),
             picks,
         }
     }
@@ -947,6 +961,29 @@ impl MoeLayer {
         } else {
             self.host_bytes() / n
         }
+    }
+
+    /// Bytes and nanoseconds the per-token host path moved: one pack per pick,
+    /// over the window the picks ran. `host_pick_bytes` is the tier's own pack, so
+    /// a borrowed pair and an int2 pair are priced at what they actually are.
+    pub fn decode_traffic(&self) -> (u64, u64) {
+        (
+            self.host_hits
+                .load(Relaxed)
+                .saturating_mul(self.host_pick_bytes() as u64),
+            self.host_ns.load(Relaxed),
+        )
+    }
+
+    /// Bytes and nanoseconds the batched-prefill union moved: one pack per expert
+    /// the chunk touched, summed where the read happened. Kept out of
+    /// `decode_traffic` because a union pick costs a *fraction* of a pack, and the
+    /// two folded together priced decode at 21.7 GB/s on a lane timed at 4.3.
+    pub fn union_traffic(&self) -> (u64, u64) {
+        (
+            self.host_union_bytes.load(Relaxed),
+            self.union_ns.load(Relaxed),
+        )
     }
 
     pub fn host_gu_bytes(&self) -> usize {
@@ -1471,7 +1508,7 @@ impl MoeLayer {
         let mut parts = vec![0f32; n * k * h];
         {
             let _cpu = prof::start(prof::MOE_CPU);
-            self.host_hits
+            self.union_picks
                 .fetch_add((n * k - cold.len()) as u64, Relaxed);
             // Prime the next layer while this one still has host work left to
             // do; this layer's own misses are too late to overlap anything.
@@ -1561,7 +1598,7 @@ impl MoeLayer {
             });
             self.host_union_bytes
                 .fetch_add(nu as u64 * self.host_pick_bytes() as u64, Relaxed);
-            self.host_ns
+            self.union_ns
                 .fetch_add(t_host.elapsed().as_nanos() as u64, Relaxed);
         }
         let si = self.cfg.shared_expert_intermediate_size;
@@ -3558,6 +3595,8 @@ struct LaneWindow {
     quant_ms: f64,
     host_bytes: u64,
     host_ns: u64,
+    union_bytes: u64,
+    union_ns: u64,
 }
 
 impl LaneWindow {
@@ -3570,6 +3609,8 @@ impl LaneWindow {
             quant_ms: self.quant_ms - prev.quant_ms,
             host_bytes: self.host_bytes.saturating_sub(prev.host_bytes),
             host_ns: self.host_ns.saturating_sub(prev.host_ns),
+            union_bytes: self.union_bytes.saturating_sub(prev.union_bytes),
+            union_ns: self.union_ns.saturating_sub(prev.union_ns),
         }
     }
 }
@@ -3968,21 +4009,67 @@ impl Model {
         t
     }
 
-    /// Bytes the RAM tier read and the nanoseconds it spent reading them, over
-    /// this process's life. Both shapes count: a decode pick reads one pack, the
-    /// batched-prefill union reads one per expert it touched rather than one per
-    /// pick, and folding the two together is what makes the derived rate the one
-    /// a placement decision should be priced with.
+    /// Bytes the RAM tier read on the decode path and the nanoseconds it spent
+    /// reading them, over this process's life. One pack per pick, so bytes/ns is
+    /// the rate a per-token placement decision is priced with.
+    ///
+    /// The batched-prefill union used to be folded in here, and that is why the
+    /// rates file held 21.7 GB/s for a tier the served profiler timed at 4.3: the
+    /// union's picks were counted in `host_hits` *and* its experts in
+    /// `host_union_bytes`, so a 26-token chunk billed (picks + experts) x pack for
+    /// the traffic of experts x pack, and `Measured::merge` keeps the warmest
+    /// sample, which is always the chunk with the most reuse. Two paths that do
+    /// different work per byte cannot share one price; the union reports on its own
+    /// through `union_traffic`.
     pub fn host_traffic(&self) -> (u64, u64) {
         let (mut bytes, mut ns) = (0u64, 0u64);
         for l in &self.layers {
             if let Some(m) = &l.moe {
-                bytes +=
-                    m.host_hits.load(Relaxed) * m.host_pick_bytes() as u64 + m.host_union_bytes.load(Relaxed);
-                ns += m.host_ns.load(Relaxed);
+                let (b, n) = m.decode_traffic();
+                bytes += b;
+                ns += n;
             }
         }
         (bytes, ns)
+    }
+
+    /// The same pair for the batched-prefill union: one pack per expert the chunk
+    /// touched, over the window that read it. Printed, not priced - the plan ranks
+    /// tokens, not prompt chunks - and it is the number that says whether a cold
+    /// prompt is being served out of the tier the prefiller expected.
+    pub fn union_traffic(&self) -> (u64, u64) {
+        let (mut bytes, mut ns) = (0u64, 0u64);
+        for l in &self.layers {
+            if let Some(m) = &l.moe {
+                bytes += m.host_union_bytes.load(Relaxed);
+                ns += m.union_ns.load(Relaxed);
+            }
+        }
+        (bytes, ns)
+    }
+
+    /// What the RAM tier *was* when it moved those bytes: the workers one pick was
+    /// split over, and the matrix bytes a pick reads. Both are rate-bearing, both
+    /// have changed under a still-valid rates file, and neither can be recovered
+    /// afterwards - #463 found the tier computing with `threads = 1` for the life
+    /// of the process, and #225/#464 changed the pack from 1.77 MiB to 0.88 and
+    /// back. `Measured::merge` drops a sample whose shape differs from the file's.
+    ///
+    /// The widest layer answers: every MoE layer gets the same count from
+    /// `Layer::set_threads`, and a layer with no RAM tier contributes zero, so a
+    /// max is how you read the one real value without assuming the stack is uniform.
+    fn host_shape(&self) -> (Option<u32>, Option<u64>) {
+        let (mut threads, mut pick) = (0usize, 0usize);
+        for l in &self.layers {
+            if let Some(m) = &l.moe {
+                threads = threads.max(m.threads);
+                pick = pick.max(m.host_pick_bytes());
+            }
+        }
+        (
+            (threads > 0).then(|| threads as u32),
+            (pick > 0).then(|| pick as u64),
+        )
     }
 
     /// Matrix bytes the RAM tier presents per byte it commits: around 9 when
@@ -4041,6 +4128,8 @@ impl Model {
     pub fn save_rates(&self, path: &str, borrows: bool) -> Option<(crate::sched::Measured, String)> {
         let st = self.stream_totals();
         let (bytes, ns) = self.host_traffic();
+        let (ub, uns) = self.union_traffic();
+        let (threads, pick_bytes) = self.host_shape();
         let now = LaneWindow {
             read_bytes: st.read_bytes,
             read_ms: st.read_ms,
@@ -4048,6 +4137,8 @@ impl Model {
             quant_ms: st.quant_ms,
             host_bytes: bytes,
             host_ns: ns,
+            union_bytes: ub,
+            union_ns: uns,
         };
         let turn = {
             let mut seen = self.rates_seen.lock().unwrap();
@@ -4060,17 +4151,21 @@ impl Model {
             quant_gbs: Self::sustained_gbs(turn.quant_bytes, turn.quant_ms),
             host_gbs: Self::sustained_gbs(turn.host_bytes, turn.host_ns as f64 / 1e6),
             held_ratio: (bytes > 0).then(|| self.host_held_ratio()).flatten(),
+            threads,
+            pick_bytes,
             borrows,
         };
         if fresh.is_empty() {
             return None;
         }
         let window = format!(
-            "streamed {} MB in {:.0} ms, host {} MB in {:.0} ms",
+            "streamed {} MB in {:.0} ms, host {} MB in {:.0} ms, union {} MB in {:.0} ms",
             turn.read_bytes / 1_048_576,
             turn.read_ms,
             turn.host_bytes / 1_048_576,
-            turn.host_ns as f64 / 1e6
+            turn.host_ns as f64 / 1e6,
+            turn.union_bytes / 1_048_576,
+            turn.union_ns as f64 / 1e6
         );
         let mut merged = crate::sched::Measured::load(path).unwrap_or_default();
         merged.merge(&fresh);
@@ -4536,5 +4631,71 @@ mod tests {
         let idle = after_turn2.since(&after_turn2);
         assert_eq!(Model::sustained_gbs(idle.read_bytes, idle.read_ms), None);
         assert_eq!(Model::sustained_gbs(idle.host_bytes, idle.host_ns as f64 / 1e6), None);
+    }
+
+    /// The union and the per-token picks read the same packs, not the same number
+    /// of them: a 26-token chunk that routes 8 picks a token may reach three of
+    /// the tier's resident experts. Folding the union's picks into `host_hits`
+    /// while also summing its experts into `host_union_bytes` billed 29 packs for
+    /// 3 reads, and because `Measured::merge` keeps the warmest sample the most
+    /// reuse-heavy chunk of every run set the price - the rates file's 21.7 GB/s
+    /// against the 3.1-8.0 GB/s the served profiler timed on the same tier.
+    #[test]
+    fn a_prefill_union_pick_bills_the_expert_not_the_token() {
+        let cfg = Arc::new(TextConfig {
+            hidden_size: 128,
+            num_hidden_layers: 1,
+            vocab_size: 256,
+            rms_norm_eps: 1e-6,
+            norm_zero_centered: true,
+            layer_types: vec![LayerKind::Full],
+            num_attention_heads: 2,
+            num_key_value_heads: 2,
+            head_dim: 64,
+            partial_rotary_factor: 1.0,
+            rope_theta: 1e6,
+            attn_output_gate: false,
+            intermediate_size: 0,
+            tie_word_embeddings: false,
+            linear_num_key_heads: 0,
+            linear_num_value_heads: 0,
+            linear_key_head_dim: 0,
+            linear_value_head_dim: 0,
+            linear_conv_kernel_dim: 0,
+            num_experts: 8,
+            num_experts_per_tok: 2,
+            moe_intermediate_size: 64,
+            shared_expert_intermediate_size: 64,
+            prefix: "model".into(),
+            name: "tiny-host-tier".into(),
+        });
+        let (h, i, group) = (cfg.hidden_size, cfg.moe_intermediate_size, 64);
+        // Two experts resident: gate|up is 2*I rows per expert, down is H rows.
+        let gu = Q4::quantize(&weights(2 * i * 2, h, 1), 2 * i * 2, h, group, 2);
+        let dn = Q4::quantize(&weights(h * 2, i, 2), h * 2, i, group, 2);
+        let parts = MoeParts {
+            gate: Dense::F32(vec![]),
+            s_gate: Dense::F32(vec![]),
+            s_up: Dense::F32(vec![]),
+            s_down: Dense::F32(vec![]),
+            s_egate: vec![],
+        };
+        let m = MoeLayer::from_parts(cfg, 0, parts, gu, dn, 4);
+        let pack = m.host_pick_bytes() as u64;
+        assert!(pack > 0, "a tier with a resident expert has a pack to price");
+
+        // Five decode picks in 50 us, and one chunk that reached three experts in
+        // 9 us of union time.
+        m.host_hits.store(5, Relaxed);
+        m.host_ns.store(50_000, Relaxed);
+        m.union_picks.store(26, Relaxed);
+        m.host_union_bytes.store(3 * pack, Relaxed);
+        m.union_ns.store(9_000, Relaxed);
+
+        assert_eq!(m.decode_traffic(), (5 * pack, 50_000));
+        assert_eq!(m.union_traffic(), (3 * pack, 9_000));
+        // The arithmetic the folded counter produced for the same traffic.
+        let folded = m.union_picks.load(Relaxed) * pack + m.host_union_bytes.load(Relaxed);
+        assert_eq!(folded, 29 * pack);
     }
 }

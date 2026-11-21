@@ -827,8 +827,19 @@ fn plan(opts: &Opts) -> Result<(), String> {
     let earned = measured.host_gbs.is_some()
         || measured.disk_gbs.is_some()
         || measured.quant_gbs.is_some();
+    // The host rate is only comparable to the shape that earned it: the same
+    // GB/s means different bytes per token at a different worker count and pack
+    // size, and a seed file carried over from another build would otherwise be
+    // read as a like-for-like number.
     let rates_note = match (&s.rates, earned) {
-        (Some(p), true) => format!("{p} (measured on this box)"),
+        (Some(p), true) => format!(
+            "{p} (measured on this box{})",
+            if measured.host_gbs.is_some() {
+                format!(", {}", measured.shape_note())
+            } else {
+                String::new()
+            }
+        ),
         (Some(p), false) => format!("none yet, priced on the compiled-in profile (runs write {p})"),
         (None, _) => "dense stack: no lane to time".into(),
     };
@@ -1557,18 +1568,19 @@ fn decode(opts: &Opts, threads: usize) -> Result<(), String> {
         st.quant_ms,
         st.quant_gbs(),
     );
-    let (dev_hits, host_hits, disk_hits, overlap_ns) = m.layers.iter().fold(
-        (0u64, 0u64, 0u64, 0u64),
-        |(a, b, c, d), l| {
+    let (dev_hits, host_hits, union_hits, disk_hits, overlap_ns) = m.layers.iter().fold(
+        (0u64, 0u64, 0u64, 0u64, 0u64),
+        |(a, b, u, c, d), l| {
             (
                 a + l.moe.as_ref().map_or(0, |m| m.dev_hits.load(std::sync::atomic::Ordering::Relaxed)),
                 b + l.moe.as_ref().map_or(0, |m| m.host_hits.load(std::sync::atomic::Ordering::Relaxed)),
+                u + l.moe.as_ref().map_or(0, |m| m.union_picks.load(std::sync::atomic::Ordering::Relaxed)),
                 c + l.moe.as_ref().map_or(0, |m| m.disk_hits.load(std::sync::atomic::Ordering::Relaxed)),
                 d + l.moe.as_ref().map_or(0, |m| m.overlap_ns.load(std::sync::atomic::Ordering::Relaxed)),
             )
         },
     );
-    let routed = (dev_hits + host_hits + disk_hits).max(1);
+    let routed = (dev_hits + host_hits + union_hits + disk_hits).max(1);
     // The prefetcher's ledger: a hit is a disk read that landed during another
     // layer's compute instead of in front of the token that needed it.
     let pf = m.prefetcher.as_ref().map(|pf| pf.stats());
@@ -1592,6 +1604,16 @@ fn decode(opts: &Opts, threads: usize) -> Result<(), String> {
             g.submitted(),
             overlap_ns as f64 / 1e6,
         );
+        // The prefill union's picks ride outside the percentage line above on
+        // purpose: they were answered out of the same tier, but one read served
+        // several of them, so their bytes-per-second is not the rate a token is
+        // priced with and folding them in would move the coverage number without
+        // moving the price.
+        if union_hits > 0 {
+            println!(
+                "  plus {union_hits} picks answered by the batched-prefill union (one pack per expert, priced separately)",
+            );
+        }
         let steps = step_ms.len().max(1) as f64;
         println!(
             "  device sync: {} waits, {:.1} ms total ({:.3} ms/wait) | {:.1} ms/token of the \
@@ -1652,11 +1674,12 @@ fn decode(opts: &Opts, threads: usize) -> Result<(), String> {
         if let Some((r, window)) = m.save_rates(p, s.borrows) {
             let g = |v: Option<f64>| v.map(|x| format!("{x:.1}")).unwrap_or_else(|| "-".into());
             println!(
-                "  rates file {p} now holds: host {} GB/s, disk {}, quant {}, held {}x matrix per byte committed | this run {}",
+                "  rates file {p} now holds: host {} GB/s, disk {}, quant {}, held {}x matrix per byte committed, shape {} | this run {}",
                 g(r.host_gbs),
                 g(r.disk_gbs),
                 g(r.quant_gbs),
                 g(r.held_ratio),
+                r.shape_note(),
                 window
             );
         }
@@ -1678,6 +1701,7 @@ fn decode(opts: &Opts, threads: usize) -> Result<(), String> {
                 "usage_store": s.store,
                 "gpu": gpu.is_some(), "device_experts": on_dev,
                 "dev_hits": dev_hits, "host_hits": host_hits, "disk_hits": disk_hits,
+                "union_picks": union_hits,
                 "cpu_overlap_ms": overlap_ns as f64 / 1e6,
                 "prefetch_hits": pf.map_or(0, |s| s.0),
                 "prefetch_misses": pf.map_or(0, |s| s.1),
