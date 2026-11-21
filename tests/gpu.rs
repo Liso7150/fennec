@@ -808,30 +808,53 @@ fn the_device_works_after_the_handle_moves_to_another_thread() {
 ///     --ignored --nocapture
 /// ```
 ///
-/// # What it said on CUDA, and what that decided
+/// # What it said, and what that decided
 ///
 /// The stage is weight bandwidth (`logs/mixer-bandwidth.log`, task #470). One
 /// GDN layer streams 67371008 bytes = 64.25 MiB of f16 weights, and the fused
-/// submit moves them at 193 GB/s against the 230 GB/s the *same kernel* gets from
-/// a 64 MiB buffer: 84% of what the bus allows at that moment. `fused x 30
-/// layers` = 10.5 ms/token, which is where the served `mixer dev device` row
-/// sits (10.14-11.58), so one layer's cost times the layer count is the whole
-/// stage and no launch, record or fence arithmetic is missing from it.
+/// submit moves them at 190-196 GB/s against the 227-234 GB/s the *same kernel*
+/// gets from a 64 MiB buffer: 81-85% of what the bus allows at that moment.
+/// `fused x 30 layers` = 10.34-10.67 ms/token, which is where the served
+/// `mixer dev device` row sits (10.14-11.58), so one layer's cost times the layer
+/// count is the whole stage and no launch, record or fence arithmetic is missing
+/// from it. The parts of a layer add up the same way: bus time at the session's
+/// own ceiling (288-293 us) plus gdn_conv and gdn_rec (41-49 us), which do not
+/// overlap the gemv traffic, accounts for 93-98% of the measured layer. On CUDA
+/// there is no bandwidth left for a better f16 gemv shape to find.
 ///
-/// Two readings the probe exists to prevent:
+/// Three readings the probe exists to prevent:
 ///
 /// * **The part rows are not a target.** Each replays one buffer 300 times, so
-///   its weights stay in the on-die cache and it prints 443-574 GB/s on a card
-///   whose DRAM ceiling is 230. Adding the parts (205 us) and calling the fused
-///   layer (350 us) a regression measures cache, not code.
+///   its weights stay in the on-die cache and it prints 415-577 GB/s on a card
+///   whose DRAM ceiling is 230. Adding the parts (200-225 us) and calling the
+///   fused layer (344-379 us) a regression measures cache, not code.
 /// * **The ceiling has to be measured under sustained load.** This card idles its
-///   memory bus at 810 MHz of an 8001 MHz maximum, and a burst taken before it
-///   ramps reads 160-205 GB/s. Three seconds of continuous reads first is what
-///   makes the ceiling line mean anything.
+///   memory bus at 810 MHz of an 8001 MHz maximum, so a burst taken before it
+///   ramps reads 11% below the same buffer three seconds later (202-204 against
+///   227-230) and a session made only of bursts read 160. Never divide a layer by
+///   a burst: the ratio flatters the layer.
+/// * **The random-vs-zeroes passes run in sequence**, so on a cold card the second
+///   inherits the ramp (204 then 232). Warm, they agree within 1.8%, which is what
+///   licenses the zeroed buffers every other row uses.
 ///
-/// The ratio is the portable quantity, not the level: a cold-clock session and a
-/// ramped one gave 138/160 and 193/230 GB/s, i.e. 86% and 84% of their own
-/// ceilings, while the fused layer's absolute microseconds differed by 40%.
+/// The ratio is the portable quantity, not the level: sessions gave 138/160,
+/// 193/230, 190/234 and 196/232 GB/s — 84-86% each — while the fused layer's
+/// absolute microseconds differed by 40% (488.9, 349.7, 355.7, 344.6).
+///
+/// # The bytes-per-weight lever, priced per backend
+///
+/// The int4 rows run `gemv_q4` over 67.1 M weights held as 32 MiB of nibbles plus
+/// 4 MiB of group-64 f32 scales, and the comparable unit is weights/s, since f16
+/// spends 2 bytes each and int4 0.5625. CUDA: 130.9-144.4 G weights/s against
+/// f16's 114.6-115.1, so 1.14-1.25x the element rate rather than the 4x the byte
+/// count suggests, which prices the trunk's 18.1 MiB/layer at 1.6-1.9 ms/token of
+/// a ~10.5 ms stage. Vulkan: 185-200 G against 93.0, so 1.99x, worth 3.9-5.0 ms
+/// of a 13.8-15.4 ms stage. That is why #471 goes to Vulkan and not CUDA, and why
+/// #147's -9% (measured on the pre-b4715b4 one-row-per-workgroup kernel, 4.2x
+/// slower) is not evidence against the current one. Vulkan's own f16 kernel is the
+/// cheaper lever it competes with: it reaches 181-186 GB/s where CUDA's reaches
+/// 227-230, so some of int4's advantage there is borrowed from an f16 kernel
+/// leaving a fifth of the bus unused.
 #[test]
 #[ignore = "device timing probe, prints instead of asserting"]
 fn mixer_kernel_shapes() {
@@ -855,7 +878,8 @@ fn mixer_kernel_shapes() {
 
     /// f16 weights of one projection, zeroed. Values do not matter: these gemvs
     /// are weight-bandwidth-bound, and zeroes keep f16 subnormals — whose
-    /// conversion cost is a separate question — out of the run.
+    /// conversion cost is a separate question — out of the run. The DRAM
+    /// reference below is what proves that sentence rather than assuming it.
     fn half_weights(g: &mut Gpu, rows: usize, cols: usize) -> usize {
         let id = g.alloc_half(rows * cols * 2, true).unwrap();
         g.write_buf(id, 0, &vec![0u8; rows * cols * 2]).unwrap();
@@ -888,7 +912,7 @@ fn mixer_kernel_shapes() {
         parts.push((label.to_string(), bytes, us));
     }
 
-    g.reserve(dense_off + (1 << 15)).unwrap();
+    g.reserve(dense_off + (1 << 15) + 65536).unwrap();
     let qkv = half_weights(&mut g, cd, h);
     let z = half_weights(&mut g, vd, h);
     let bproj = half_weights(&mut g, nv, h);
@@ -990,6 +1014,71 @@ fn mixer_kernel_shapes() {
     let secs = t.elapsed().as_secs_f64();
     let hot_us = big_gemv(&mut g);
     let busy_gbs = |bytes: usize, us: f64| bytes as f64 / ((us - floor).max(1e-6) * 1e-6) / 1e9;
+    // The same question for the format the bytes-per-weight lever would move the
+    // trunk to. int4 stores a quarter of what f16 does, so it only buys time if
+    // the unpacking kernel can still keep the bus busy - and the unit that makes
+    // the two comparable is weights per second, not bytes. Random nibbles and one
+    // sane scale price throughput here; the q4 numerics are pinned elsewhere in
+    // this file. Two shapes: the trunk's own reduction length is 2048, and only
+    // 32 MiB of nibbles clears the on-die cache at that width.
+    let q_group = 64usize;
+    struct Q4Ref {
+        rows: usize,
+        cols: usize,
+        bytes: usize,
+        sustained_gbs: f64,
+        wps: f64,
+        burst_gbs: f64,
+    }
+    let mut q4 = Vec::new();
+    for (q_rows, q_cols) in [(65536usize, 1024usize), (32768, 2048)] {
+        let (q_bytes, q_scale) = (q_rows * q_cols / 2, q_rows * (q_cols / q_group) * 4);
+        let qw = g.alloc_half(q_bytes, false).unwrap();
+        let qs = g.alloc_half(q_scale, false).unwrap();
+        let mut nib = vec![0u8; 1 << 20];
+        for off in (0..q_bytes).step_by(1 << 20) {
+            for b in nib.iter_mut() {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                *b = (s >> 24) as u8;
+            }
+            g.write_buf(qw, off, &nib).unwrap();
+        }
+        let one_scale = 0.02f32.to_le_bytes();
+        let mut scl = vec![0u8; 1 << 20];
+        for (i, b) in scl.iter_mut().enumerate() {
+            *b = one_scale[i % 4];
+        }
+        for off in (0..q_scale).step_by(1 << 20) {
+            g.write_buf(qs, off, &scl).unwrap();
+        }
+        let q_once = move |g: &mut Gpu| {
+            g.batch().unwrap()
+                .gemv_q4(qw, qs, q_rows, q_cols, q_group, dense_off, ib)
+                .unwrap()
+                .run()
+                .unwrap();
+        };
+        let q_burst = timed(&mut g, |g| q_once(g));
+        let t = std::time::Instant::now();
+        let mut q_laps = 0usize;
+        while t.elapsed().as_secs_f64() < 3.0 {
+            q_once(&mut g);
+            q_laps += 1;
+        }
+        let q_secs = t.elapsed().as_secs_f64();
+        let q_hot = timed(&mut g, |g| q_once(g));
+        q4.push(Q4Ref {
+            rows: q_rows,
+            cols: q_cols,
+            bytes: q_bytes + q_scale,
+            sustained_gbs: (q_bytes + q_scale) as f64 * q_laps as f64 / q_secs / 1e9,
+            wps: q_rows as f64 * q_cols as f64 * q_laps as f64 / q_secs / 1e9,
+            burst_gbs: busy_gbs(q_bytes + q_scale, q_burst.min(q_hot)),
+        });
+    }
+    let (q_gbs, q_wps, q_peak) = (q4[1].sustained_gbs, q4[1].wps, q4[1].burst_gbs);
 
     // The layer as decode runs it, and two variations that say which of the
     // stage's costs are real: dropping the barrier tests whether the four input
@@ -1044,6 +1133,23 @@ fn mixer_kernel_shapes() {
         big_bytes as f64 * laps as f64 / secs / 1e9,
         busy_gbs(big_bytes, hot_us)
     );
+    // Weights per second is the only unit an f16 and an int4 kernel share: one
+    // moves 2 bytes per weight, the other 0.5 plus a scale every 64 columns.
+    let f16_wps = big_rows as f64 * big_cols as f64 * laps as f64 / secs / 1e9;
+    for r in &q4 {
+        println!(
+            "  int4 reference    : {:5}x{:<4} = {} nibble bytes + {} scale bytes, \
+             sustained {:.0} GB/s packed ({:.1} G weights/s), burst {:.0} GB/s",
+            r.rows, r.cols, r.rows * r.cols / 2, r.bytes - r.rows * r.cols / 2,
+            r.sustained_gbs, r.wps, r.burst_gbs
+        );
+    }
+    println!(
+        "                    : f16 moves {:.1} G weights/s, so int4 at the trunk's \
+         own width is {:.2}x the element rate",
+        f16_wps,
+        q_wps / f16_wps
+    );
     println!("  sum of parts      : {sum:.1} us, plus the floor {:.1}", sum + floor);
     println!("  fused, one submit : {fused:.1} us   barrier-free {fused_nb:.1} us");
     let weight_bytes = (cd * h + vd * h + 2 * nv * h + h * vd) * 2;
@@ -1057,6 +1163,23 @@ fn mixer_kernel_shapes() {
         fused - floor,
         busy_gbs(weight_bytes, fused),
         100.0 * busy_gbs(weight_bytes, fused) / ceiling
+    );
+    // What the bytes-per-weight lever would buy, on this card's own numbers: the
+    // same projections at int4 are a quarter of the nibble traffic plus one f32
+    // scale per group, priced at the FASTEST int4 rate measured (best case).
+    let q4_layer = weight_bytes / 4 + weight_bytes / (2 * q_group) * 4;
+    let q4_best = q_gbs.max(q_peak);
+    println!(
+        "  the layer at int4 : {q4_layer} bytes = {:.1} MiB, needing {:.0} us of bus \
+         time at {:.0} GB/s against the {:.0} us of f16 bus time it replaces, so at \
+         best {:.2} ms/token of the {:.2} the stage costs",
+        q4_layer as f64 / (1 << 20) as f64,
+        q4_layer as f64 / (q4_best * 1e9) * 1e6,
+        q4_best,
+        weight_bytes as f64 / (ceiling * 1e9) * 1e6,
+        (weight_bytes as f64 / (ceiling * 1e9) - q4_layer as f64 / (q4_best * 1e9))
+            * 1e6 * linear_layers as f64 / 1000.0,
+        fused * linear_layers as f64 / 1000.0
     );
     println!(
         "  overlap saving    : {:.1} us ({:.0}% of the parts)",
