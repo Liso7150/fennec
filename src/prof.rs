@@ -12,9 +12,10 @@
 //! thread count, not against the token's wall clock.
 //!
 //! Most stages are siblings that a token's time is carved between, and those
-//! are what [`total`] adds up. `mixer device` and its three `mixer dev *`
-//! rows are not siblings: the parent wraps the children, so [`total`] counts
-//! the parent and skips the parts that restate it. See [`BREAKDOWN`].
+//! are what [`total`] adds up. `mixer device` and its `mixer dev *` rows are
+//! not siblings: the parent wraps three parts, and a fourth splits one of those,
+//! so [`total`] counts the parent and skips everything in [`SUBROWS`]. See
+//! [`BREAKDOWN`].
 //!
 //! A request is two kinds of forward pass: the prompt, which [`split`] moves
 //! into its own counters, and one token at a time afterwards, which
@@ -46,6 +47,22 @@ pub const MIXER_PROJ: usize = 12;
 pub const MIXER_DEV_UPLOAD: usize = 13;
 pub const MIXER_DEV_COMPUTE: usize = 14;
 pub const MIXER_DEV_READBACK: usize = 15;
+/// What the device itself spent inside the mixer's blocking readback, as the
+/// driver's own event pair measured it. Splits the readback row again, because
+/// a blocking DtoH absorbs the whole queued batch: on the served CUDA cell
+/// `mixer dev readback` is 12.91 ms/token for an 8 KiB copy, and only the device
+/// clock can say how much of that is shader work and how much is submission and
+/// fence wait. The CUDA tier reports it; Vulkan's arena read is a plain host
+/// copy of memory the shaders already wrote, so the row stays 0 there.
+///
+/// It answered: 62.9% of the mixer's device window (median of three steady
+/// requests, 62.5-64.2%) is the device's own span, and host submission is a
+/// third of that span, so the span is execution rather than launch gaps. The
+/// fence excess is bounded at ~2.8 ms/token, which is why the readback was left
+/// blocking and the mixer kernels became the thing to chase.
+pub const MIXER_DEV_DEVICE: usize = 16;
+
+pub const STAGE_COUNT: usize = 17;
 
 /// The rows that restate another row instead of standing beside it.
 ///
@@ -59,12 +76,44 @@ pub const MIXER_DEV_READBACK: usize = 15;
 /// just do not add.
 pub const BREAKDOWN: [usize; 3] = [MIXER_DEV_UPLOAD, MIXER_DEV_COMPUTE, MIXER_DEV_READBACK];
 
+/// [`BREAKDOWN`] plus the row that splits one of those parts. Everything here
+/// leaves the sum; only [`BREAKDOWN`] is added when checking a part against its
+/// whole, since `mixer dev device` is a slice of the readback, not a fourth
+/// sibling of it.
+pub const SUBROWS: [usize; 4] = [MIXER_DEV_UPLOAD, MIXER_DEV_COMPUTE, MIXER_DEV_READBACK, MIXER_DEV_DEVICE];
+
+/// Milliseconds per token that a `mixer dev` part was timed outside the row it
+/// splits, or 0 when the rows nest the way [`BREAKDOWN`] claims.
+///
+/// [`total`] drops the parts on the grounds that the parent bills them. A device
+/// block opened after the parent closes is therefore billed by neither, and the
+/// only trace is the parts summing over their own whole - which is what the
+/// attention mixer's o_proj did to every CUDA table (11.85 over 10.85
+/// ms/token) before this row started printing.
+pub fn leak(ms: &[f64; STAGE_COUNT]) -> f64 {
+    let parts: f64 = BREAKDOWN.iter().map(|&i| ms[i]).sum();
+    (parts - ms[MIXER_DEV]).max(0.0)
+}
+
+/// One line per table whose `mixer dev` rows overflow their parent. Silent when
+/// the rows nest, so a correct run pays nothing for the check.
+pub fn leak_line(ms: &[f64; STAGE_COUNT], per_token: f64) -> Option<String> {
+    let over = leak(ms);
+    (over > 1e-4).then(|| {
+        format!(
+            "  LEAK        `mixer dev` rows exceed `mixer device` by {:.2} ms/token: \
+             a device block is timed outside its parent and billed by neither\n",
+            over / per_token
+        )
+    })
+}
+
 /// Milliseconds a token actually spent: every stage except the rows that
 /// restate a stage already in the sum.
-pub fn total(ms: &[f64; 16]) -> f64 {
+pub fn total(ms: &[f64; STAGE_COUNT]) -> f64 {
     ms.iter()
         .enumerate()
-        .filter(|(i, _)| !BREAKDOWN.contains(i))
+        .filter(|(i, _)| !SUBROWS.contains(i))
         .map(|(_, v)| *v)
         .sum()
 }
@@ -76,8 +125,9 @@ pub fn total(ms: &[f64; 16]) -> f64 {
 /// 248320x2048 half-precision read per token and nothing named it.
 /// `mixer device` split in three for the same reason: upload, compute and
 /// readback have different bottlenecks (PCIe bandwidth, shader execution,
-/// PCIe latency) and different fixes.
-pub const STAGES: [&str; 16] = [
+/// PCIe latency) and different fixes. `mixer dev device` splits the readback
+/// once more, into the part the GPU executed and the part the host waited.
+pub const STAGES: [&str; STAGE_COUNT] = [
     "route",
     "moe upload",
     "moe record+launch",
@@ -94,11 +144,12 @@ pub const STAGES: [&str; 16] = [
     "mixer dev upload",
     "mixer dev compute",
     "mixer dev readback",
+    "mixer dev device",
 ];
 
 static ON: AtomicBool = AtomicBool::new(false);
-static NS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
-static PROMPT_NS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+static NS: [AtomicU64; STAGE_COUNT] = [const { AtomicU64::new(0) }; STAGE_COUNT];
+static PROMPT_NS: [AtomicU64; STAGE_COUNT] = [const { AtomicU64::new(0) }; STAGE_COUNT];
 static PROMPT_TOKENS: AtomicU64 = AtomicU64::new(0);
 static STEPS: AtomicU64 = AtomicU64::new(0);
 /// When the decode phase began, so the wall clock in the report is the one the
@@ -136,8 +187,8 @@ pub fn reset() {
 
 /// Milliseconds per stage, in `STAGES` order — the decode steps only, once
 /// [`split`] has been called.
-pub fn millis() -> [f64; 16] {
-    let mut out = [0f64; 16];
+pub fn millis() -> [f64; STAGE_COUNT] {
+    let mut out = [0f64; STAGE_COUNT];
     for (i, c) in NS.iter().enumerate() {
         out[i] = c.load(Relaxed) as f64 / 1e6;
     }
@@ -183,8 +234,8 @@ pub fn decode_steps() -> usize {
 }
 
 /// Prompt-phase milliseconds per stage, and how many tokens they cover.
-pub fn prompt_millis() -> ([f64; 16], usize) {
-    let mut out = [0f64; 16];
+pub fn prompt_millis() -> ([f64; STAGE_COUNT], usize) {
+    let mut out = [0f64; STAGE_COUNT];
     for (i, c) in PROMPT_NS.iter().enumerate() {
         out[i] = c.load(Relaxed) as f64 / 1e6;
     }
@@ -202,7 +253,7 @@ pub fn prompt_line() -> Option<String> {
     let (worst, biggest) = ms
         .iter()
         .enumerate()
-        .filter(|(i, _)| !BREAKDOWN.contains(i))
+        .filter(|(i, _)| !SUBROWS.contains(i))
         .fold((0usize, 0f64), |a, (i, &x)| if x > a.1 { (i, x) } else { a });
     Some(format!(
         "  prompt    {tokens} tokens in {sum:.2} ms accounted, {:.0}% {}",
@@ -213,12 +264,22 @@ pub fn prompt_line() -> Option<String> {
 
 /// The table's own heading, shared by both printers so the two can never
 /// disagree about whether the `mixer dev` rows add. A reader who sums the
-/// column has to know that three of the rows restate one of the others.
+/// column has to know that four of the rows restate others: three split the
+/// device mixer and the fourth splits one of those.
 pub fn header(steps: usize) -> String {
     format!(
-        "  stage breakdown (ms/token, {steps} decode steps; the three `mixer dev` \
-         rows split `mixer device` and are not added):\n"
+        "  stage breakdown (ms/token, {steps} decode steps; the `mixer dev` rows \
+         restate `mixer device` and are not added):\n"
     )
+}
+
+/// Bill milliseconds against a stage from inside a driver call that has no
+/// timer of its own - the CUDA tier's event harvest, which is the device's
+/// clock rather than an `Instant` around a blocking call.
+pub fn add(stage: usize, ms: f64) {
+    if enabled() && ms > 0.0 {
+        NS[stage].fetch_add((ms * 1e6) as u64, Relaxed);
+    }
 }
 
 /// The decode breakdown: milliseconds per decode step, then the prompt on its
@@ -239,6 +300,9 @@ pub fn report(wall_ms: f64) -> String {
         sum / steps,
         wall / steps
     ));
+    if let Some(line) = leak_line(&ms, steps) {
+        out.push_str(&line);
+    }
     if let Some(line) = prompt_line() {
         out.push_str(&line);
         out.push('\n');
@@ -256,6 +320,9 @@ pub fn report(wall_ms: f64) -> String {
             out.push_str(&format!("    {name:<20} {:7.3}  {:5.1}%\n", v / tokens as f64, 100.0 * v / psum.max(1e-9)));
         }
         out.push_str(&format!("    {:<20} {:7.3}\n", "accounted", psum / tokens as f64));
+        if let Some(line) = leak_line(&pms, tokens as f64) {
+            out.push_str(&line);
+        }
     }
     // Add overlap measurement if we have samples
     let (overlap_ms, gpu_busy_ms, samples) = overlap_stats();
@@ -438,7 +505,7 @@ mod tests {
     }
 
     /// `mixer device` wraps its three parts, so the column a reader adds is not
-    /// the 16 rows printed above it. Bill both and the mixer's device half is
+    /// the 17 rows printed above it. Bill both and the mixer's device half is
     /// charged twice, `accounted` lands over the wall clock and the one row
     /// that says how much of a token the profiler failed to name goes negative.
     #[test]
@@ -446,13 +513,15 @@ mod tests {
         let _g = EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner());
         ON.store(true, Relaxed);
         reset();
-        // Ten ms of device mixer, split inside itself as 2 + 3 + 5, plus 2 ms of
-        // routing: the token took 12 ms, not 22.
+        // Ten ms of device mixer, split inside itself as 2 + 3 + 5, of which the
+        // readback says 4 was the device actually running, plus 2 ms of routing:
+        // the token took 12 ms, not 26.
         for (stage, ms) in [
             (MIXER_DEV, 10.0),
             (MIXER_DEV_UPLOAD, 2.0),
             (MIXER_DEV_COMPUTE, 3.0),
             (MIXER_DEV_READBACK, 5.0),
+            (MIXER_DEV_DEVICE, 4.0),
             (ROUTE, 2.0),
         ] {
             NS[stage].store((ms * 1e6) as u64, Relaxed);
@@ -462,22 +531,23 @@ mod tests {
         tick_decode_step();
 
         let ms = millis();
-        assert_eq!(total(&[0.0; 16]), 0.0);
+        assert_eq!(total(&[0.0; STAGE_COUNT]), 0.0);
         assert!(
             (total(&ms) - 12.0).abs() < 1e-6,
             "a token is its stages, not its stages plus the parts of one: {}",
             total(&ms)
         );
         assert!(
-            (ms.iter().sum::<f64>() - 22.0).abs() < 1e-6,
+            (ms.iter().sum::<f64>() - 26.0).abs() < 1e-6,
             "the printed column still shows every row"
         );
+        assert_eq!(leak(&ms), 0.0, "a row that splits a part is not a fourth part");
 
         let rep = report(12.0);
         assert!(rep.contains("12.00  (wall 12.00)"), "accounted row:\n{rep}");
         // The parts still print, because upload, compute and readback have
         // three different fixes — they just do not add.
-        for name in ["mixer dev upload", "mixer dev compute", "mixer dev readback"] {
+        for name in ["mixer dev upload", "mixer dev compute", "mixer dev readback", "mixer dev device"] {
             assert!(rep.contains(name), "{name} left the table:\n{rep}");
         }
         // The headline names a stage a token actually spends, not a slice of one.
@@ -485,10 +555,60 @@ mod tests {
         assert!(line.contains("12.00 ms accounted"), "{line}");
         assert!(line.contains(STAGES[MIXER_DEV]), "{line}");
         assert!(
-            BREAKDOWN.iter().all(|i| !line.contains(STAGES[*i])),
+            SUBROWS.iter().all(|i| !line.contains(STAGES[*i])),
             "the prompt line blamed a row that does not add: {line}"
         );
         reset();
+        ON.store(false, Relaxed);
+    }
+
+    /// The three `mixer dev` rows are only free to leave the sum while every one
+    /// of them really is inside `mixer device`. The attention mixer used to open
+    /// its o_proj upload, compute and readback after the parent had closed, so
+    /// that device time was billed by neither the row that splits it nor the sum
+    /// that drops it, and the table's only symptom was parts over a whole.
+    #[test]
+    fn a_part_timed_outside_its_parent_says_so() {
+        let _g = EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner());
+        ON.store(true, Relaxed);
+        reset();
+        let nested = |ms: &mut [f64; STAGE_COUNT]| {
+            ms[MIXER_DEV] = 10.0;
+            ms[MIXER_DEV_UPLOAD] = 2.0;
+            ms[MIXER_DEV_COMPUTE] = 3.0;
+            ms[MIXER_DEV_READBACK] = 5.0;
+        };
+        let mut ms = [0f64; STAGE_COUNT];
+        nested(&mut ms);
+        assert_eq!(leak(&ms), 0.0, "2 + 3 + 5 inside a 10 ms parent leaks nothing");
+        // o_proj bills a sixth millisecond of readback outside the parent.
+        ms[MIXER_DEV_READBACK] = 6.0;
+        assert!(
+            (leak(&ms) - 1.0).abs() < 1e-9,
+            "parts of 12 over a whole of 10 leaks 1: {}",
+            leak(&ms)
+        );
+        for (stage, v) in ms.iter().enumerate() {
+            NS[stage].store((v * 1e6) as u64, Relaxed);
+            PROMPT_NS[stage].store((v * 1e6) as u64, Relaxed);
+        }
+        PROMPT_TOKENS.store(100, Relaxed);
+        tick_decode_step();
+        let rep = report(12.0);
+        assert!(rep.contains("LEAK"), "the decode table stayed silent:\n{rep}");
+        assert!(rep.contains("1.00 ms/token"), "the decode row lost its amount:\n{rep}");
+        // Per prompt token the same leak is a hundredth of a millisecond, and a
+        // reader comparing the two tables has to be able to tell them apart.
+        assert!(rep.contains("0.01 ms/token"), "the prompt row is not per token:\n{rep}");
+        reset();
+        let clean = report(12.0);
+        assert!(
+            !clean.contains("LEAK"),
+            "a table with nothing counted must not blame a leak:\n{clean}"
+        );
+        let mut ms = [0f64; STAGE_COUNT];
+        nested(&mut ms);
+        assert!(leak_line(&ms, 1.0).is_none(), "nested rows must not print");
         ON.store(false, Relaxed);
     }
 }

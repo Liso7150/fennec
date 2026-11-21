@@ -72,6 +72,21 @@ pub struct CudaGpu {
     pub graph_hits: u64,
     /// Number of graph captures (for profiling)
     pub graph_captures: u64,
+    /// The pair of stream markers bracketing one mixer batch. CUDA events are
+    /// queue positions, not host stamps: `ev_a` fires when the GPU reaches it,
+    /// which after a drained stream is immediately, and `ev_b` when the batch
+    /// it follows is done. Their difference is what the silicon actually spent,
+    /// as opposed to how long the host spent blocked in the readback.
+    ev_a: Handle,
+    ev_b: Handle,
+    /// Set by `time_mixer_batch`, consumed by the next submit.
+    time_next: bool,
+    /// A bracket is in the queue, waiting for its end event to fire.
+    pending: bool,
+    /// What the GPU reported for the mixer batches, and how many brackets were
+    /// harvested. `sync_ms` beside it is the host's side of the same waits.
+    pub device_ms: f64,
+    pub device_samples: u64,
 }
 
 // The context is current on the owning thread only; the CPU workers that run
@@ -128,9 +143,19 @@ impl CudaGpu {
             graph_cache: HashMap::new(),
             graph_hits: 0,
             graph_captures: 0,
+            ev_a: std::ptr::null_mut(),
+            ev_b: std::ptr::null_mut(),
+            time_next: false,
+            pending: false,
+            device_ms: 0.0,
+            device_samples: 0,
         };
         // Create a stream for graph capture and async operations
         g.stream = g.cu.create_stream().unwrap_or(std::ptr::null_mut());
+        // The timing bracket. Null on failure, which turns the instrument off
+        // rather than failing the tier: it measures, it does not compute.
+        g.ev_a = g.cu.create_event().unwrap_or(std::ptr::null_mut());
+        g.ev_b = g.cu.create_event().unwrap_or(std::ptr::null_mut());
         // The same starting arena the Vulkan tier opens with, so a caller that
         // writes activations without naming a size behaves identically on both.
         g.reserve(crate::gpu::SCRATCH_FLOATS)?;
@@ -379,6 +404,46 @@ impl CudaGpu {
         }
     }
 
+    /// Ask for the *next* batch submit to be bracketed by the timing events.
+    /// Only the mixer calls this: its host-side rows are the ones whose GPU
+    /// share is unknown, and the harvest lands in the row that splits them.
+    pub fn time_mixer_batch(&mut self) {
+        self.harvest();
+        self.time_next = !self.ev_a.is_null() && !self.ev_b.is_null();
+    }
+
+    /// Bill a finished bracket. Called from `time_mixer_batch`, which runs after
+    /// the previous batch's blocking read, so both markers have fired and this
+    /// never waits. A bracket still pending is left for the next call, and the
+    /// last one of a request is dropped: one sample in tens of thousands.
+    fn harvest(&mut self) {
+        if !self.pending {
+            return;
+        }
+        if let Some(ms) = self.cu.event_elapsed(self.ev_a, self.ev_b) {
+            self.pending = false;
+            self.device_ms += ms;
+            self.device_samples += 1;
+            crate::prof::add(crate::prof::MIXER_DEV_DEVICE, ms);
+        }
+    }
+
+    /// Open a bracket on the stream the batch is about to be launched on. The
+    /// markers are queue positions, so recording one on a stream other than the
+    /// work's measures the gap between two unrelated queues.
+    fn open_timing(&mut self, stream: Handle) -> bool {
+        if !std::mem::take(&mut self.time_next) {
+            return false;
+        }
+        self.cu.record_event(self.ev_a, stream).is_ok()
+    }
+
+    fn close_timing(&mut self, stream: Handle, opened: bool) {
+        if opened && self.cu.record_event(self.ev_b, stream).is_ok() {
+            self.pending = true;
+        }
+    }
+
     pub fn wait(&mut self) -> Result<()> {
         let t0 = std::time::Instant::now();
         let r = self.cu.sync();
@@ -402,6 +467,11 @@ impl CudaGpu {
         self.syncs = 0;
         self.graph_hits = 0;
         self.graph_captures = 0;
+        self.device_ms = 0.0;
+        self.device_samples = 0;
+        // An in-flight bracket belongs to the window that opened it.
+        self.pending = false;
+        self.time_next = false;
     }
 }
 
@@ -416,10 +486,12 @@ impl Drop for CudaGpu {
         for (_, exec) in self.graph_cache.drain() {
             self.cu.destroy_graph_exec(exec);
         }
-        // Clean up the stream
+        // Clean up the stream and the timing events
         if !self.stream.is_null() {
             self.cu.destroy_stream(self.stream);
         }
+        self.cu.destroy_event(self.ev_a);
+        self.cu.destroy_event(self.ev_b);
     }
 }
 
@@ -479,13 +551,7 @@ impl<'a> CudaBatch<'a> {
             return Err("batch already submitted".into());
         }
         self.live = false;
-        let q = std::mem::take(&mut self.queue);
-        for l in q {
-            self.gpu.exec(l)?;
-            self.gpu.dispatches += 1;
-        }
-        self.gpu.submitted += 1;
-        Ok(())
+        CudaBatch::run_plain(self.gpu, std::mem::take(&mut self.queue))
     }
 
     pub fn wait(&mut self) -> Result<()> {
@@ -535,10 +601,13 @@ impl<'a> CudaBatch<'a> {
 
     /// Plain per-launch submit of an already-detached queue.
     fn run_plain(gpu: &mut CudaGpu, q: Vec<Launch>) -> Result<()> {
+        // `exec` launches on the legacy stream, so the markers go there too.
+        let timed = gpu.open_timing(std::ptr::null_mut());
         for l in q {
             gpu.exec(l)?;
             gpu.dispatches += 1;
         }
+        gpu.close_timing(std::ptr::null_mut(), timed);
         gpu.submitted += 1;
         Ok(())
     }
@@ -555,7 +624,10 @@ impl<'a> CudaBatch<'a> {
         let hash = self.queue_hash();
         if let Some(&exec) = self.gpu.graph_cache.get(&hash) {
             // Replay the cached graph
-            self.gpu.cu.launch_graph(exec, self.gpu.stream)?;
+            let stream = self.gpu.stream;
+            let timed = self.gpu.open_timing(stream);
+            self.gpu.cu.launch_graph(exec, stream)?;
+            self.gpu.close_timing(stream, timed);
             self.gpu.graph_hits += 1;
             self.gpu.submitted += 1;
             self.gpu.dispatches += self.queue.len() as u64;

@@ -265,6 +265,51 @@ fn the_elementwise_ops_agree() {
     close("rmsnorm -> axpy chained", &want, &g.read(2 * n, n), 2e-6);
 }
 
+/// The device clock, proven on hardware.
+///
+/// `MIXER_DEV_DEVICE` is the row that says how much of a mixer batch the
+/// silicon executed as opposed to how long the host sat blocked in the readback,
+/// and it is built from CUDA events, which are positions in a stream rather than
+/// host stamps. That distinction is exactly what a unit test cannot fake, so this
+/// drives one real batch through arm → submit → drain → harvest and demands a
+/// sample back. Vulkan stays a deliberate no-op: its arena is host-visible, so
+/// its upload/compute/readback split already accounts for the whole batch.
+#[test]
+fn a_timed_mixer_batch_reports_the_device_clock() {
+    let Some(mut g) = gpu() else { return };
+    if g.backend() != Backend::Cuda {
+        println!("  {} has no device clock to bracket", g.backend().label());
+        return;
+    }
+    let (rows, cols) = (2048usize, 2048usize);
+    let w = f16_bytes(&lcg(rows * cols, 71, 5e-2));
+    let x = lcg(cols, 73, 1.0);
+    let wb = g.upload_half(&w, true).unwrap();
+    g.write(0, &x);
+
+    // Arming is one-shot: a batch nobody asked about must not be billed, or the
+    // row would count submissions the mixer never attributed to itself.
+    g.batch().unwrap().gemv_half(wb, rows, cols, 0, cols).unwrap().submit().unwrap();
+    g.wait().unwrap();
+    assert_eq!(g.device_samples(), 0, "an un-armed submit must not be timed");
+
+    g.time_mixer_batch();
+    g.batch().unwrap().gemv_half(wb, rows, cols, 0, cols).unwrap().submit().unwrap();
+    // Draining is what fires both markers; the harvest itself never waits.
+    g.wait().unwrap();
+    g.time_mixer_batch();
+    assert_eq!(g.device_samples(), 1, "one armed batch is exactly one sample");
+    let ms = g.device_ms();
+    assert!(ms > 0.0, "the device reported {ms} ms for a {rows}x{cols} f16 gemv");
+    println!("  device clock: {ms:.3} ms for one timed {rows}x{cols} gemv");
+
+    // And the bracket must be a pure observer: what ran is still what the CPU
+    // kernels get.
+    let mut want = vec![0f32; rows];
+    kernel::gemv_f16(&w, rows, cols, &x, &mut want, 8);
+    close("timed gemv", &want, &g.read(cols, rows), 2e-6);
+}
+
 #[test]
 fn a_whole_expert_runs_on_the_device() {
     let Some(mut g) = gpu() else { return };

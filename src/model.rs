@@ -2427,6 +2427,9 @@ impl GdnLayer {
         let read_syncs = g.read_syncs();
         {
             let _c = prof::start(prof::MIXER_DEV_COMPUTE);
+            // Also bill this batch on the device's own clock, which separates
+            // GPU execution from the host's wait (no-op on Vulkan).
+            g.time_mixer_batch();
             let mut bt = g.batch().unwrap();
             // The four input projections read the same x and write disjoint
             // slices, so they are independent. Recorded barrier-free they fill
@@ -2474,6 +2477,9 @@ impl GdnLayer {
         }
         {
             let _c = prof::start(prof::MIXER_DEV_COMPUTE);
+            // Also bill this batch on the device's own clock, which separates
+            // GPU execution from the host's wait (no-op on Vulkan).
+            g.time_mixer_batch();
             let mut bt = g.batch().unwrap();
             bt.gemv_half_indep(d.qkv, cd, h, DENSE_OFF, DENSE_OFF + h).unwrap();
             bt.gemv_half_indep(d.z, vd, h, DENSE_OFF, DENSE_OFF + h + cd).unwrap();
@@ -2935,6 +2941,9 @@ impl AttnLayer {
         }
         {
             let _c = prof::start(prof::MIXER_DEV_COMPUTE);
+            // Also bill this batch on the device's own clock, which separates
+            // GPU execution from the host's wait (no-op on Vulkan).
+            g.time_mixer_batch();
             let mut bt = g.batch().unwrap();
             if d.q4 {
                 bt.gemv_q4_indep(d.q, d.qs[0], q_out, h, d.group, DENSE_OFF, DENSE_OFF + h).unwrap();
@@ -2993,6 +3002,11 @@ impl AttnLayer {
         drop(_cpu);
         match &self.dev {
             Some(d) => {
+                // o_proj's three rows need this parent too. `total` drops them on
+                // the grounds that `mixer device` already bills them, so a device
+                // block outside it was billed by neither: on the served CUDA cell
+                // the parts summed to 11.85 ms/token over a 10.85 whole.
+                let _t = prof::start(prof::MIXER_DEV);
                 let mut g = d.gpu.lock().unwrap();
                 {
                     let _u = prof::start(prof::MIXER_DEV_UPLOAD);
@@ -3000,6 +3014,7 @@ impl AttnLayer {
                 }
                 {
                     let _c = prof::start(prof::MIXER_DEV_COMPUTE);
+                    g.time_mixer_batch();
                     let mut bt = g.batch().unwrap();
                     if d.q4 {
                         bt.gemv_q4(d.o, d.qs[3], h, nh * hd, d.group, DENSE_OFF, DENSE_OFF + nh * hd).unwrap();

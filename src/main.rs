@@ -1602,6 +1602,20 @@ fn decode(opts: &Opts, threads: usize) -> Result<(), String> {
             g.sync_ms() / steps,
             stack_ms.iter().sum::<f64>() / steps,
         );
+        // The claim above is only checkable against the device's own clock, and
+        // only CUDA has one of those. Where the two disagree, the difference is
+        // submission and fence; where they agree, the waits are the shaders.
+        if g.device_samples() > 0 {
+            println!(
+                "  device clock: {} timed mixer batches spanned {:.1} ms ({:.2} ms/token) against \
+                 {:.2} ms/token of host waits; the difference is submission and fence, the rest \
+                 is work",
+                g.device_samples(),
+                g.device_ms(),
+                g.device_ms() / steps,
+                g.sync_ms() / steps,
+            );
+        }
     }
     if fennec::prof::enabled() {
         let steps = step_ms.len().max(1) as f64;
@@ -1613,13 +1627,16 @@ fn decode(opts: &Opts, threads: usize) -> Result<(), String> {
         }
         // Every stage timer wraps its parallel region from the outside, so these
         // are wall time, and `total` bills the device mixer once rather than with
-        // the three parts that split it. The remainder is stack time no stage
+        // the parts that split it. The remainder is stack time no stage
         // claims, which is the number to chase rather than a rounding error.
         let stack_mean = stack_ms.iter().sum::<f64>() / steps;
         println!(
             "    {:<20} {:7.2}  (wall time; stack {:.2}, unaccounted {:.2})",
             "accounted", sum / steps, stack_mean, stack_mean - sum / steps
         );
+        if let Some(line) = fennec::prof::leak_line(&ms, steps) {
+            print!("{line}");
+        }
     }
     if let Some(p) = &s.store {
         if let Some(n) = m.save_picks(p) {

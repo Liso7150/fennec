@@ -14,7 +14,7 @@
 
 use libloading::Library;
 use std::ffi::{c_void, CStr};
-use std::os::raw::{c_char, c_int, c_uint};
+use std::os::raw::{c_char, c_float, c_int, c_uint};
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -45,6 +45,11 @@ const CU_STREAM_CAPTURE_MODE_RELAXED: c_uint = 2;
 /// directions, which is what lets a synchronous memcpy bracket a graph launch.
 /// CU_STREAM_NON_BLOCKING (1) would drop that ordering.
 const CU_STREAM_DEFAULT: c_uint = 0;
+/// CU_EVENT_DEFAULT: a timing event, which is what `cuEventElapsedTime` reads.
+/// CU_EVENT_BLOCKING_SYNC (1) would park the waiting thread instead of spinning.
+const CU_EVENT_DEFAULT: c_uint = 0;
+/// `CUDA_ERROR_NOT_READY`: the end event has not fired yet.
+const CUDA_ERROR_NOT_READY: c_int = 600;
 
 /// The driver entry points this backend uses. Resolved once at load, so a
 /// launch is a direct call through a function pointer, same as the Vulkan api.
@@ -85,6 +90,12 @@ struct Api {
     graph_launch: unsafe extern "system" fn(Handle, Handle) -> c_int,
     graph_destroy: unsafe extern "system" fn(Handle) -> c_int,
     graph_exec_destroy: unsafe extern "system" fn(Handle) -> c_int,
+    // Event APIs: the only way to time what the GPU actually spent, as
+    // opposed to how long the host spent waiting for it.
+    event_create: unsafe extern "system" fn(*mut Handle, c_uint) -> c_int,
+    event_record: unsafe extern "system" fn(Handle, Handle) -> c_int,
+    event_elapsed: unsafe extern "system" fn(*mut c_float, Handle, Handle) -> c_int,
+    event_destroy: unsafe extern "system" fn(Handle) -> c_int,
 }
 
 macro_rules! resolve {
@@ -167,6 +178,10 @@ impl Cuda {
                 graph_launch: resolve!(lib, "cuGraphLaunch", unsafe extern "system" fn(Handle, Handle) -> c_int),
                 graph_destroy: resolve!(lib, "cuGraphDestroy", unsafe extern "system" fn(Handle) -> c_int),
                 graph_exec_destroy: resolve!(lib, "cuGraphExecDestroy", unsafe extern "system" fn(Handle) -> c_int),
+                event_create: resolve!(lib, "cuEventCreate", unsafe extern "system" fn(*mut Handle, c_uint) -> c_int),
+                event_record: resolve!(lib, "cuEventRecord", unsafe extern "system" fn(Handle, Handle) -> c_int),
+                event_elapsed: resolve!(lib, "cuEventElapsedTime", unsafe extern "system" fn(*mut c_float, Handle, Handle) -> c_int),
+                event_destroy: resolve!(lib, "cuEventDestroy_v2", unsafe extern "system" fn(Handle) -> c_int),
             }
         };
         let mut cuda = Cuda {
@@ -524,6 +539,55 @@ impl Cuda {
             },
             "cuLaunchKernel",
         )
+    }
+
+    /// Create a timing event. Two of them straddling a batch is the only way to
+    /// separate what the GPU executed from how long the host waited for it.
+    pub fn create_event(&mut self) -> Result<Handle> {
+        self.bind();
+        let mut ev: Handle = std::ptr::null_mut();
+        self.check(
+            unsafe { (self.api.event_create)(&mut ev, CU_EVENT_DEFAULT) },
+            "cuEventCreate",
+        )?;
+        Ok(ev)
+    }
+
+    /// Push an event onto a stream. It fires when the GPU reaches that point in
+    /// the queue, so it records *after* whatever is already queued ahead of it.
+    pub fn record_event(&mut self, ev: Handle, stream: Handle) -> Result<()> {
+        self.bind();
+        self.check(
+            unsafe { (self.api.event_record)(ev, stream) },
+            "cuEventRecord",
+        )
+    }
+
+    /// Milliseconds between two fired events, or `None` while either is still
+    /// pending. `CUDA_ERROR_NOT_READY` is the only benign failure here: the
+    /// caller leaves the bracket in place and asks again once a blocking read
+    /// has proved both markers fired, which costs no extra synchronisation.
+    pub fn event_elapsed(&mut self, a: Handle, b: Handle) -> Option<f64> {
+        if a.is_null() || b.is_null() {
+            return None;
+        }
+        self.bind();
+        let mut ms: c_float = 0.0;
+        let code = unsafe { (self.api.event_elapsed)(&mut ms, a, b) };
+        if code == CUDA_ERROR_NOT_READY {
+            return None;
+        }
+        self.check(code, "cuEventElapsedTime").ok()?;
+        Some(ms as f64)
+    }
+
+    /// Destroy an event created with create_event.
+    pub fn destroy_event(&mut self, ev: Handle) {
+        if ev.is_null() {
+            return;
+        }
+        self.bind();
+        unsafe { (self.api.event_destroy)(ev) };
     }
 }
 

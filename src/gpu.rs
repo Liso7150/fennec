@@ -1819,6 +1819,34 @@ impl Gpu {
         matches!(self, Gpu::Cuda(_))
     }
 
+    /// Ask for the next batch submit to be bracketed by timing events, so the
+    /// mixer's rows can say how much of them the silicon actually executed
+    /// instead of how long the host was blocked. Vulkan needs no such row: its
+    /// arena is host-visible, so its upload/compute/readback split already
+    /// accounts for the whole batch and this stays a no-op there.
+    pub fn time_mixer_batch(&mut self) {
+        match self {
+            Gpu::Vk(_) => {}
+            Gpu::Cuda(g) => g.time_mixer_batch(),
+        }
+    }
+
+    /// What the device reported for the bracketed batches, and how many
+    /// brackets were harvested. Zero on Vulkan, which has no such instrument.
+    pub fn device_ms(&self) -> f64 {
+        match self {
+            Gpu::Vk(_) => 0.0,
+            Gpu::Cuda(g) => g.device_ms,
+        }
+    }
+
+    pub fn device_samples(&self) -> u64 {
+        match self {
+            Gpu::Vk(_) => 0,
+            Gpu::Cuda(g) => g.device_samples,
+        }
+    }
+
     pub fn wait(&mut self) -> Result<()> {
         match self {
             Gpu::Vk(g) => g.wait(),
