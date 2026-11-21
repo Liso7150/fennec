@@ -660,6 +660,15 @@ fn dense_projections_on_the_device_match_the_cpu_stack() {
     assert!(attn.q.is_empty() && attn.o.is_empty(), "the attention host copy was not released");
     assert!(!dev.prefill_ready(), "a device plan claims a batch prompt path it dropped");
     assert!(cpu.prefill_ready(), "the host stack keeps its batch prompt path");
+    // The device chunk is served only on the tier that won the paired run for it, so
+    // the gate has to track the backend that actually opened - not the request, and not
+    // merely the presence of a device.
+    assert!(!cpu.prefill_device_chunked(), "the host tier batches through `prefill`");
+    assert_eq!(
+        dev.prefill_device_chunked(),
+        matches!(gpu.lock().unwrap().backend(), Backend::Cuda),
+        "the device chunk gate does not follow the tier's backend"
+    );
 
     let toks = [15059usize, 9948, 271, 1024];
     let (mut sa, mut sb) = (cpu.states(8), dev.states(8));

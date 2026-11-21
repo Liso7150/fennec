@@ -4530,6 +4530,20 @@ impl Model {
         self.gpu.is_some()
     }
 
+    /// Whether the device prompt should go through [`Model::prefill_device`] in
+    /// chunks rather than one token at a time. The two device tiers answered that
+    /// question differently on the same paired protocol, so the gate is per tier.
+    /// CUDA took the chunk: 8.1-8.4 ms per prompt token faster at 34, 126 and 531
+    /// tokens, both orders at every length. Vulkan refused it: 27.5 ms per prompt
+    /// token slower at 34, +0.730 s in `ab` and +0.987 s in `ba`, its decode step
+    /// unmoved (68.6 against 69.1 ms/token), so the loss is the chunk and not the box.
+    pub fn prefill_device_chunked(&self) -> bool {
+        matches!(
+            self.gpu.as_ref().map(|g| g.lock().unwrap().backend()),
+            Some(crate::backend::Backend::Cuda)
+        )
+    }
+
     /// logits = lm_head @ x. The head is never materialised: for a two-byte
     /// format the dot reads the mmap directly (`gemv_bf16` / `gemv_f16`),
     /// because an f32 copy of a 1 GiB tensor pays 2 GiB of writes and 2 GiB of
