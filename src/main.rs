@@ -795,7 +795,11 @@ fn plan(opts: &Opts) -> Result<(), String> {
     // constants. A prediction is only worth the numbers priced into it, and the
     // reader has to be able to tell a plan built on a measured 17.4 GB/s disk lane
     // from one built on the 3.2 GB/s some other machine once managed. `*` is
-    // earned, `?` is assumed.
+    // earned, `?` is assumed. The host rate is always `?` now: what a run reports
+    // about it is the span of a lane other tiers share, not a cost per byte, so
+    // #473 stopped letting it enter the price and there is no measurement that can
+    // earn it. The observed window is printed separately, below, because it is
+    // still worth reading as contention.
     let rate = |got: Option<f64>, now: f64| format!("{:.1}{}", now, if got.is_some() { "*" } else { "?" });
     // Nothing times the device's own reads or the load-time upload per byte, so
     // these two stay profile constants for as long as the plan is printed.
@@ -807,7 +811,7 @@ fn plan(opts: &Opts) -> Result<(), String> {
         plan.lm_head_ms,
         assumed(bw.device_gbs),
         assumed(bw.pcie_gbs),
-        rate(measured.host_gbs, bw.host_gbs),
+        rate(None, bw.host_gbs),
         rate(measured.disk_gbs, bw.disk_gbs),
         rate(measured.quant_gbs, bw.quant_gbs)
     );
@@ -824,23 +828,20 @@ fn plan(opts: &Opts) -> Result<(), String> {
     // not the question: a run that never filled a lane can still record the
     // held ratio it observed, and a plan carrying only that has no measured
     // bandwidth in it.
-    let earned = measured.host_gbs.is_some()
-        || measured.disk_gbs.is_some()
-        || measured.quant_gbs.is_some();
-    // The host rate is only comparable to the shape that earned it: the same
-    // GB/s means different bytes per token at a different worker count and pack
-    // size, and a seed file carried over from another build would otherwise be
-    // read as a like-for-like number.
+    // A rates file holding only a host window has priced nothing: that number is
+    // reported, not divided by.
+    let earned = measured.disk_gbs.is_some() || measured.quant_gbs.is_some();
+    // The host window is still shown, tagged with the shape it was timed on: the
+    // same GB/s means different bytes per token at a different worker count and
+    // pack size, and a lane that reached 4.2 GB/s while other tiers were moving is
+    // contention worth reading even though it is not a price.
+    let seen = measured
+        .host_gbs
+        .map(|h| format!(", host window {:.1} GB/s observed ({}), reported not priced", h, measured.shape_note()))
+        .unwrap_or_default();
     let rates_note = match (&s.rates, earned) {
-        (Some(p), true) => format!(
-            "{p} (measured on this box{})",
-            if measured.host_gbs.is_some() {
-                format!(", {}", measured.shape_note())
-            } else {
-                String::new()
-            }
-        ),
-        (Some(p), false) => format!("none yet, priced on the compiled-in profile (runs write {p})"),
+        (Some(p), true) => format!("{p} (measured on this box{seen})"),
+        (Some(p), false) => format!("none that prices yet{seen}, plan on the compiled-in profile (runs write {p})"),
         (None, _) => "dense stack: no lane to time".into(),
     };
     println!(

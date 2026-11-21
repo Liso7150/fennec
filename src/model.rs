@@ -629,9 +629,10 @@ pub struct MoeLayer {
     pub overlap_ns: AtomicU64,
     /// Nanoseconds this layer spent computing picks out of the RAM tier, over
     /// every token. `host_hits` x the pack size over this is the tier's decode
-    /// bandwidth, which is the number `sched::Bandwidth::host_gbs` has been
-    /// guessing at - and the one a placement decision is priced with, so it is
-    /// measured on the real work instead of on a copy loop.
+    /// throughput - what the lane achieved under load, which is why it is measured
+    /// on the real work instead of on a copy loop. It is *not* a cost per byte:
+    /// the span is the lane, and the streamed tier is on it too (#473, r23), so
+    /// `sched::Bandwidth::apply` reports this and prices with the profile constant.
     pub host_ns: AtomicU64,
     /// Picks the batched-prefill union answered, and the nanoseconds its window
     /// ran. Deliberately separate from `host_hits`/`host_ns`: the union reads one
@@ -1187,13 +1188,16 @@ impl MoeLayer {
                 parts[n] = part;
             }
         }
-        // Timed, because the host tier's price in the plan is the one rate nothing
-        // else measures honestly. `Bandwidth::host_gbs` used to come from
-        // `fennec bench`'s copy loop, which r13 showed runs 1.5-2.4x faster than a
-        // decode (13.3-19.4 GB/s against 8.1), and a placement priced on it thinks
-        // RAM picks are nearly free. The activation buffers this section also
-        // touches are under 1% of the pack each pick reads, so picks x pack bytes
-        // over this span is the tier's decode bandwidth on this box.
+        // Timed, because the plan's host price was being taken from a copy loop
+        // that did not represent the tier: `fennec bench` runs 1.5-2.4x faster than
+        // a decode (13.3-19.4 GB/s against 8.1, r13), and a placement priced on it
+        // thinks RAM picks are nearly free. The activation buffers this section
+        // also touches are under 1% of the pack each pick reads, so picks x pack
+        // bytes over this span is the tier's decode throughput on this box - which
+        // #473 turned out not to be a cost per byte either, because the same shape
+        // read 4.2 GB/s cold and 15.6 warm with the streamed window moving in
+        // step. So this number is reported as contention and the plan keeps its
+        // profile constant; see `Bandwidth::apply`.
         let t_host = (!host.is_empty()).then(std::time::Instant::now);
         if self.threads == 1 || host.len() < 2 || self.host_gu.is_some() {
             // Serial path: one expert at a time. Also used when int2 host experts

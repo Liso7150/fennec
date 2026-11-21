@@ -15,8 +15,13 @@
 //!     question (`Model::host_traffic` src/model.rs:3976, `host_ns` src/model.rs:1228),
 //!     which is the same span as the `moe host experts` stage - so it reports the
 //!     achieved rate and can only ever agree with the stage it is meant to price.
-//!     `Plan::build` places experts with it (#436/#437). The missing piece is an
-//!     independent ceiling, which is what section 2 is for.
+//!     r23 showed the second reason not to trust it: the same shape read 4.2 GB/s
+//!     cold and 15.6 warm 90 s apart, with the streamed window moving with it, so
+//!     it is a lane span other tiers share rather than a cost of a byte. #473 took
+//!     it out of `Bandwidth::apply`, which leaves `Plan::build` pricing with the
+//!     profile constant and this ceiling as the only independent number. Section 2
+//!     is what measures the ceiling; sections 1 and 3 say how far the kernel is
+//!     from it.
 //!
 //! The ceiling is measured twice on purpose. Since #419 the host tier's weights
 //! are borrowed from the shard mapping - they are file pages, not bytes the

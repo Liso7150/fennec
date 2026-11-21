@@ -155,20 +155,27 @@ impl Bandwidth {
     /// lm_head), and #464 finally measured what the tier really does: the int4
     /// expert GEMV holds 31-37 GB/s on private pages from 8 to 16 workers against
     /// a 63.6 GB/s read ceiling, so the kernel - not the RAM - is the limit, and
-    /// it is already issue-limited at the shipped worker count. Two consequences
-    /// for this constant, both of which it now honors:
+    /// it is already issue-limited at the shipped worker count. The 17 is left
+    /// against the 31-37 on purpose: this one field prices three byte classes (the
+    /// int4 experts, the int8 dense trunk, the int8 lm_head) and 15.4-18.5 is what
+    /// two of the three were timed at, so raising it to the expert kernel's rate
+    /// would price the trunk and the head too cheaply to pay for the experts.
+    /// Splitting the classes is #436's structural job; editing this number is not
+    /// that fix, and a plan rebased on 34 would sit quietly 2x off every
+    /// prediction recorded against 17. Two consequences for this constant, both of
+    /// which it now honors:
     ///
-    /// - The seed stays a *served* rate, not the kernel's best. The per-turn
-    ///   windows the engine logs read 3.1 GB/s on the CUDA lane (33645 MB in
-    ///   10827 ms) and 5.1-8.0 on the CPU lane (17222 MB in 3404 ms, 64592 in 8121,
-    ///   54669 in 7820), so 17 is high against every served window this box has
-    ///   recorded - and those windows are themselves generous, because until #473
-    ///   they blended the decode tier with the prefill union and double-billed the
-    ///   union's bytes: the r20 CPU arm reported 759 MB/token against the 542 MiB a
-    ///   token can read even when every one of its 320 picks comes from RAM. The
-    ///   decode-only rate is what the next serve session reports; this constant is a
-    ///   seed, and `Measured::host_gbs` replaces it as soon as a run of the same
-    ///   tier shape has timed one.
+    /// - This is a *cost of bytes*, which is the only thing the plan divides by,
+    ///   and it is deliberately not a served-window number. The windows the engine
+    ///   logs are not comparable to it: two runs of one shape on one box put the
+    ///   CPU lane at 4.2 GB/s and 15.6 90 s apart, because the span timed is the
+    ///   lane the host picks share with the streamed refills they wait on.
+    ///   `Measured::host_gbs` records that achievement and `apply` refuses to price
+    ///   with it; see the comment there for the 149 ms/token machine that predicted
+    ///   1802.5 when it did. Until #473 the windows were worse than noisy: they
+    ///   blended the decode tier with the prefill union and double-billed the
+    ///   union's bytes, the r20 CPU arm reporting 759 MB/token against the 542 MiB
+    ///   a token can read even when every one of its 320 picks comes from RAM.
     /// - It must not be read as a ceiling to buy back with more threads. The
     ///   marginal byte past ~8 workers is already free of bandwidth pressure
     ///   (efficiency falls 85-91 % to 57-62 % while GB/s stays flat), so a plan
@@ -197,9 +204,12 @@ impl Bandwidth {
 
     /// CPU-only decode: everything is read from system RAM, so the device tier
     /// is a second name for the host tier and every bandwidth is the host's. Same
-    /// 17 GB/s and the same provenance, with one difference worth naming: with no
-    /// device batch competing for the memory controller, this is the lane where
-    /// the seed is closest to what a served window reports.
+    /// 17 GB/s and the same provenance. Taking the device batch out does not turn
+    /// the served window into a byte cost either: r23 ran this profile with no
+    /// device in sight and logged 4.2 GB/s cold and 15.6 warm for one shape 90 s
+    /// apart, with the streamed window of the same pair moving 3.8 to 23.6 in step -
+    /// which is what says the host number times a lane rather than the time one
+    /// pack's first byte takes to reach its last.
     pub fn cpu_only() -> Bandwidth {
         Bandwidth {
             device_gbs: 17.0,
@@ -217,15 +227,28 @@ impl Bandwidth {
     /// `device_gbs` and `pcie_gbs` are absent on purpose. Nothing times the
     /// device's own reads or the load-time upload per byte, so the only honest
     /// source for those two is the profile they came from.
+    ///
+    /// `host_gbs` is absent for a different reason, and it is the reason #473
+    /// stayed open after the union's double-count was fixed: the measured host
+    /// number is not a cost per byte, so there is no price for it to replace.
+    /// Two runs of one shape on one box, `decode --cpu --window 4` on edge0-35b,
+    /// 16 workers, 1.69 MiB packs, 90 s apart: the first logged 573 MB in 144 ms
+    /// (4.2 GB/s) and the second 889 MB in 60 ms (15.6). Nothing about the tier
+    /// changed between them but the OS page cache - the streamed window in the
+    /// same pair went 3.8 to 23.6 GB/s - and a rate that swings 3.7x on cache
+    /// state cannot be what a byte costs. Pricing the second run with the first
+    /// one's 4.2 made a machine that served 149 ms/token predict 1802.5. The two
+    /// windows move together, which is what says the host span is a lane the
+    /// streamed tier is also using rather than the time between one pack's first
+    /// byte and its last: the numerator bills host picks only, the denominator is
+    /// the lane. It stays in the rates file as what the box was doing under load,
+    /// which is worth reading and not worth dividing by.
     pub fn apply(&mut self, m: &Measured) {
         if let Some(v) = m.disk_gbs {
             self.disk_gbs = v;
         }
         if let Some(v) = m.quant_gbs {
             self.quant_gbs = v;
-        }
-        if let Some(v) = m.host_gbs {
-            self.host_gbs = v;
         }
     }
 }
@@ -237,7 +260,9 @@ impl Bandwidth {
 /// is not a property of the SSD: r11 measured 13-20 GB/s when the tier borrowed
 /// pages the OS was already caching and 1.3-1.9 GB/s when it copied through a
 /// private buffer, on the same disk, in the same session. Neither number belongs
-/// in a constant, so neither is used as one once a run has said otherwise.
+/// in a constant, so neither is used as one once a run has said otherwise -
+/// except the host rate, which #473 stopped applying because a lane span is not a
+/// cost per byte at all. See `Bandwidth::apply`.
 ///
 /// It lives beside `.fennec_usage` because both are learned the same way - the
 /// first start assumes, every start after it knows - and it is written by Fennec
@@ -246,6 +271,13 @@ impl Bandwidth {
 pub struct Measured {
     /// Decimal GB/s the streamed tier moved per pick, as the ring timed it. The
     /// coldest sample wins: see `merge`.
+    ///
+    /// The same page-cache swing that took the host window from 4.2 to 15.6 took
+    /// this one from 3.8 to 23.6 across the same two runs, so it is as much a
+    /// property of what the OS still holds as of the SSD. `merge` keeps the coldest
+    /// of the two, which is the pessimistic side of that band, and it is the rate
+    /// that would move a placement if a placement were ever sensitive to it (r23
+    /// found none: three arms, 4.2/15.6/23.6, all placed 2427 slots).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_gbs: Option<f64>,
     /// Decimal GB/s of the FQ4 encode pass. Absent when the tier borrowed and
@@ -253,17 +285,19 @@ pub struct Measured {
     /// sample wins, as with `disk_gbs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quant_gbs: Option<f64>,
-    /// Decimal GB/s the host tier sustained while computing decode picks, which
-    /// is the only window a placement decision is made in. `Model::host_traffic`
-    /// times it on the decode path; the batched-prefill union, which reads one
-    /// pack per expert instead of one per pick, is timed on its own and never
-    /// priced here (#473). The warmest sample of the same shape wins: see `merge`.
+    /// Decimal GB/s the host tier sustained while computing decode picks.
+    /// `Model::host_traffic` times it on the decode path; the batched-prefill
+    /// union, which reads one pack per expert instead of one per pick, is timed on
+    /// its own and never mixed in (#473). The warmest sample of the same shape
+    /// wins: see `merge`.
     ///
-    /// This is a served-path *achievement*, not a property of the memory. It is
-    /// taken while the device batch is in flight and the workers share the
-    /// controller with everything else in the token, so it is the right number to
-    /// quote as contention and the wrong one to quote as what the RAM can do: #464
-    /// measured the same packs read at 31-37 GB/s on an idle box.
+    /// Reported, never priced: `Bandwidth::apply` leaves `host_gbs` alone. This is
+    /// a served-path *achievement* over a lane span, so its denominator contains
+    /// the streamed refills the host picks wait on (and, on a GPU plan, the device
+    /// batch they overlap), and it moves 3.7x on page-cache state for one shape
+    /// (4.2 then 15.6 GB/s, 90 s apart). What a host byte costs is the profile
+    /// constant, which #464 bracketed at 31-37 GB/s for the expert kernel and
+    /// `fennec bench` at 15.4-18.5 for the copy loop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_gbs: Option<f64>,
     /// Matrix bytes held per byte committed by the RAM tier: 9.0-ish when every
@@ -319,23 +353,28 @@ impl Measured {
     /// Fold what a run just measured onto what earlier runs measured.
     ///
     /// The fields do not share a rule, because the two rates are distorted by
-    /// opposite conditions. A run's first pass pays a page fault on every
-    /// borrowed expert and records a host tier near what cold memory did once;
-    /// the passes after it hit pages the OS still holds, and those are the ones a
-    /// placement decision lasts over, because RAM that is resident stays resident
-    /// for the life of the plan. So the host rate keeps its best sample - bounded
-    /// now, because #464 measured the warming itself: the same packs read as
-    /// file-mapped pages cost 79-101 % of the time they cost in private buffers, so
-    /// the warmest honest sample is at most 1/0.79 = 1.27x the coldest one.
+    /// opposite conditions. The streamed tier is distorted by warmth in the
+    /// direction that flatters it: the same pack read a second time comes out of
+    /// the OS cache at over 20 GB/s, which is a fact about the cache and not about
+    /// the drive the streamed lane has to reach for on a cold page, and the only
+    /// sample that prices the streamed tier is the one that had to go to disk. So
+    /// disk and quantise keep their worst. Measured on one box, four runs apart, on
+    /// the same 8 GiB borrowed tier, disk read 4.4 GB/s cold and 22.9 warm.
+    ///
+    /// The host rate keeps its best sample for the mirror reason, and now for that
+    /// reason only - it no longer prices anything (`Bandwidth::apply`), so which
+    /// sample survives is a display choice about what the box was capable of, not a
+    /// cost. It used to be load-bearing, and the note here bounded the choice:
+    /// #464 measured the same packs read as file-mapped pages costing 79-101 % of
+    /// what they cost in private buffers, which caps warmth at 1/0.79 = 1.27x. r23
+    /// broke that bound in the served lane - one shape, 90 s apart, 4.2 GB/s then
+    /// 15.6, a 3.7x swing - which is the second reason the field left the price: a
+    /// sample whose own spread is 3.7x is not a cost per byte, and a cap derived
+    /// from an isolated copy loop does not describe a window other tiers share.
+    ///
     /// (The 5x gap that this file used to show between its stored rate and its own
     /// logged windows came from blending the two paths, not from warmth - see
-    /// `Model::host_traffic`.) The streamed tier is the mirror image: the same pack
-    /// read a second time comes out of the OS cache at over 20 GB/s, which is a
-    /// fact about the cache and not about the drive, and the only sample that
-    /// prices the streamed lane is the one that had to go to disk. So disk and
-    /// quantise keep their worst. Measured on one box, four runs apart, the same
-    /// 8 GiB borrowed tier: 3.5 GB/s on a cold cache and 11.5 on a warm one, disk
-    /// 4.4 cold and 22.9 warm.
+    /// `Model::host_traffic`.)
     ///
     /// A change in the tier's shape resets the traffic rates. A tier that memcpys
     /// packs out of a mapping and one that reads a whole source and encodes it are
@@ -492,9 +531,10 @@ pub fn expert_source_bytes(cfg: &TextConfig) -> usize {
 /// the kernel that applies a pack does the same work whether the pack came from
 /// the RAM tier or out of a ring, and pricing only the read is how the plan came
 /// to treat the streamed tier as a discount on RAM. The compute is charged at
-/// `host_gbs`, which is not a bandwidth guess but the measured cost per pick of
-/// running that kernel on this CPU, so a disk pick costs its refill plus one host
-/// pick and nothing else invented.
+/// `host_gbs`, the profile's cost of a host byte (#464 bracketed the expert kernel
+/// at 31-37 GB/s, `fennec bench` the copy loop at 15.4-18.5, and the constant sits
+/// at 17 for the reasons on `laptop_4060`), so a disk pick costs its refill plus
+/// one host pick and nothing else invented.
 fn stream_price_ms(
     borrows: bool,
     pack_bytes: usize,
@@ -725,7 +765,8 @@ impl Plan {
         // device lane is zero and the max is the same number the sum used to be.
         let dev_lane = per_token_bytes * device_hit_rate / bw.device_gbs / 1e6;
         // the host tier is read by the CPU out of its own RAM: no PCIe crossing,
-        // so it is priced at host bandwidth, not the link's
+        // so it is priced at the profile's cost of a host byte, not the link's.
+        // The rate a served run reports about this lane never enters here (#473).
         let host_lane = per_token_bytes * host_hit_rate / bw.host_gbs / 1e6 + stream_ms;
         let mut credit = 0.0f64;
         for lp in &layers {
@@ -907,7 +948,6 @@ mod tests {
         let mut bw = Bandwidth::laptop_4060();
         bw.apply(&back);
         assert_eq!(bw.disk_gbs, 17.4);
-        assert_eq!(bw.host_gbs, 12.1);
         assert_eq!(bw.quant_gbs, 1.9);
         assert_eq!(bw.pcie_gbs, 13.5);
         assert_eq!(bw.device_gbs, 272.0);
@@ -926,7 +966,7 @@ mod tests {
         assert_eq!(
             kept.host_gbs,
             Some(12.1),
-            "the RAM tier is priced on its warmest pass, not on a run that paid the page faults"
+            "the reported lane achievement is the box's best pass, not one that paid the page faults"
         );
         // The disk lane is priced the other way round: the same pack read twice
         // comes out of the OS cache, and that number is about the cache, not the
@@ -951,6 +991,49 @@ mod tests {
         assert_eq!(flipped.host_gbs, Some(1.6));
         assert!(!flipped.borrows, "the shape flag follows the newest run");
         std::fs::remove_file(&path).ok();
+    }
+
+    /// #473, second half: what a run reports about its host lane must not reach
+    /// the price of a host byte. r23 ran one shape twice on one box, 90 s apart,
+    /// and got 4.2 GB/s then 15.6 - the OS page cache, not the memory - while the
+    /// streamed window in the same pair moved 3.8 to 23.6. Pricing the second run
+    /// with the first one's sample predicted 1802.5 ms/token for a machine that
+    /// served 149.1. Both samples now live in the rates file as contention
+    /// evidence; neither is allowed to change the plan.
+    #[test]
+    fn a_measured_host_window_never_prices_a_host_byte() {
+        let seed = Bandwidth::laptop_4060();
+        for (cold, warm) in [(4.1668, 15.6), (2.5, 21.7), (31.0, 37.0)] {
+            for rate in [cold, warm] {
+                let mut bw = Bandwidth::laptop_4060();
+                bw.apply(&Measured {
+                    host_gbs: Some(rate),
+                    borrows: true,
+                    threads: Some(16),
+                    pick_bytes: Some(1_769_472),
+                    ..Default::default()
+                });
+                assert_eq!(
+                    bw.host_gbs,
+                    seed.host_gbs,
+                    "{rate} GB/s of served lane is reported, not divided by"
+                );
+            }
+        }
+        // The rates that do price are the ones measured against the medium they
+        // price, and they still override.
+        let mut bw = Bandwidth::laptop_4060();
+        bw.apply(&Measured {
+            host_gbs: Some(4.1668),
+            disk_gbs: Some(9.4),
+            quant_gbs: Some(2.2),
+            borrows: true,
+            threads: Some(16),
+            pick_bytes: Some(1_769_472),
+            ..Default::default()
+        });
+        assert_eq!((bw.disk_gbs, bw.quant_gbs), (9.4, 2.2));
+        assert_eq!(bw.host_gbs, seed.host_gbs);
     }
 
     /// #473: a rate is a property of a shape, not of a box. The worker count and
