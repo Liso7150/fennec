@@ -114,9 +114,10 @@ Two protocols appear here and they answer different questions:
 | CPU decode | `2026-11-21T01:39:40Z` | **143.6 ms/token** | Colibri 169.4 ms/token | **Fennec faster** - 15.2% median gap against a 14.6% run-to-run spread, ahead in 4 of 4 paired rounds |
 | Vulkan decode | `2026-11-21T01:39:40Z` | **66.0 ms/token** | Colibri 84.7 ms/token | **Fennec faster** - 22.1% median gap against a 14.5% run-to-run spread, ahead in 4 of 4 paired rounds |
 | Served time to first token (device tier) | `2026-11-21T01:39:40Z` | **2.094 s** | Colibri 1.125 s | **behind** - task #191 settled the chunked route by measurement: serving `prefill_device` cost +0.57 to +0.64 s over the per-token device path (ABBA 4 of 4, both orders, session 2026-11-15T20:24Z), so `serve` is behind the host-tier gate until the expert union splits by pick rather than by token (#201) |
+| CUDA decode vs Strata (ctx 8192) | `2026-11-21T16:55:37Z` | **60.4 ms/token** | Strata 36.6 ms/token | **behind** - Strata's drafter, not a faster kernel, buys it 1.53x on this box: the cell that changed nothing but `--mtp` measured 23.81 ms/token with it and 36.46 without (engine-bench/raw/strata-mtp-attribution.json), on a draft block Fennec's own checkpoint already carries unread - 529 `mtp.*` tensors, 0.50 GiB, `mtp_num_hidden_layers: 1` - and no code path uses (#482). The residual is per-pass cost, 36.46 against Fennec's 60.4 with speculation off, which is the host expert read #464 found issue-limited. Three disclosures: every Strata token came back in `reasoning_content` instead of the answer field; it needed a `{% generation %}` chat-template pack plus 81.9 s of cold start against Fennec's 24.0 s; and the attribution cell ran alone while this row is paired, so its ratio travels and its levels do not. |
 | CUDA decode vs llama.cpp | `2026-11-21T01:39:40Z` | **65.2 ms/token** | llama.cpp 47.9 ms/token | both rows are block medians of the same session, so this is a level difference and not an ABBA verdict; llama.cpp reads a Q4_K_M GGUF of the checkpoint while Fennec reads the suite's int4 container, which is the first thing to hold constant before calling it a kernel gap (open as task #459) |
 
-Every row is re-derived from the ABBA session file it names; the medians are the median of paired visits after two discarded full-length warm-ups, and the spread is the run-to-run range of the same pair on this box. Sources: `results-backend-matrix.abba-2026-11-15T0941Z.json`, `results-backend-matrix.abba-vulkan-postkernel-2026-11-15T1047Z.json`, `results-backend-matrix.abba-2026-11-21T0139Z.json`.
+Every row is re-derived from the ABBA session file it names; the medians are the median of paired visits after two discarded full-length warm-ups, and the spread is the run-to-run range of the same pair on this box. Sources: `results-backend-matrix.abba-2026-11-15T0941Z.json`, `results-backend-matrix.abba-vulkan-postkernel-2026-11-15T1047Z.json`, `results-backend-matrix.abba-2026-11-21T0139Z.json`, `results-backend-matrix.abba-2026-11-21T1655Z.json`, `results-backend-matrix.blocked-2026-11-21T1830Z.json`.
 <!-- /fennec-results:bench -->
 
 ### Fennec against llama.cpp 1.0.0
@@ -244,7 +245,7 @@ fennec serve --backend ort --model <model-dir>
 ## Testing
 
 ```bash
-# Run all tests (201 passing)
+# Run all tests (203 passing)
 cargo test --release --offline
 
 # Backend-specific tests
@@ -258,7 +259,7 @@ FENNEC_GOLDEN_MODEL=<model-dir> cargo test --release --offline --test golden
 python tools/smoke_serve.py  # 30 checks against running server
 ```
 
-**Test coverage**: 201 passed, 0 failed, 5 ignored across 10 suites
+**Test coverage**: 203 passed, 0 failed, 5 ignored across 10 suites
 - `src/` unit tests: quantizer, kernels, auth, samplers, device discovery, memory
 - golden tests against the pinned transformers 5.22.2 reference (`tests/golden.rs`)
 - device-vs-CPU integration tests (`tests/gpu.rs`, run once per backend)
