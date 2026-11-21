@@ -804,9 +804,34 @@ fn the_device_works_after_the_handle_moves_to_another_thread() {
 /// decision, not a regression gate. Run it on the tier being tuned:
 ///
 /// ```text
-/// FENNEC_BACKEND=vulkan cargo test --release --offline --test gpu -- \
+/// FENNEC_BACKEND=cuda cargo test --release --offline --test gpu -- \
 ///     --ignored --nocapture
 /// ```
+///
+/// # What it said on CUDA, and what that decided
+///
+/// The stage is weight bandwidth (`logs/mixer-bandwidth.log`, task #470). One
+/// GDN layer streams 67371008 bytes = 64.25 MiB of f16 weights, and the fused
+/// submit moves them at 193 GB/s against the 230 GB/s the *same kernel* gets from
+/// a 64 MiB buffer: 84% of what the bus allows at that moment. `fused x 30
+/// layers` = 10.5 ms/token, which is where the served `mixer dev device` row
+/// sits (10.14-11.58), so one layer's cost times the layer count is the whole
+/// stage and no launch, record or fence arithmetic is missing from it.
+///
+/// Two readings the probe exists to prevent:
+///
+/// * **The part rows are not a target.** Each replays one buffer 300 times, so
+///   its weights stay in the on-die cache and it prints 443-574 GB/s on a card
+///   whose DRAM ceiling is 230. Adding the parts (205 us) and calling the fused
+///   layer (350 us) a regression measures cache, not code.
+/// * **The ceiling has to be measured under sustained load.** This card idles its
+///   memory bus at 810 MHz of an 8001 MHz maximum, and a burst taken before it
+///   ramps reads 160-205 GB/s. Three seconds of continuous reads first is what
+///   makes the ceiling line mean anything.
+///
+/// The ratio is the portable quantity, not the level: a cold-clock session and a
+/// ramped one gave 138/160 and 193/230 GB/s, i.e. 86% and 84% of their own
+/// ceilings, while the fused layer's absolute microseconds differed by 40%.
 #[test]
 #[ignore = "device timing probe, prints instead of asserting"]
 fn mixer_kernel_shapes() {
@@ -910,6 +935,62 @@ fn mixer_kernel_shapes() {
     });
 
     let (dev, backend_label) = (g.name().to_string(), g.backend().label().to_string());
+
+    // The card's own read bandwidth, so the figures above and the layer below
+    // have a ceiling to be read against. 16384x2048 f16 is 64 MiB, which no
+    // on-die cache holds, and it is measured twice: once over pseudo-random
+    // weights and once over zeroes. If the two agree, the zeroed buffers every
+    // other row uses are not making anything look cheaper than it is.
+    let (big_rows, big_cols) = (16384usize, 2048usize);
+    let big_bytes = big_rows * big_cols * 2;
+    let big = half_weights(&mut g, big_rows, big_cols);
+    let mut rnd = vec![0u8; 1 << 20];
+    let mut s = 0x9E37_79B9_7F4A_7C15u64;
+    for off in (0..big_bytes).step_by(1 << 20) {
+        for b in rnd.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *b = (s >> 24) as u8;
+        }
+        g.write_buf(big, off, &rnd).unwrap();
+    }
+    let big_gemv = |g: &mut Gpu| {
+        timed(g, move |g| {
+            g.batch().unwrap()
+                .gemv_half_indep(big, big_rows, big_cols, dense_off, ib)
+                .unwrap()
+                .run()
+                .unwrap();
+        })
+    };
+    let big_once = move |g: &mut Gpu| {
+        g.batch().unwrap()
+            .gemv_half_indep(big, big_rows, big_cols, dense_off, ib)
+            .unwrap()
+            .run()
+            .unwrap();
+    };
+    let rand_us = big_gemv(&mut g);
+    let zeroes = vec![0u8; 1 << 20];
+    for off in (0..big_bytes).step_by(1 << 20) {
+        g.write_buf(big, off, &zeroes).unwrap();
+    }
+    let zero_us = big_gemv(&mut g);
+    // A burst measures whatever the memory bus happens to be doing: this card
+    // idles at 810 MHz against an 8001 MHz maximum, so the two bursts above may
+    // be reading a downclocked bus. Three seconds of continuous load, then the
+    // same burst again, and the two are printed side by side.
+    let t = std::time::Instant::now();
+    let mut laps = 0usize;
+    while t.elapsed().as_secs_f64() < 3.0 {
+        big_once(&mut g);
+        laps += 1;
+    }
+    let secs = t.elapsed().as_secs_f64();
+    let hot_us = big_gemv(&mut g);
+    let busy_gbs = |bytes: usize, us: f64| bytes as f64 / ((us - floor).max(1e-6) * 1e-6) / 1e9;
+
     // The layer as decode runs it, and two variations that say which of the
     // stage's costs are real: dropping the barrier tests whether the four input
     // kernels were ever actually serialized, and skipping the submit leaves the
@@ -947,9 +1028,36 @@ fn mixer_kernel_shapes() {
         let gbs = if busy > 0.0 { *bytes as f64 / (busy * 1e-6) / 1e9 } else { 0.0 };
         println!("  {label:<9}: {us:6.1} us  busy {busy:6.1} us  {gbs:5.0} GB/s");
     }
-    println!("  (the conv and rec figures count state traffic, not weights)");
+    println!(
+        "  (the conv and rec figures count state traffic, not weights; the gemv \
+         GB/s is an L2 ceiling - each part replays one buffer {ITERS} times)"
+    );
+    println!(
+        "  DRAM reference    : 64 MiB f16 gemv reads at {:.0} GB/s over random \
+         weights, {:.0} GB/s over zeroes",
+        busy_gbs(big_bytes, rand_us),
+        busy_gbs(big_bytes, zero_us)
+    );
+    println!(
+        "                    : sustained {laps} laps in {secs:.2} s = {:.0} GB/s, \
+         burst after it {:.0} GB/s",
+        big_bytes as f64 * laps as f64 / secs / 1e9,
+        busy_gbs(big_bytes, hot_us)
+    );
     println!("  sum of parts      : {sum:.1} us, plus the floor {:.1}", sum + floor);
     println!("  fused, one submit : {fused:.1} us   barrier-free {fused_nb:.1} us");
+    let weight_bytes = (cd * h + vd * h + 2 * nv * h + h * vd) * 2;
+    // Compared against the *best* ceiling measured above, so "bandwidth-bound"
+    // is the conservative reading, not the flattering one.
+    let ceiling = busy_gbs(big_bytes, rand_us.min(hot_us));
+    println!(
+        "  one layer reads {weight_bytes} bytes ({:.0} MiB) of weights in {:.1} us busy \
+         = {:.0} GB/s, which is {:.0}% of the best measured ceiling",
+        weight_bytes as f64 / (1 << 20) as f64,
+        fused - floor,
+        busy_gbs(weight_bytes, fused),
+        100.0 * busy_gbs(weight_bytes, fused) / ceiling
+    );
     println!(
         "  overlap saving    : {:.1} us ({:.0}% of the parts)",
         sum + floor - fused,
