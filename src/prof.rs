@@ -7,10 +7,14 @@
 //! and optimising a guess.
 //!
 //! Off unless `enable()` is called, so a normal run pays one relaxed load per
-//! stage. Stages are disjoint: a timer never nests inside another. Counters
-//! accumulate across threads, so a stage measured inside `par_count` reports
-//! CPU time rather than wall time — compare it against the thread count, not
-//! against the token's wall clock.
+//! stage. Counters accumulate across threads, so a stage measured inside
+//! `par_count` reports CPU time rather than wall time — compare it against the
+//! thread count, not against the token's wall clock.
+//!
+//! Most stages are siblings that a token's time is carved between, and those
+//! are what [`total`] adds up. `mixer device` and its three `mixer dev *`
+//! rows are not siblings: the parent wraps the children, so [`total`] counts
+//! the parent and skips the parts that restate it. See [`BREAKDOWN`].
 //!
 //! A request is two kinds of forward pass: the prompt, which [`split`] moves
 //! into its own counters, and one token at a time afterwards, which
@@ -42,6 +46,28 @@ pub const MIXER_PROJ: usize = 12;
 pub const MIXER_DEV_UPLOAD: usize = 13;
 pub const MIXER_DEV_COMPUTE: usize = 14;
 pub const MIXER_DEV_READBACK: usize = 15;
+
+/// The rows that restate another row instead of standing beside it.
+///
+/// `Model::step` opens `mixer device` around `step_fused` / `dev_inputs`, and
+/// those open upload, compute and readback inside it. `total` therefore counts
+/// the parent and skips the parts: add both and the mixer's device half is
+/// billed twice, which is what made `accounted` come out over the wall clock
+/// and `unaccounted` negative on the CUDA tier (43.60 against 35.31 ms/token).
+/// The children still print, because upload, compute and readback have three
+/// different fixes (PCIe bandwidth, shader execution, PCIe latency) — they
+/// just do not add.
+pub const BREAKDOWN: [usize; 3] = [MIXER_DEV_UPLOAD, MIXER_DEV_COMPUTE, MIXER_DEV_READBACK];
+
+/// Milliseconds a token actually spent: every stage except the rows that
+/// restate a stage already in the sum.
+pub fn total(ms: &[f64; 16]) -> f64 {
+    ms.iter()
+        .enumerate()
+        .filter(|(i, _)| !BREAKDOWN.contains(i))
+        .map(|(_, v)| *v)
+        .sum()
+}
 
 /// `moe submit` split in two and `moe device wait` split in two, because the
 /// lumped numbers could not say whether the cost was the blocking activation
@@ -172,10 +198,11 @@ pub fn prompt_line() -> Option<String> {
     if tokens == 0 {
         return None;
     }
-    let sum: f64 = ms.iter().sum();
+    let sum = total(&ms);
     let (worst, biggest) = ms
         .iter()
         .enumerate()
+        .filter(|(i, _)| !BREAKDOWN.contains(i))
         .fold((0usize, 0f64), |a, (i, &x)| if x > a.1 { (i, x) } else { a });
     Some(format!(
         "  prompt    {tokens} tokens in {sum:.2} ms accounted, {:.0}% {}",
@@ -184,15 +211,25 @@ pub fn prompt_line() -> Option<String> {
     ))
 }
 
+/// The table's own heading, shared by both printers so the two can never
+/// disagree about whether the `mixer dev` rows add. A reader who sums the
+/// column has to know that three of the rows restate one of the others.
+pub fn header(steps: usize) -> String {
+    format!(
+        "  stage breakdown (ms/token, {steps} decode steps; the three `mixer dev` \
+         rows split `mixer device` and are not added):\n"
+    )
+}
+
 /// The decode breakdown: milliseconds per decode step, then the prompt on its
 /// own line. `wall_ms` is the caller's whole request and is only used when the
 /// phase was never split, so the last row shows what the stages failed to name.
 pub fn report(wall_ms: f64) -> String {
     let steps = decode_steps().max(1) as f64;
     let ms = millis();
-    let sum: f64 = ms.iter().sum();
+    let sum = total(&ms);
     let wall = decode_wall_ms().unwrap_or(wall_ms);
-    let mut out = format!("  stage breakdown (ms/token, {} decode steps):\n", decode_steps());
+    let mut out = header(decode_steps());
     for (name, v) in STAGES.iter().zip(&ms) {
         out.push_str(&format!("    {name:<20} {:7.2}  {:5.1}%\n", v / steps, 100.0 * v / sum.max(1e-9)));
     }
@@ -209,9 +246,10 @@ pub fn report(wall_ms: f64) -> String {
         // A chunked prefill and a token loop can total the same and disagree
         // stage by stage, and that difference is the whole measurement.
         let (pms, tokens) = prompt_millis();
-        let psum: f64 = pms.iter().sum();
+        let psum = total(&pms);
         out.push_str(&format!(
-            "  prompt stage breakdown (ms/token, {} prompt tokens):\n",
+            "  prompt stage breakdown (ms/token, {} prompt tokens; as above, the \
+             `mixer dev` rows do not add):\n",
             tokens
         ));
         for (name, v) in STAGES.iter().zip(&pms) {
@@ -397,5 +435,60 @@ mod tests {
         assert!(STAGES.iter().all(|s| !s.is_empty()));
         let mut seen = std::collections::HashSet::new();
         assert!(STAGES.iter().all(|s| seen.insert(*s)));
+    }
+
+    /// `mixer device` wraps its three parts, so the column a reader adds is not
+    /// the 16 rows printed above it. Bill both and the mixer's device half is
+    /// charged twice, `accounted` lands over the wall clock and the one row
+    /// that says how much of a token the profiler failed to name goes negative.
+    #[test]
+    fn a_stage_that_wraps_its_own_breakdown_is_billed_once() {
+        let _g = EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner());
+        ON.store(true, Relaxed);
+        reset();
+        // Ten ms of device mixer, split inside itself as 2 + 3 + 5, plus 2 ms of
+        // routing: the token took 12 ms, not 22.
+        for (stage, ms) in [
+            (MIXER_DEV, 10.0),
+            (MIXER_DEV_UPLOAD, 2.0),
+            (MIXER_DEV_COMPUTE, 3.0),
+            (MIXER_DEV_READBACK, 5.0),
+            (ROUTE, 2.0),
+        ] {
+            NS[stage].store((ms * 1e6) as u64, Relaxed);
+            PROMPT_NS[stage].store((ms * 1e6) as u64, Relaxed);
+        }
+        PROMPT_TOKENS.store(4, Relaxed);
+        tick_decode_step();
+
+        let ms = millis();
+        assert_eq!(total(&[0.0; 16]), 0.0);
+        assert!(
+            (total(&ms) - 12.0).abs() < 1e-6,
+            "a token is its stages, not its stages plus the parts of one: {}",
+            total(&ms)
+        );
+        assert!(
+            (ms.iter().sum::<f64>() - 22.0).abs() < 1e-6,
+            "the printed column still shows every row"
+        );
+
+        let rep = report(12.0);
+        assert!(rep.contains("12.00  (wall 12.00)"), "accounted row:\n{rep}");
+        // The parts still print, because upload, compute and readback have
+        // three different fixes — they just do not add.
+        for name in ["mixer dev upload", "mixer dev compute", "mixer dev readback"] {
+            assert!(rep.contains(name), "{name} left the table:\n{rep}");
+        }
+        // The headline names a stage a token actually spends, not a slice of one.
+        let line = prompt_line().unwrap();
+        assert!(line.contains("12.00 ms accounted"), "{line}");
+        assert!(line.contains(STAGES[MIXER_DEV]), "{line}");
+        assert!(
+            BREAKDOWN.iter().all(|i| !line.contains(STAGES[*i])),
+            "the prompt line blamed a row that does not add: {line}"
+        );
+        reset();
+        ON.store(false, Relaxed);
     }
 }

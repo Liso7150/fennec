@@ -1606,14 +1606,15 @@ fn decode(opts: &Opts, threads: usize) -> Result<(), String> {
     if fennec::prof::enabled() {
         let steps = step_ms.len().max(1) as f64;
         let ms = fennec::prof::millis();
-        let sum: f64 = ms.iter().sum();
-        println!("  stage breakdown (ms/token, {} steps):", steps as usize);
+        let sum = fennec::prof::total(&ms);
+        print!("{}", fennec::prof::header(steps as usize));
         for (name, v) in fennec::prof::STAGES.iter().zip(&ms) {
             println!("    {name:<20} {:7.2}  {:5.1}%", v / steps, 100.0 * v / sum.max(1e-9));
         }
         // Every stage timer wraps its parallel region from the outside, so these
-        // are wall time and add up to the stack. The remainder is stack time no
-        // stage claims, which is the number to chase rather than a rounding error.
+        // are wall time, and `total` bills the device mixer once rather than with
+        // the three parts that split it. The remainder is stack time no stage
+        // claims, which is the number to chase rather than a rounding error.
         let stack_mean = stack_ms.iter().sum::<f64>() / steps;
         println!(
             "    {:<20} {:7.2}  (wall time; stack {:.2}, unaccounted {:.2})",
