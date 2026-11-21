@@ -244,7 +244,7 @@ fennec serve --backend ort --model <model-dir>
 ## Testing
 
 ```bash
-# Run all tests (195 passing)
+# Run all tests (196 passing)
 cargo test --release --offline
 
 # Backend-specific tests
@@ -258,7 +258,7 @@ FENNEC_GOLDEN_MODEL=<model-dir> cargo test --release --offline --test golden
 python tools/smoke_serve.py  # 30 checks against running server
 ```
 
-**Test coverage**: 195 passed, 0 failed, 4 ignored across 9 suites
+**Test coverage**: 196 passed, 0 failed, 4 ignored across 9 suites
 - `src/` unit tests: quantizer, kernels, auth, samplers, device discovery, memory
 - golden tests against the pinned transformers 5.22.2 reference (`tests/golden.rs`)
 - device-vs-CPU integration tests (`tests/gpu.rs`, run once per backend)
