@@ -20,7 +20,7 @@ sys.path.insert(0, str(HERE / "tools"))
 
 from engine_graph import bars  # noqa: E402
 
-SRC = SUITE / "benchmarks" / "results-backend-matrix.json"
+SRC = SUITE / "benchmarks" / "artifacts" / "results-backend-matrix.json"
 OUT = HERE / "docs"
 
 LABEL = {
