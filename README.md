@@ -266,7 +266,7 @@ python tools/smoke_serve.py  # 30 checks against running server
   `tests/dense_i8.rs`, `tests/edge0_bench.rs`)
 
 The per-suite split is whatever the run above prints; the total, the ignored count and
-the suite count come from `benchmarks/results/RESULTS.json` in the suite checkout, and
+the suite count come from `benchmarks/artifacts/hub/RESULTS.json` in the suite checkout, and
 `python benchmarks/results.py sync` rewrites the line above from it.
 
 CI runs the whole suite on Windows, macOS (ARM64) and Ubuntu x86_64. The golden
