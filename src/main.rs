@@ -100,7 +100,7 @@ impl Opts {
     fn model_dir(&self) -> Result<String, String> {
         let dir = self.dir();
         if dir.is_empty() {
-            return Err("no model directory: pass --model <dir>, set FENNEC_MODEL, or set `model` in ~/.fennec/config.json".into());
+            return Err("no model directory: pass --model <dir>, or set FENNEC_MODEL".into());
         }
         Ok(dir)
     }
@@ -124,8 +124,12 @@ fn main() {
     let cmd = all.first().cloned().unwrap_or_else(|| "help".to_string());
     
     // Handle version flags before command parsing
-    if cmd == "--version" || cmd == "-V" || cmd == "-v" {
+    if cmd == "--version" || cmd == "-V" || cmd == "-v" || cmd == "version" {
         println!("fennec {}", fennec::VERSION);
+        return;
+    }
+    if cmd == "--help" || cmd == "-h" {
+        usage();
         return;
     }
     
@@ -209,7 +213,7 @@ fn usage() {
          \x20 --host-int2       quantise host-resident experts to int2: 40% of the tier's bytes for ~3% slower decode, opt-in, and a no-op when the tier borrows the file mapping\n\
          \x20 --mtp N           draft N tokens per round from the checkpoint's mtp.* block and verify them in one trunk pass; greedy only, host tier only, 0 turns it off\n\
          \x20 --experimental    check for updates from main branch instead of releases\n\n\
-         model dir: pass --model <dir>, set FENNEC_MODEL, or set `model` in ~/.fennec/config.json",
+         model dir: pass --model <dir>, or set FENNEC_MODEL",
         fennec::VERSION
     );
 }
