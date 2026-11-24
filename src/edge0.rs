@@ -119,6 +119,12 @@ fn create_edge0_145b_config() -> TextConfig {
         num_experts_per_tok: 10,
         moe_intermediate_size: 640,
         shared_expert_intermediate_size: 640,
+mtp_num_hidden_layers: 0,
+        mtp_use_dedicated_embeddings: false,
+        vision: None,
+        image_token_id: None,
+        vision_start_token_id: None,
+        vision_end_token_id: None,
         
         layer_types: generate_hybrid_layer_types(48),
         
@@ -158,6 +164,12 @@ fn create_edge0_120b_config() -> TextConfig {
         num_experts_per_tok: 10,
         moe_intermediate_size: 640,
         shared_expert_intermediate_size: 640,
+mtp_num_hidden_layers: 0,
+        mtp_use_dedicated_embeddings: false,
+        vision: None,
+        image_token_id: None,
+        vision_start_token_id: None,
+        vision_end_token_id: None,
         
         layer_types: generate_hybrid_layer_types(48),
         

@@ -207,6 +207,7 @@ fn usage() {
          \x20 --auto-tier       turn the device tier on without spelling out --gpu\n\
          \x20 --dense-i8        one byte per weight for the host dense projections; on by default, --no-dense-i8 restores the exact bf16/f16 dot\n\
          \x20 --host-int2       quantise host-resident experts to int2: 40% of the tier's bytes for ~3% slower decode, opt-in, and a no-op when the tier borrows the file mapping\n\
+         \x20 --mtp N           draft N tokens per round from the checkpoint's mtp.* block and verify them in one trunk pass; greedy only, host tier only, 0 turns it off\n\
          \x20 --experimental    check for updates from main branch instead of releases\n\n\
          model dir: pass --model <dir>, set FENNEC_MODEL, or set `model` in ~/.fennec/config.json",
         fennec::VERSION
@@ -1849,10 +1850,25 @@ fn serve_cmd(opts: &Opts, threads: usize) -> Result<(), String> {
              Pass --allow-remote if you really mean to expose it."
         ));
     }
-    let srv = Arc::new(fennec::serve::Server::new(
+    let srv = Arc::new(with_mtp(opts, threads, fennec::serve::Server::new(
         e.model, e.sh, e.cfg, e.tok, e.id, e.key, e.ctx,
-    ));
+    )));
     fennec::serve::serve(srv, &bind, port)
+}
+
+/// Read the drafter into a server if `--mtp N` asked for one. Shared by `serve`
+/// and `run` so both decode the same way; the quant group width comes from the
+/// checkpoint, exactly as the trunk's does.
+fn with_mtp(opts: &Opts, threads: usize, mut srv: fennec::serve::Server) -> fennec::serve::Server {
+    let group = group_for(opts, &srv.shards, &srv.cfg);
+    let k = opts.usize_at("mtp", 0);
+    // A drafter that will not read is a slower answer, not a wrong one, so the
+    // turn still runs; `enable_mtp` says out loud when it declined for a reason
+    // the caller can act on (device tier, no block in the checkpoint).
+    if let Err(e) = srv.enable_mtp(k, group, threads) {
+        eprintln!("[fennec] --mtp {k}: no drafter ({e})");
+    }
+    srv
 }
 
 fn run_cmd(opts: &Opts, threads: usize) -> Result<(), String> {
@@ -1882,9 +1898,12 @@ fn run_cmd(opts: &Opts, threads: usize) -> Result<(), String> {
     if let Some(r) = opts.str("repeat-penalty").and_then(|v| v.parse::<f32>().ok()) {
         s.repeat_penalty = r.max(1.0);
     }
-    let srv = fennec::serve::Server::new(
+    let srv = with_mtp(opts, threads, fennec::serve::Server::new(
         e.model, e.sh, e.cfg, e.tok, e.id, e.key, e.ctx,
-    );
+    ));
+    if srv.mtp.is_some() && (s.temperature > 0.0 || s.repeat_penalty != 1.0) {
+        eprintln!("[fennec] mtp: the sampler is not plain argmax, so this turn decodes one token at a time (pass --greedy)");
+    }
     let mut out = std::io::stdout();
     fennec::prof::reset();
     let t0 = Instant::now();
@@ -1918,8 +1937,8 @@ fn update_cmd(opts: &Opts) -> Result<(), String> {
                     let asset = release.assets.iter().find(|a| a.name == asset_name);
                     if let Some(asset) = asset {
                         eprintln!("[update] Downloading {}...", asset_name);
-                        let checksum = release.checksums_url.as_deref();
-                        match fennec::updater::download_asset(&asset.download_url, checksum).await {
+                        let checksum = fennec::updater::checksum_for(&release, &asset_name).await;
+                        match fennec::updater::download_asset(&asset.download_url, checksum.as_deref()).await {
                             Ok(bytes) => {
                                 let temp_path = std::env::temp_dir().join(&asset_name);
                                 std::fs::write(&temp_path, &bytes).map_err(|e| format!("Write: {e}"))?;
@@ -1929,7 +1948,13 @@ fn update_cmd(opts: &Opts) -> Result<(), String> {
                             Err(e) => return Err(format!("Download failed: {e}")),
                         }
                     } else {
-                        return Err(format!("No asset for platform: {}", asset_name));
+                        // No release here carries a per-platform binary, so the
+                        // checkout is what moves this build. Saying so is an
+                        // advisory, not a failed update.
+                        eprintln!(
+                            "[update] {} publishes no {asset_name}; the engine ships from                              source - run `fennec update` from the CLI to fast-forward this                              checkout, then `cargo build --release`.",
+                            release.version
+                        );
                     }
                 }
                 Ok(None) => {
@@ -1948,8 +1973,8 @@ fn update_cmd(opts: &Opts) -> Result<(), String> {
                     let asset = release.assets.iter().find(|a| a.name == asset_name);
                     if let Some(asset) = asset {
                         eprintln!("[update] Downloading {}...", asset_name);
-                        let checksum = release.checksums_url.as_deref();
-                        match fennec::updater::download_asset(&asset.download_url, checksum).await {
+                        let checksum = fennec::updater::checksum_for(&release, &asset_name).await;
+                        match fennec::updater::download_asset(&asset.download_url, checksum.as_deref()).await {
                             Ok(bytes) => {
                                 let current_exe = std::env::current_exe().map_err(|e| format!("Exe path: {e}"))?;
                                 if cfg!(target_os = "windows") {
@@ -1973,7 +1998,13 @@ fn update_cmd(opts: &Opts) -> Result<(), String> {
                             Err(e) => return Err(format!("Download failed: {e}")),
                         }
                     } else {
-                        return Err(format!("No asset for platform: {}", asset_name));
+                        // No release here carries a per-platform binary, so the
+                        // checkout is what moves this build. Saying so is an
+                        // advisory, not a failed update.
+                        eprintln!(
+                            "[update] {} publishes no {asset_name}; the engine ships from                              source - run `fennec update` from the CLI to fast-forward this                              checkout, then `cargo build --release`.",
+                            release.version
+                        );
                     }
                 }
                 Ok(None) => {

@@ -552,6 +552,40 @@ impl Q4 {
         y
     }
 
+    /// One pass over a weight row against several prepared activations.
+    ///
+    /// The union reads each expert row once per pick that routed to it, so the
+    /// nibble unpack and the row's bytes are paid `ps.len()` times in a row.
+    /// This splits each weight block once and feeds the same `lo`/`hi` vectors
+    /// to every pick, which is the issue-cost saving the union exists to earn
+    /// (a member averages ~4 picks per prompt chunk). Every output is
+    /// bit-identical to `dot_prepped(r, ps[i])` on its own: the per-pick block
+    /// order, the four-accumulator split, the tail folding into accumulator 0
+    /// and the final reduction all mirror `dot_int` exactly. Picks whose prep
+    /// carries no int8 form, a pack `wants_int` rejects, or the planar kernel
+    /// selected fall back to the per-pick `dot_prepped` loop.
+    pub fn dot_prepped_multi(&self, r: usize, ps: &[&DotPrep], out: &mut Vec<f32>) {
+        out.clear();
+        #[cfg(target_arch = "x86_64")]
+        if ps.len() > 1
+            && !planar_dot()
+            && self.wants_int()
+            && std::is_x86_feature_detected!("avx2")
+            && std::is_x86_feature_detected!("fma")
+        {
+            let items: Option<Vec<&I8Prep>> = ps.iter().map(|p| p.q.as_ref()).collect();
+            if let Some(items) = items {
+                let mut buf = vec![0f32; ps.len()];
+                unsafe { avx2::dot_prepped_multi_int(self, r, &items, &mut buf) };
+                out.append(&mut buf);
+                return;
+            }
+        }
+        for p in ps {
+            out.push(self.dot_prepped(r, p));
+        }
+    }
+
     /// The error the int4 round trip actually introduces on real weights.
     pub fn rel_error(&self, src: &[f32]) -> f32 {
         let mut num = 0f64;
@@ -1132,6 +1166,69 @@ mod tests {
     }
 
     #[test]
+    fn one_row_shared_by_several_picks_keeps_the_single_pick_bits() {
+        // The prefill union reads an expert row once and dots it against every
+        // token that picked it, so `dot_prepped_multi` splits each weight block
+        // once and feeds it to several int8 preps. That reuse is only sound if
+        // every output is the exact bits the single-pick kernel returns: same
+        // 64-column block order, same four accumulators, leftover blocks folded
+        // into slot 0, same pairwise reduction. 448 columns is the shape that
+        // exercises the tail (7 blocks: one main pass plus 3 stragglers); 512 is
+        // the shipped moe_intermediate_size and has no tail at all, and 64 never
+        // enters the main loop.
+        for &cols in &[64usize, 256, 448, 512] {
+            let rows = 3;
+            let src: Vec<f32> = (0..rows * cols)
+                .map(|i| ((i * 37 % 211) as f32 - 105.0) * 0.017)
+                .collect();
+            let owned = Q4::quantize(&src, rows, cols, 64, 2);
+            let mut file = vec![0xa5u8; 8];
+            file.extend(owned.data.iter().map(|b| b ^ 0x88));
+            let p = tmp("multi");
+            std::fs::write(&p, &file).unwrap();
+            let map = Arc::new(unsafe { Mmap::map(&std::fs::File::open(&p).unwrap()) }.unwrap());
+            let q = Q4::mapped(map, 8, rows, cols, 64, owned.scale.clone(), true);
+            assert!(q.wants_int(), "cols={cols} must reach the int kernel");
+
+            // A different activation per pick, so a list that dots the wrong prep
+            // or carries an accumulator across picks cannot pass by coincidence.
+            let preps: Vec<DotPrep> = (0..5)
+                .map(|t| {
+                    let x: Vec<f32> = (0..cols)
+                        .map(|i| ((i as f32 * 0.31) + t as f32).sin() * (1.0 + 0.25 * t as f32))
+                        .collect();
+                    q.prepare(&x)
+                })
+                .collect();
+            assert!(
+                preps.iter().all(|p| p.q.is_some()),
+                "cols={cols}: a prep lost its int8 form, so this tests the fallback"
+            );
+
+            for r in 0..rows {
+                for np in [1usize, 2, 3, 5] {
+                    let mut refs: Vec<&DotPrep> = preps[..np].iter().collect();
+                    if np == 3 {
+                        refs.push(&preps[1]);
+                    }
+                    let mut got = Vec::new();
+                    q.dot_prepped_multi(r, &refs, &mut got);
+                    assert_eq!(got.len(), refs.len(), "cols={cols} row={r}");
+                    for (i, g) in got.iter().enumerate() {
+                        assert_eq!(
+                            *g,
+                            q.dot_prepped(r, refs[i]),
+                            "cols={cols} row={r} pick {i} of {}: multi changed the bits",
+                            refs.len()
+                        );
+                    }
+                }
+            }
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+
+    #[test]
     fn the_prepped_kernel_matches_an_f64_dot_at_the_shipped_shape() {
         // 2048 columns at group 64 is the checkpoint's expert row. The permuted
         // activation and the fma bias are only right if every product lands where
@@ -1540,14 +1637,12 @@ mod avx2 {
 
     #[target_feature(enable = "avx2,fma")]
     #[inline]
-    unsafe fn block_i32<const SIGNED: bool>(
+    unsafe fn split_block<const SIGNED: bool>(
         row_bytes: *const u8,
-        p: &I8Prep,
         b: usize,
         m4: __m256i,
         flip: __m256i,
-        one: __m256i,
-    ) -> __m256i {
+    ) -> (__m256i, __m256i) {
         let mut v = unsafe { _mm256_loadu_si256(row_bytes.add(b * 32) as *const __m256i) };
         if SIGNED {
             // One XOR on the packed byte flips bit 3 of both nibbles, so the
@@ -1556,6 +1651,18 @@ mod avx2 {
         }
         let lo = _mm256_and_si256(v, m4);
         let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(v), m4);
+        (lo, hi)
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    #[inline]
+    unsafe fn madd_block(
+        lo: __m256i,
+        hi: __m256i,
+        p: &I8Prep,
+        b: usize,
+        one: __m256i,
+    ) -> __m256i {
         let xe = unsafe { _mm256_loadu_si256(p.xe.as_ptr().add(b * 32) as *const __m256i) };
         let xo = unsafe { _mm256_loadu_si256(p.xo.as_ptr().add(b * 32) as *const __m256i) };
         // maddubs takes the nibbles unsigned and the activations signed.
@@ -1565,6 +1672,20 @@ mod avx2 {
             _mm256_madd_epi16(_mm256_maddubs_epi16(hi, xo), one),
         );
         _mm256_sub_epi32(s, unsafe { _mm256_loadu_si256(p.corr.as_ptr().add(b * 8) as *const __m256i) })
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    #[inline]
+    unsafe fn block_i32<const SIGNED: bool>(
+        row_bytes: *const u8,
+        p: &I8Prep,
+        b: usize,
+        m4: __m256i,
+        flip: __m256i,
+        one: __m256i,
+    ) -> __m256i {
+        let (lo, hi) = unsafe { split_block::<SIGNED>(row_bytes, b, m4, flip) };
+        unsafe { madd_block(lo, hi, p, b, one) }
     }
 
     #[target_feature(enable = "avx2,fma")]
@@ -1611,6 +1732,105 @@ mod avx2 {
         let h = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps::<1>(acc));
         let h = _mm_add_ps(h, _mm_movehl_ps(h, h));
         _mm_cvtss_f32(_mm_add_ss(h, _mm_shuffle_ps::<1>(h, h)))
+    }
+
+    /// One pass over a weight row, every pick's dot out.
+    ///
+    /// # Safety
+    /// Requires AVX2 and FMA, every `p` built for `q.cols`, row `r` inside the
+    /// matrix, `out.len() == ps.len()`, and `q.wants_int()`.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn dot_prepped_multi_int(
+        q: &Q4,
+        r: usize,
+        ps: &[&I8Prep],
+        out: &mut [f32],
+    ) {
+        if q.signed {
+            unsafe { dot_multi::<true>(q, r, ps, out) }
+        } else {
+            unsafe { dot_multi::<false>(q, r, ps, out) }
+        }
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn dot_multi<const SIGNED: bool>(
+        q: &Q4,
+        r: usize,
+        ps: &[&I8Prep],
+        out: &mut [f32],
+    ) {
+        let blocks = q.cols / 64;
+        let per = q.group / 64;
+        let ng = q.ngroups();
+        let row_bytes = unsafe { q.data.as_ptr().add(r * (q.cols / 2)) };
+        let row_scale = unsafe { q.scale.as_ptr().add(r * ng) };
+        let m4 = _mm256_set1_epi8(15);
+        let flip = _mm256_set1_epi8(0x88u8 as i8);
+        let one = _mm256_set1_epi16(1);
+        // Four accumulators per pick, filled in `dot_int`'s exact order: blocks
+        // b..b+4 land in slots 0..3 of the main loop, leftover blocks fold into
+        // slot 0, and the reduction adds (a0+a1)+(a2+a3) pairwise. Same products,
+        // same tree, so each output matches the single-pick kernel bit for bit.
+        let mut accs: Vec<[__m256; 4]> = vec![[_mm256_setzero_ps(); 4]; ps.len()];
+        let mut b = 0;
+        while b + 4 <= blocks {
+            let w0 = unsafe { split_block::<SIGNED>(row_bytes, b, m4, flip) };
+            let w1 = unsafe { split_block::<SIGNED>(row_bytes, b + 1, m4, flip) };
+            let w2 = unsafe { split_block::<SIGNED>(row_bytes, b + 2, m4, flip) };
+            let w3 = unsafe { split_block::<SIGNED>(row_bytes, b + 3, m4, flip) };
+            let wsc = [
+                _mm256_set1_ps(unsafe { *row_scale.add(b / per) }),
+                _mm256_set1_ps(unsafe { *row_scale.add((b + 1) / per) }),
+                _mm256_set1_ps(unsafe { *row_scale.add((b + 2) / per) }),
+                _mm256_set1_ps(unsafe { *row_scale.add((b + 3) / per) }),
+            ];
+            for (ai, p) in ps.iter().enumerate() {
+                let a = &mut accs[ai];
+                let d = |k: usize| {
+                    _mm256_mul_ps(wsc[k], _mm256_set1_ps(unsafe {
+                        *p.d.as_ptr().add(b + k)
+                    }))
+                };
+                a[0] = _mm256_fmadd_ps(
+                    _mm256_cvtepi32_ps(unsafe { madd_block(w0.0, w0.1, p, b, one) }),
+                    d(0),
+                    a[0],
+                );
+                a[1] = _mm256_fmadd_ps(
+                    _mm256_cvtepi32_ps(unsafe { madd_block(w1.0, w1.1, p, b + 1, one) }),
+                    d(1),
+                    a[1],
+                );
+                a[2] = _mm256_fmadd_ps(
+                    _mm256_cvtepi32_ps(unsafe { madd_block(w2.0, w2.1, p, b + 2, one) }),
+                    d(2),
+                    a[2],
+                );
+                a[3] = _mm256_fmadd_ps(
+                    _mm256_cvtepi32_ps(unsafe { madd_block(w3.0, w3.1, p, b + 3, one) }),
+                    d(3),
+                    a[3],
+                );
+            }
+            b += 4;
+        }
+        while b < blocks {
+            let w = unsafe { split_block::<SIGNED>(row_bytes, b, m4, flip) };
+            let sc = _mm256_set1_ps(unsafe { *row_scale.add(b / per) });
+            for (ai, p) in ps.iter().enumerate() {
+                let s = unsafe { madd_block(w.0, w.1, p, b, one) };
+                let scale = _mm256_mul_ps(sc, _mm256_set1_ps(unsafe { *p.d.as_ptr().add(b) }));
+                accs[ai][0] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s), scale, accs[ai][0]);
+            }
+            b += 1;
+        }
+        for (ai, a) in accs.iter().enumerate() {
+            let acc = _mm256_add_ps(_mm256_add_ps(a[0], a[1]), _mm256_add_ps(a[2], a[3]));
+            let h = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps::<1>(acc));
+            let h = _mm_add_ps(h, _mm_movehl_ps(h, h));
+            out[ai] = _mm_cvtss_f32(_mm_add_ss(h, _mm_shuffle_ps::<1>(h, h)));
+        }
     }
 
     #[target_feature(enable = "avx2,fma")]

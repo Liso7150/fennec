@@ -10,7 +10,7 @@ Fennec replaces multiple inference engines with one codebase: raw Vulkan through
 - **Model support**: Qwen3.5-MoE (30B-A3B) and Edge0-145B architectures
 - **Int4 quantization**: Hand-written quantizer with group-64 amax scaling
 - **Four-tier expert routing**: Hot experts in VRAM, warm experts on NPU, system RAM, or cold on NVMe
-- **Batched GPU prefill**: Grouped expert union matches Colibri's batch-union strategy (built and tested, but `serve` does not use it yet - see below)
+- **Batched GPU prefill**: Grouped expert union reduces repeated expert reads; the served path is enabled only on the backend where measurement supports it
 - **Plugin architecture**: Extensible system for backends, models, tokenizers, and servers
 - **OpenAI-compatible API**: `/v1/chat/completions`, `/v1/models`, streaming SSE
 - **Zero-copy cold start**: Memory-mapped expert pool with borrowed nibbles
@@ -252,7 +252,7 @@ fennec serve --backend ort --model <model-dir>
 ## Testing
 
 ```bash
-# Run all tests (203 passing)
+# Run all tests (220 passing)
 cargo test --release --offline
 
 # Backend-specific tests
@@ -266,7 +266,7 @@ FENNEC_GOLDEN_MODEL=<model-dir> cargo test --release --offline --test golden
 python tools/smoke_serve.py  # 30 checks against running server
 ```
 
-**Test coverage**: 203 passed, 0 failed, 5 ignored across 10 suites
+**Test coverage**: 220 passed, 0 failed, 6 ignored across 11 suites
 - `src/` unit tests: quantizer, kernels, auth, samplers, device discovery, memory
 - golden tests against the pinned transformers 5.22.2 reference (`tests/golden.rs`)
 - device-vs-CPU integration tests (`tests/gpu.rs`, run once per backend)
@@ -351,8 +351,8 @@ Fennec includes a BPE tokenizer id-for-id identical to Hugging Face:
 > - **CUDA moe_reduce**: CUDA path lacks phase-batched `moe_reduce` kernel (uses per-expert chain)
 > - **Apple Metal**: Compile-verified but not performance-measured
 > - **NPU DirectML**: Refused by driver; use OpenVINO backend instead
-> - **Chat template**: Missing think opener (Colibri emits `\n\n`, Fennec emits nothing)
-> - **Served device prefill**: the batched device path is served on CUDA and withheld on Vulkan, where the same paired run measured it 27.5 ms/prompt-token slower; Vulkan device TTFT therefore trails Colibri (see Performance)
+> - **Chat template**: Some checkpoints expect a think opener that their template supplies; Fennec currently emits no implicit opener
+> - **Served device prefill**: the batched device path is served on CUDA and withheld on Vulkan, where the same paired run measured it 27.5 ms/prompt-token slower; Vulkan keeps the per-token path
 
 ## Project Structure
 

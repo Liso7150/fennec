@@ -1,7 +1,7 @@
 //! The qwen3_5_moe block math, transcribed from the transformers reference and
 //! driven by Fennec's own tensors. Every function here has a golden test.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
 use crate::config::{LayerKind, Result, TextConfig};
@@ -102,7 +102,7 @@ pub enum Dense {
 }
 
 impl Dense {
-    fn load(sh: &Shards, name: &str) -> Result<Dense> {
+    pub(crate) fn load(sh: &Shards, name: &str) -> Result<Dense> {
         let i = sh.info(name).ok_or_else(|| format!("missing tensor {name}"))?;
         let fmt = match i.dtype {
             DType::BF16 => Some(kernel::Half::Bf16),
@@ -284,7 +284,7 @@ pub fn dense_half(sh: &Shards, name: &str) -> Result<(Dense, usize, usize)> {
 /// convention, and the dialect stays a property of the weights rather than of
 /// the code that reads them. The gated delta net's norm is a full gain in both
 /// dialects and does not come through here.
-fn norm_w(sh: &Shards, name: &str, zero_centered: bool) -> Result<Vec<f32>> {
+pub(crate) fn norm_w(sh: &Shards, name: &str, zero_centered: bool) -> Result<Vec<f32>> {
     let mut w = dense(sh, name)?.0;
     if !zero_centered {
         for v in w.iter_mut() {
@@ -595,6 +595,19 @@ pub struct AttnDev {
     pub q4: bool,
     pub qs: [usize; 4],
     pub group: usize,
+    /// Device KV cache for CUDA chunk prefill. `None` (allocation failure,
+    /// wrong backend) keeps the host path; never fails the model load.
+    pub cache: Option<AttnCache>,
+}
+
+/// Device-resident f32 KV cache + norm/rope buffers for the CUDA attention
+/// chunk prefill. `rows` is the number of cache rows already valid.
+pub struct AttnCache {
+    pub k: usize,
+    pub v: usize,
+    pub norm: usize,
+    pub rope: usize,
+    pub rows: AtomicUsize,
 }
 
 /// Upload a whole projection set, or nothing. A layer with a tensor wider than
@@ -1651,12 +1664,15 @@ impl MoeLayer {
         if union.is_empty() {
             return;
         }
-        // Within a layer every expert comes from the same pack, so the first
-        // resident one decides whether the integer dot is available to all of
-        // them — the assumption `cpu_picks` already makes.
-        let (gu0, _, _) = self.expert_pair(union[0].0);
-        let int = gu0.wants_int();
+        // The preps must carry the same int8 activation form the per-token paths
+        // use (`expert_in` via `Q4::prepare`, `cpu_picks` via `with_int`): an
+        // f32 gate/up dot here rounds differently, and the union's expert
+        // outputs then drift from `forward`'s by enough to flip the trunk's
+        // argmax — which broke the spec losslessness test at the very first
+        // committed token. One flag from the first union member's gate_up
+        // decides, exactly as `cpu_picks` decides from its first host pick.
         let nu = union.len();
+        let int = self.expert_pair(union[0].0).0.wants_int();
         let mut px: Vec<DotPrep> = (0..n).map(|_| DotPrep::with_int(h, int)).collect();
         for r in 0..n {
             px[r].fill(&xs[r * h..(r + 1) * h]);
@@ -1665,34 +1681,75 @@ impl MoeLayer {
         {
             let hhp = kernel::SharedPtr::new(hh.as_mut_ptr());
             kernel::par_index(nu * i, self.threads, |start, len| {
+                // The member's pick list and the two dot rows are reused while
+                // `g` walks one expert's rows, so a member's weight bytes are
+                // unpacked once no matter how many tokens picked it.
+                let mut sel: Vec<&DotPrep> = Vec::with_capacity(8);
+                let mut ga: Vec<f32> = Vec::with_capacity(8);
+                let mut up: Vec<f32> = Vec::with_capacity(8);
+                let mut last_u = usize::MAX;
                 for g in start..start + len {
                     let u = g / i;
                     let j = g - u * i;
                     let (gu, _, s) = self.expert_pair(union[u].0);
                     let base = s * 2 * i;
-                    for &q in &union[u].1 {
-                        let p = &px[q as usize / k];
+                    let picks = &union[u].1;
+                    if picks.len() > 1 {
+                        if u != last_u {
+                            sel.clear();
+                            for &q in picks {
+                                sel.push(&px[q as usize / k]);
+                            }
+                            last_u = u;
+                        }
+                        gu.dot_prepped_multi(base + j, &sel, &mut ga);
+                        gu.dot_prepped_multi(base + i + j, &sel, &mut up);
+                        for (e, &q) in picks.iter().enumerate() {
+                            unsafe { *hhp.at(q as usize * i + j) = kernel::silu(ga[e]) * up[e] };
+                        }
+                    } else {
+                        let q = picks[0] as usize;
+                        let p = &px[q / k];
                         let a = gu.dot_prepped(base + j, p);
                         let b = gu.dot_prepped(base + i + j, p);
-                        unsafe { *hhp.at(q as usize * i + j) = kernel::silu(a) * b };
+                        unsafe { *hhp.at(q * i + j) = kernel::silu(a) * b };
                     }
                 }
             });
         }
-        let mut ph: Vec<DotPrep> = (0..n * k).map(|_| DotPrep::with_int(i, int)).collect();
+        let mut ph: Vec<DotPrep> = (0..n * k)
+            .map(|_| DotPrep::with_int(i, int))
+            .collect();
         for q in 0..n * k {
             ph[q].fill(&hh[q * i..(q + 1) * i]);
         }
         let pp = kernel::SharedPtr::new(parts.as_mut_ptr());
         kernel::par_index(nu * h, self.threads, |start, len| {
+            let mut sel: Vec<&DotPrep> = Vec::with_capacity(8);
+            let mut vv: Vec<f32> = Vec::with_capacity(8);
+            let mut last_u = usize::MAX;
             for g in start..start + len {
                 let u = g / h;
                 let j = g - u * h;
                 let (_, dn, s) = self.expert_pair(union[u].0);
                 let row = s * h + j;
-                for &q in &union[u].1 {
-                    let v = dn.dot_prepped(row, &ph[q as usize]);
-                    unsafe { *pp.at(q as usize * h + j) = wts[q as usize] * v };
+                let picks = &union[u].1;
+                if picks.len() > 1 {
+                    if u != last_u {
+                        sel.clear();
+                        for &q in picks {
+                            sel.push(&ph[q as usize]);
+                        }
+                        last_u = u;
+                    }
+                    dn.dot_prepped_multi(row, &sel, &mut vv);
+                    for (e, &q) in picks.iter().enumerate() {
+                        unsafe { *pp.at(q as usize * h + j) = wts[q as usize] * vv[e] };
+                    }
+                } else {
+                    let q = picks[0] as usize;
+                    let v = dn.dot_prepped(row, &ph[q]);
+                    unsafe { *pp.at(q * h + j) = wts[q] * v };
                 }
             }
         });
@@ -2565,9 +2622,8 @@ impl GdnLayer {
     /// Move the five projections to VRAM and drop the host's copies, and
     /// with them the conv weights, A_log, dt_bias and the gated norm plus two
     /// zeroed state buffers, so the whole mixer can run on the device.
-    pub fn attach_dense(&mut self, sh: &Shards, layer: usize, gpu: Arc<Mutex<Gpu>>) -> Result<()> {
-        let p = format!("{}.layers.{layer}.linear_attn", self.cfg.prefix);
-        let names = [
+    pub fn attach_dense(&mut self, sh: &Shards, layer: usize, gpu: Arc<Mutex<Gpu>>, _rope: Option<usize>) -> Result<()> {
+        let p = format!("{}.layers.{layer}.linear_attn", self.cfg.prefix);        let names = [
             format!("{p}.in_proj_qkv.weight"),
             format!("{p}.in_proj_z.weight"),
             format!("{p}.in_proj_b.weight"),
@@ -3134,7 +3190,9 @@ impl AttnLayer {
     /// q/k/v/o to VRAM. The per-head norms, rope, the KV append and the softmax
     /// stay on the CPU: they read the cache, which is host memory that grows
     /// with the sequence and has no business being re-uploaded every token.
-    pub fn attach_dense(&mut self, sh: &Shards, layer: usize, gpu: Arc<Mutex<Gpu>>) -> Result<()> {
+    /// `rope` is the shared device rope table ([cos | sin]) when the backend
+    /// supports the CUDA attention chunk.
+    pub fn attach_dense(&mut self, sh: &Shards, layer: usize, gpu: Arc<Mutex<Gpu>>, rope: Option<usize>) -> Result<()> {
         let p = format!("{}.layers.{layer}.self_attn", self.cfg.prefix);
         let names = [
             format!("{p}.q_proj.weight"),
@@ -3144,6 +3202,7 @@ impl AttnLayer {
         ];
         let mut g = gpu.lock().unwrap();
         g.reserve(DENSE_OFF + DENSE_FLOATS)?;
+        let cache = self.build_cache(&mut g, rope);
         if dense_int4() {
             let mut ws = [0usize; 4];
             let mut ss = [0usize; 4];
@@ -3158,19 +3217,61 @@ impl AttnLayer {
                 ss[i] = sc;
             }
             drop(g);
-            self.dev = Some(AttnDev { gpu, q: ws[0], k: ws[1], v: ws[2], o: ws[3], q4: true, qs: ss, group: 64 });
+            self.dev = Some(AttnDev { gpu, q: ws[0], k: ws[1], v: ws[2], o: ws[3], q4: true, qs: ss, group: 64, cache });
         } else {
             let Some(b) = put_set(&mut g, sh, &names)? else {
                 return Ok(());
             };
             drop(g);
-            self.dev = Some(AttnDev { gpu, q: b[0], k: b[1], v: b[2], o: b[3], q4: false, qs: [0; 4], group: 0 });
+            self.dev = Some(AttnDev { gpu, q: b[0], k: b[1], v: b[2], o: b[3], q4: false, qs: [0; 4], group: 0, cache });
         }
         self.q.clear();
         self.k.clear();
         self.v.clear();
         self.o.clear();
         Ok(())
+    }
+
+    /// Device KV cache + norm gains for the CUDA attention chunk prefill. Any
+    /// shortfall (wrong backend, PTX shape constraints, allocation failure)
+    /// keeps the host path; never fails the model load.
+    fn build_cache(&self, g: &mut Gpu, rope: Option<usize>) -> Option<AttnCache> {
+        if std::env::var_os("FENNEC_ATTN_HOST").is_some() {
+            return None;
+        }
+        let rope = rope?;
+        if g.backend() != crate::backend::Backend::Cuda {
+            return None;
+        }
+        let cfg = &self.cfg;
+        let (hd, nkv, nh) = (cfg.head_dim, cfg.num_key_value_heads, cfg.num_attention_heads);
+        // attn_chunk block dim is hd threads with 8 KiB of per-warp shared
+        // staging; kv_prepare's block dim is nkv*hd.
+        if hd == 0 || hd > 256 || hd % 32 != 0 || nkv * hd > 512 || nh % nkv != 0 {
+            return None;
+        }
+        let rot = cfg.rotary_dim();
+        if rot == 0 || rot % 2 != 0 || rot > hd {
+            return None;
+        }
+        let cap = self.cos.len() / rot;
+        if cap == 0 {
+            return None;
+        }
+        let row = nkv * hd * 4;
+        let k = g.alloc_half(cap * row, false).ok()?;
+        let v = g.alloc_half(cap * row, false).ok()?;
+        // kernel::rmsnorm multiplies by (1 + weight); the kernels read the gain
+        // directly, so store the folded value.
+        let mut gains = Vec::with_capacity(2 * hd);
+        gains.extend(self.q_norm.iter().map(|w| 1.0 + w));
+        gains.extend(self.k_norm.iter().map(|w| 1.0 + w));
+        let mut bytes = Vec::with_capacity(gains.len() * 4);
+        for f in &gains {
+            bytes.extend_from_slice(&f.to_le_bytes());
+        }
+        let norm = g.upload_half(&bytes, false).ok()?;
+        Some(AttnCache { k, v, norm, rope, rows: AtomicUsize::new(0) })
     }
 
     /// q, k and v in one batch and one contiguous read, same as the delta net.
@@ -3348,6 +3449,54 @@ impl AttnLayer {
         let v_off = k_off + n * nkv * hd;
         let attn_off = v_off + n * nkv * hd;
 
+        // CUDA-only device attention: kv_prepare normalizes+ropes the chunk's
+        // K rows and writes both caches, attn_chunk mixes every head against
+        // the full cache on the GPU, replacing the per-token host mix loop.
+        // Geometry gates were checked in build_cache; only the position bound
+        // varies per call.
+        if let Some(cache) = &d.cache {
+            let rot = cfg.rotary_dim();
+            let cap = self.cos.len() / rot;
+            if pos0 + n <= cap {
+                let kv_rows = cache.rows.load(Relaxed);
+                if kv_rows < pos0 {
+                    let count = pos0 - kv_rows;
+                    let mut kb = Vec::with_capacity(count * st.kv * 4);
+                    for f in &st.k[kv_rows * st.kv..pos0 * st.kv] { kb.extend_from_slice(&f.to_le_bytes()); }
+                    gpu.write_buf(cache.k, kv_rows * st.kv * 4, &kb)?;
+                    let mut vb = Vec::with_capacity(count * st.kv * 4);
+                    for f in &st.v[kv_rows * st.kv..pos0 * st.kv] { vb.extend_from_slice(&f.to_le_bytes()); }
+                    gpu.write_buf(cache.v, kv_rows * st.kv * 4, &vb)?;
+                }
+                let eps = cfg.rms_norm_eps as f32;
+                let scale = 1.0 / (hd as f32).sqrt();
+                {
+                    let _p = prof::start(prof::MIXER_PROJ);
+                    let mut bt = gpu.batch()?;
+                    bt.gemv_half_batch(d.q, q_out, h, n, xs_off, q_off)?;
+                    bt.gemv_half_batch(d.k, nkv * hd, h, n, xs_off, k_off)?;
+                    bt.gemv_half_batch(d.v, nkv * hd, h, n, xs_off, v_off)?;
+                    bt.kv_prepare(cache.norm, cache.rope, cache.k, cache.v, self.cos.len(), k_off, v_off, pos0, n, nkv, hd, rot, eps)?;
+                    bt.barrier()?;
+                    bt.attn_chunk(cache.norm, cache.rope, cache.k, cache.v, self.cos.len(), q_off, attn_off, pos0, n, nh, nkv, hd, rot, q_out, cfg.attn_output_gate, eps, scale)?;
+                    bt.gemv_half_batch(d.o, h, nh * hd, n, attn_off, out_off)?;
+                    bt.run()?;
+                }
+                let mut kb = vec![0u8; n * st.kv * 4];
+                let mut vb = vec![0u8; n * st.kv * 4];
+                gpu.read_buf_at(cache.k, pos0 * st.kv * 4, &mut kb)?;
+                gpu.read_buf_at(cache.v, pos0 * st.kv * 4, &mut vb)?;
+                let need = (pos0 + n) * st.kv;
+                if st.k.len() < need { st.k.resize(need, 0.0); }
+                if st.v.len() < need { st.v.resize(need, 0.0); }
+                bytes_into_f32(&kb, &mut st.k[pos0 * st.kv..pos0 * st.kv + n * st.kv]);
+                bytes_into_f32(&vb, &mut st.v[pos0 * st.kv..pos0 * st.kv + n * st.kv]);
+                st.len = pos0 + n;
+                cache.rows.store(pos0 + n, Relaxed);
+                return Ok(());
+            }
+        }
+
         {
             let _p = prof::start(prof::MIXER_PROJ);
             let mut bt = gpu.batch()?;
@@ -3418,12 +3567,6 @@ impl AttnLayer {
             &self.cos[pos * rot..(pos + 1) * rot],
             &self.sin[pos * rot..(pos + 1) * rot],
         );
-        let mut qq = vec![0f32; nh * hd];
-        for i in 0..nh {
-            let base = i * stride;
-            kernel::rmsnorm(&qraw[base..base + hd], &self.q_norm, eps, &mut qq[i * hd..(i + 1) * hd]);
-            kernel::rope_apply(&mut qq[i * hd..(i + 1) * hd], c, s, rot);
-        }
         let mut kk = vec![0f32; nkv * hd];
         for i in 0..nkv {
             let base = i * hd;
@@ -3437,40 +3580,54 @@ impl AttnLayer {
 
         let rep = nh / nkv;
         let scale = 1.0f32 / (hd as f32).sqrt();
-        // One scores buffer reused across heads; st.len is fixed for this step.
-        let mut scores = Vec::with_capacity(st.len);
-        for i in 0..nh {
-            let q = &qq[i * hd..(i + 1) * hd];
-            let hkv = i / rep;
-            let mut best = f32::NEG_INFINITY;
-            scores.clear();
-            for j in 0..st.len {
-                let kr = j * st.kv + hkv * hd;
-                scores.push(kernel::dot(q, &st.k[kr..kr + hd]) * scale);
-                best = best.max(*scores.last().unwrap());
-            }
-            let mut sum = 0f32;
-            for s in scores.iter_mut() {
-                *s = (*s - best).exp();
-                sum += *s;
-            }
-            let o = &mut attn[i * hd..(i + 1) * hd];
-            for v in o.iter_mut() {
-                *v = 0.0;
-            }
-            for (j, p) in scores.iter().enumerate() {
-                let w = p / sum;
-                let vr = j * st.kv + hkv * hd;
-                kernel::axpy(o, &st.v[vr..vr + hd], w);
-            }
-        }
-        if cfg.attn_output_gate {
-            for i in 0..nh {
-                let gbase = i * stride + hd;
-                for j in 0..hd {
-                    attn[i * hd + j] *= kernel::sigmoid(qraw[gbase + j]);
+        let st_len = st.len;
+        // Heads are independent: per-head q norm and rope, causal scores over
+        // that head's kv-head rows, softmax and gated weighted sum all touch
+        // only head i's slice of `attn`. The kv cache rows are read-only here
+        // (the append above already happened). Below a short context the pool
+        // round-trip costs more than the dots, so small sequences stay serial.
+        let attnp = kernel::SharedPtr::new(attn.as_mut_ptr());
+        let head = |h0: usize, hn: usize| {
+            let mut q = vec![0f32; hd];
+            let mut scores: Vec<f32> = Vec::with_capacity(st_len);
+            for i in h0..h0 + hn {
+                let base = i * stride;
+                kernel::rmsnorm(&qraw[base..base + hd], &self.q_norm, eps, &mut q);
+                kernel::rope_apply(&mut q, c, s, rot);
+                let hkv = i / rep;
+                let mut best = f32::NEG_INFINITY;
+                scores.clear();
+                for j in 0..st_len {
+                    let kr = j * st.kv + hkv * hd;
+                    scores.push(kernel::dot(&q, &st.k[kr..kr + hd]) * scale);
+                    best = best.max(*scores.last().unwrap());
+                }
+                let mut sum = 0f32;
+                for sc in scores.iter_mut() {
+                    *sc = (*sc - best).exp();
+                    sum += *sc;
+                }
+                let o = unsafe { std::slice::from_raw_parts_mut(attnp.at(i * hd), hd) };
+                for v in o.iter_mut() {
+                    *v = 0.0;
+                }
+                for (j, p) in scores.iter().enumerate() {
+                    let w = p / sum;
+                    let vr = j * st.kv + hkv * hd;
+                    kernel::axpy(o, &st.v[vr..vr + hd], w);
+                }
+                if cfg.attn_output_gate {
+                    let gbase = i * stride + hd;
+                    for j in 0..hd {
+                        o[j] *= kernel::sigmoid(qraw[gbase + j]);
+                    }
                 }
             }
+        };
+        if st_len >= 128 {
+            kernel::par_count(nh, self.threads.max(1), head);
+        } else {
+            head(0, nh);
         }
     }
 }
@@ -3491,6 +3648,85 @@ pub struct Layer {
 pub enum LayerState {
     Linear(GdnState),
     Full(AttnState),
+}
+
+/// One layer's cache as it stood before a pass that may be backed out of.
+///
+/// The two kinds need different things. Attention stores one row per position,
+/// so forgetting rows is a row count: the vectors past the commit point stay
+/// allocated and the next write overwrites them. A gated delta net has no row
+/// store at all - `conv` and `rec` are a running window and a running matrix -
+/// so backing it out means having kept the bytes from before.
+///
+/// Host tier only. A mirrored GDN state's authoritative copy lives in the device
+/// arena (`GdnState::mirrored`), and its host buffers are whatever the last
+/// readback left there; restoring those would put the mixer behind. Speculative
+/// decode therefore engages where `Model::prefill_ready` is true.
+pub struct StateSave {
+    conv: Vec<f32>,
+    rec: Vec<f32>,
+    len: usize,
+    filled: usize,
+    mirrored: bool,
+}
+
+impl StateSave {
+    /// One slot per layer, populated from `st`.
+    pub fn all(st: &[LayerState]) -> Vec<StateSave> {
+        st.iter().map(StateSave::new).collect()
+    }
+
+    /// Refresh every slot from `st`, reusing the allocations. A decode loop
+    /// builds the vec once per request and grabs it each round, so the 63 MiB
+    /// of gated-delta-net state is copied, never reallocated.
+    pub fn refresh(slots: &mut [StateSave], st: &[LayerState]) {
+        for (s, sst) in slots.iter_mut().zip(st.iter()) {
+            s.grab(sst);
+        }
+    }
+
+    /// Write every slot back over `st`.
+    pub fn restore_all(st: &mut [LayerState], slots: &[StateSave]) {
+        for (s, sst) in st.iter_mut().zip(slots.iter()) {
+            sst.restore(s);
+        }
+    }
+
+    fn new(st: &LayerState) -> StateSave {
+        let (conv, rec) = match st {
+            LayerState::Linear(g) => (vec![0f32; g.conv.len()], vec![0f32; g.rec.len()]),
+            LayerState::Full(_) => (Vec::new(), Vec::new()),
+        };
+        let mut s = StateSave { conv, rec, len: 0, filled: 0, mirrored: false };
+        s.grab(st);
+        s
+    }
+
+    fn grab(&mut self, st: &LayerState) {
+        match st {
+            LayerState::Linear(g) => {
+                self.conv.clear();
+                self.conv.extend_from_slice(&g.conv);
+                self.rec.clear();
+                self.rec.extend_from_slice(&g.rec);
+                self.filled = g.filled;
+                self.mirrored = g.mirrored;
+            }
+            LayerState::Full(a) => self.len = a.len,
+        }
+    }
+
+    fn restore(&self, st: &mut LayerState) {
+        match st {
+            LayerState::Linear(g) => {
+                g.conv.copy_from_slice(&self.conv);
+                g.rec.copy_from_slice(&self.rec);
+                g.filled = self.filled;
+                g.mirrored = self.mirrored;
+            }
+            LayerState::Full(a) => a.len = self.len,
+        }
+    }
 }
 
 impl Layer {
@@ -3561,10 +3797,10 @@ impl Layer {
 
     /// Park this layer's dense projections in VRAM. Which block that is depends
     /// on the layer kind, and a checkpoint that is not bf16 keeps the CPU copy.
-    pub fn attach_dense(&mut self, sh: &Shards, layer: usize, gpu: Arc<Mutex<Gpu>>) -> Result<()> {
+    pub fn attach_dense(&mut self, sh: &Shards, layer: usize, gpu: Arc<Mutex<Gpu>>, rope: Option<usize>) -> Result<()> {
         match self.kind {
-            LayerKind::Linear => self.gdn.as_mut().unwrap().attach_dense(sh, layer, gpu),
-            LayerKind::Full => self.attn.as_mut().unwrap().attach_dense(sh, layer, gpu),
+            LayerKind::Linear => self.gdn.as_mut().unwrap().attach_dense(sh, layer, gpu, rope),
+            LayerKind::Full => self.attn.as_mut().unwrap().attach_dense(sh, layer, gpu, rope),
         }
     }
 
@@ -3747,6 +3983,7 @@ pub struct Model {
     pub norm: Vec<f32>,
     pub embed: String,
     pub head: String,
+    pub vision: Option<crate::vision::VisionModel>,
     pub threads: usize,
     /// The compute device, shared with every layer's `DevExperts`. None means
     /// the whole stack runs on the CPU and the plan's device tier merges into
@@ -4050,12 +4287,29 @@ impl Model {
             head_ms = t.elapsed().as_secs_f64() * 1e3;
             crate::mem::report("lm_head");
             let t = std::time::Instant::now();
+            // One shared rope table ([cos | sin], f32) for every full-attention
+            // layer: identical per layer (same theta/rotary), so each layer's
+            // chunk kernel indexes it with its own sin_off-free row base.
+            let rope_dev = {
+                let mut g = g.lock().unwrap();
+                if g.backend() == crate::backend::Backend::Cuda {
+                    model.layers.iter().find_map(|l| l.attn.as_ref()).and_then(|a| {
+                        let mut bytes = Vec::with_capacity((a.cos.len() + a.sin.len()) * 4);
+                        for f in a.cos.iter().chain(a.sin.iter()) {
+                            bytes.extend_from_slice(&f.to_le_bytes());
+                        }
+                        g.upload_half(&bytes, false).ok()
+                    })
+                } else {
+                    None
+                }
+            };
             for (l, lp) in model.layers.iter_mut().zip(&plan.layers) {
                 if let Some(m) = &mut l.moe {
                     m.attach_gpu(sh, lp.layer, g.clone(), &lp.resident, group)?;
                 }
                 if lp.dense_on_device {
-                    l.attach_dense(sh, lp.layer, g.clone())?;
+                    l.attach_dense(sh, lp.layer, g.clone(), rope_dev)?;
                 }
             }
             dev_ms = t.elapsed().as_secs_f64() * 1e3;
@@ -4169,9 +4423,14 @@ impl Model {
             (true, false) => format!("{}.embed_tokens.weight", cfg.prefix),
             _ => "lm_head.weight".to_string(),
         };
+        let vision = match &cfg.vision {
+            Some(vision_cfg) => crate::vision::VisionModel::load(sh, vision_cfg.clone())?,
+            None => None,
+        };
         Ok(Model {
             embed: format!("{}.embed_tokens.weight", cfg.prefix),
             head,
+            vision,
             norm: norm_w(sh, &format!("{}.norm.weight", cfg.prefix), cfg.norm_zero_centered)?,
             cfg,
             first,
@@ -4465,6 +4724,13 @@ impl Model {
         sh.row_f32(&self.embed, id)
     }
 
+    pub fn vision_features(&self, image: &[u8]) -> Result<Vec<Vec<f32>>> {
+        self.vision
+            .as_ref()
+            .ok_or_else(|| "this checkpoint has no visual tower".to_string())?
+            .output_tokens(image)
+    }
+
     /// One token through the loaded layers, in place on `x`. This is also the
     /// unit the profiler divides by, so it counts itself.
     pub fn forward(&self, x: &mut [f32], st: &mut [LayerState], pos: usize) {
@@ -4528,6 +4794,21 @@ impl Model {
     /// to be present (device tier). Returns false for host-only tiers.
     pub fn prefill_device_ready(&self) -> bool {
         self.gpu.is_some()
+    }
+
+    /// Pull every mirrored gated-delta-net state back into its host copy, so a
+    /// caller that wants to snapshot or rewind the trunk's state sees what the
+    /// device actually holds. [`GdnLayer::sync_state`] is a no-op for a state
+    /// that is already host-authoritative - what the device chunk leaves behind,
+    /// and what a rejected speculation round restores - so this is safe to call
+    /// before every round.
+    pub fn sync_host_state(&self, st: &mut [LayerState]) -> Result<()> {
+        for (l, s) in self.layers.iter().zip(st.iter_mut()) {
+            if let (Some(gdn), LayerState::Linear(gs)) = (l.gdn.as_ref(), s) {
+                gdn.sync_state(gs)?;
+            }
+        }
+        Ok(())
     }
 
     /// Whether the device prompt should go through [`Model::prefill_device`] in
@@ -4604,6 +4885,54 @@ impl Model {
             let raw = sh.slice_f32(&self.head, r0 * cols, (r0 + n) * cols)?;
             buf[..n * cols].copy_from_slice(&raw);
             kernel::gemv(&buf[..n * cols], n, cols, x, &mut out[r0..r0 + n], self.threads);
+        }
+        Ok(())
+    }
+
+    /// `n` rows through the lm_head in one weight pass: `xs` is `n` rows of
+    /// `hidden_size`, `out` is `n` rows of `vocab_size`, both token-major as in
+    /// [`kernel::gemv_batch`], and bit-identical to `n` calls of [`Model::logits`].
+    ///
+    /// This is what makes a speculative verify affordable. The head is the
+    /// largest single read of a decode step - 248320 x 2048, still 0.5 GiB after
+    /// the int8 quantisation - and reading it once for the whole block instead of
+    /// once per row is the only part of a round that gets cheaper with depth. The
+    /// drafts pay for their own greediness: each is chosen off a single row.
+    ///
+    /// The host paths only, which is where speculative decode runs; the device
+    /// tiers have their head in VRAM and their own batch entry point, and a
+    /// mirrored gated-delta-net state cannot be backed out.
+    pub fn logits_batch(&self, sh: &Shards, xs: &[f32], out: &mut [f32]) -> Result<()> {
+        let (cols, v) = (self.cfg.hidden_size, self.cfg.vocab_size);
+        let n = out.len() / v;
+        if n <= 1 {
+            return self.logits(sh, xs, out);
+        }
+        if let Some(d) = &self.head_i8 {
+            let _h = prof::start(prof::HEAD);
+            d.gemv_batch(v, cols, xs, out, self.threads);
+            return Ok(());
+        }
+        let i = sh
+            .info(&self.head)
+            .ok_or_else(|| format!("missing tensor {}", self.head))?;
+        let elems = i.elems();
+        let fmt = match i.dtype {
+            DType::BF16 => Some(kernel::Half::Bf16),
+            DType::F16 => Some(kernel::Half::F16),
+            _ => None,
+        };
+        if let Some(f) = fmt {
+            if elems == v * cols {
+                let _h = prof::start(prof::HEAD);
+                let bytes = &sh.data(i.file)[i.off..i.off + elems * 2];
+                kernel::gemv_half_batch(bytes, v, cols, xs, out, self.threads, f);
+                return Ok(());
+            }
+        }
+        // A format with no batch kernel: pay the head per row, as before.
+        for t in 0..n {
+            self.logits(sh, &xs[t * cols..(t + 1) * cols], &mut out[t * v..(t + 1) * v])?;
         }
         Ok(())
     }
@@ -4889,6 +5218,12 @@ mod tests {
             num_experts_per_tok: 2,
             moe_intermediate_size: 64,
             shared_expert_intermediate_size: 64,
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: false,
+            vision: None,
+            image_token_id: None,
+            vision_start_token_id: None,
+            vision_end_token_id: None,
             prefix: "model".into(),
             name: "tiny-host-tier".into(),
         });
@@ -4955,6 +5290,12 @@ mod tests {
             num_experts_per_tok: 8,
             moe_intermediate_size: 512,
             shared_expert_intermediate_size: 512,
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: false,
+            vision: None,
+            image_token_id: None,
+            vision_start_token_id: None,
+            vision_end_token_id: None,
             prefix: "model".into(),
             name: "qwen36-shape".into(),
         };

@@ -31,8 +31,20 @@ use std::ffi::c_void;
 
 const PTX: &str = include_str!("kernels/fennec.ptx");
 
-/// One kernel per `Op`, in the same order the Vulkan pipelines are built.
-const NAMES: [&str; 8] = ["gemv_bf16", "gemv_q4", "rmsnorm", "silu_mul", "axpy", "gemv_f16", "gdn_conv", "gdn_rec"];
+/// One kernel per `Op`, in the same order the Vulkan pipelines are built. The
+/// CUDA-only attention kernels follow with their `Op` discriminants.
+const NAMES: [(&str, usize); 10] = [
+    ("gemv_bf16", 0),
+    ("gemv_q4", 1),
+    ("rmsnorm", 2),
+    ("silu_mul", 3),
+    ("axpy", 4),
+    ("gemv_f16", 5),
+    ("gdn_conv", 6),
+    ("gdn_rec", 7),
+    ("attn_chunk", 15),
+    ("kv_prepare", 16),
+];
 
 struct CBuf {
     ptr: DevPtr,
@@ -51,13 +63,22 @@ enum Launch {
     GemvHalf { w: DevPtr, f16: bool, rows: u32, cols: u32, x_off: u32, y_off: u32 },
     GdnConv { w: DevPtr, state: DevPtr, base: u32, cd: u32, kernel: u32, hist: u32 },
     GdnRec { w: DevPtr, state: DevPtr, base: u32, out_off: u32, kd: u32, nv: u32, dk: u32, dv: u32, rep: u32, eps: f32 },
+    AttnChunk {
+        norm: DevPtr, rope: DevPtr, kcache: DevPtr, vcache: DevPtr, sin_off: u32,
+        q_off: u32, attn_off: u32, pos0: u32, n: u32, nh: u32, nkv: u32, hd: u32,
+        rot: u32, q_out: u32, gate: u32, eps: f32, scale: f32,
+    },
+    KvPrepare {
+        norm: DevPtr, rope: DevPtr, kcache: DevPtr, vcache: DevPtr, sin_off: u32,
+        k_off: u32, v_off: u32, pos0: u32, n: u32, nkv: u32, hd: u32, rot: u32, eps: f32,
+    },
 }
 
 pub struct CudaGpu {
     cu: Cuda,
     pub info: Device,
     bufs: Vec<CBuf>,
-    funcs: [Handle; 8],
+    funcs: [Handle; 17],
     arena_dev: DevPtr,
     arena_floats: usize,
     pub submitted: u64,
@@ -105,9 +126,9 @@ impl CudaGpu {
     pub fn open(index: usize) -> Result<CudaGpu> {
         let mut cu = Cuda::load().map_err(|e| format!("no CUDA driver: {e}"))?;
         cu.open(index, &[PTX]).map_err(|e| format!("CUDA device {index}: {e}"))?;
-        let mut funcs: [Handle; 8] = [std::ptr::null_mut(); 8];
-        for (i, n) in NAMES.iter().enumerate() {
-            funcs[i] = cu.function(n).map_err(|e| format!("CUDA kernel {n}: {e}"))?;
+        let mut funcs: [Handle; 17] = [std::ptr::null_mut(); 17];
+        for (n, idx) in NAMES.iter() {
+            funcs[*idx] = cu.function(n).map_err(|e| format!("CUDA kernel {n}: {e}"))?;
         }
         let d = cu.devices[index].clone();
         let bytes = (d.total_gib * 2f64.powi(30)) as u64;
@@ -265,6 +286,16 @@ impl CudaGpu {
         self.cu.read(out, self.bufs[id].ptr).map_err(|e| format!("CUDA read_buf {id}: {e}"))
     }
 
+    pub fn read_buf_at(&mut self, id: usize, at: usize, out: &mut [u8]) -> Result<()> {
+        if at + out.len() > self.bufs[id].size as usize {
+            return Err(format!("read_buf_at: {} bytes at {at} out of a {}-byte buffer", out.len(), self.bufs[id].size));
+        }
+        if out.is_empty() {
+            return Ok(());
+        }
+        self.cu.read(out, self.bufs[id].ptr + at as u64).map_err(|e| format!("CUDA read_buf_at {id}: {e}"))
+    }
+
     pub fn write(&mut self, off: usize, v: &[f32]) {
         assert!(off + v.len() <= self.arena_floats, "activation arena too small");
         let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
@@ -345,6 +376,29 @@ impl CudaGpu {
                 ];
                 self.cu.launch(self.funcs[Op::GdnRec as usize], nv, 512, 0, &mut p)
             }
+            Launch::AttnChunk { norm, rope, kcache, vcache, sin_off, q_off, attn_off, pos0, n, nh, nkv, hd, rot, q_out, gate, eps, scale } => {
+                let (mut a, mut np, mut rp, mut kp, mut vp, mut so, mut qo, mut ao, mut p0, mut nt, mut nhp, mut nk, mut h, mut r, mut q, mut g, mut e, mut s) =
+                    (arena, norm, rope, kcache, vcache, sin_off, q_off, attn_off, pos0, n, nh, nkv, hd, rot, q_out, gate, eps, scale);
+                let mut p = [
+                    arg(&mut a), arg(&mut np), arg(&mut rp), arg(&mut kp), arg(&mut vp),
+                    arg(&mut so), arg(&mut qo), arg(&mut ao), arg(&mut p0), arg(&mut nt),
+                    arg(&mut nhp), arg(&mut nk), arg(&mut h), arg(&mut r), arg(&mut q),
+                    arg(&mut g), arg(&mut e), arg(&mut s),
+                ];
+                let grid = div_up(nt, 8) * nhp;
+                self.cu.launch(self.funcs[Op::AttnChunk as usize], grid, hd, 0, &mut p)
+            }
+            Launch::KvPrepare { norm, rope, kcache, vcache, sin_off, k_off, v_off, pos0, n, nkv, hd, rot, eps } => {
+                let (mut a, mut np, mut rp, mut kp, mut vp, mut so, mut ko, mut vo, mut p0, mut n, mut nk, mut h, mut r, mut e) =
+                    (arena, norm, rope, kcache, vcache, sin_off, k_off, v_off, pos0, n, nkv, hd, rot, eps);
+                let mut p = [
+                    arg(&mut a), arg(&mut np), arg(&mut rp), arg(&mut kp), arg(&mut vp),
+                    arg(&mut so), arg(&mut ko), arg(&mut vo), arg(&mut p0), arg(&mut n),
+                    arg(&mut nk), arg(&mut h), arg(&mut r), arg(&mut e),
+                ];
+                let block = nkv * hd;
+                self.cu.launch(self.funcs[Op::KvPrepare as usize], 2 * n, block, 0, &mut p)
+            }
         }
     }
 
@@ -400,6 +454,29 @@ impl CudaGpu {
                     arg(&mut n), arg(&mut dkk), arg(&mut dvv), arg(&mut r), arg(&mut e),
                 ];
                 self.cu.launch_on_stream(self.funcs[Op::GdnRec as usize], stream, nv, 512, 0, &mut p)
+            }
+            Launch::AttnChunk { norm, rope, kcache, vcache, sin_off, q_off, attn_off, pos0, n, nh, nkv, hd, rot, q_out, gate, eps, scale } => {
+                let (mut a, mut np, mut rp, mut kp, mut vp, mut so, mut qo, mut ao, mut p0, mut nt, mut nhp, mut nk, mut h, mut r, mut q, mut g, mut e, mut s) =
+                    (arena, norm, rope, kcache, vcache, sin_off, q_off, attn_off, pos0, n, nh, nkv, hd, rot, q_out, gate, eps, scale);
+                let mut p = [
+                    arg(&mut a), arg(&mut np), arg(&mut rp), arg(&mut kp), arg(&mut vp),
+                    arg(&mut so), arg(&mut qo), arg(&mut ao), arg(&mut p0), arg(&mut nt),
+                    arg(&mut nhp), arg(&mut nk), arg(&mut h), arg(&mut r), arg(&mut q),
+                    arg(&mut g), arg(&mut e), arg(&mut s),
+                ];
+                let grid = div_up(nt, 8) * nhp;
+                self.cu.launch_on_stream(self.funcs[Op::AttnChunk as usize], stream, grid, hd, 0, &mut p)
+            }
+            Launch::KvPrepare { norm, rope, kcache, vcache, sin_off, k_off, v_off, pos0, n, nkv, hd, rot, eps } => {
+                let (mut a, mut np, mut rp, mut kp, mut vp, mut so, mut ko, mut vo, mut p0, mut n, mut nk, mut h, mut r, mut e) =
+                    (arena, norm, rope, kcache, vcache, sin_off, k_off, v_off, pos0, n, nkv, hd, rot, eps);
+                let mut p = [
+                    arg(&mut a), arg(&mut np), arg(&mut rp), arg(&mut kp), arg(&mut vp),
+                    arg(&mut so), arg(&mut ko), arg(&mut vo), arg(&mut p0), arg(&mut n),
+                    arg(&mut nk), arg(&mut h), arg(&mut r), arg(&mut e),
+                ];
+                let block = nkv * hd;
+                self.cu.launch_on_stream(self.funcs[Op::KvPrepare as usize], stream, 2 * n, block, 0, &mut p)
             }
         }
     }
@@ -554,6 +631,27 @@ impl<'a> CudaBatch<'a> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_chunk(&mut self, norm: usize, rope: usize, kcache: usize, vcache: usize, sin_off: usize, q_off: usize, attn_off: usize, pos0: usize, n: usize, nh: usize, nkv: usize, hd: usize, rot: usize, q_out: usize, gate: bool, eps: f32, scale: f32) -> Result<&mut CudaBatch<'a>> {
+        let (np, rp, kp, vp) = (self.gpu.bufs[norm].ptr, self.gpu.bufs[rope].ptr, self.gpu.bufs[kcache].ptr, self.gpu.bufs[vcache].ptr);
+        self.push(Launch::AttnChunk {
+            norm: np, rope: rp, kcache: kp, vcache: vp, sin_off: sin_off as u32,
+            q_off: q_off as u32, attn_off: attn_off as u32, pos0: pos0 as u32,
+            n: n as u32, nh: nh as u32, nkv: nkv as u32, hd: hd as u32, rot: rot as u32,
+            q_out: q_out as u32, gate: gate as u32, eps, scale,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_prepare(&mut self, norm: usize, rope: usize, kcache: usize, vcache: usize, sin_off: usize, k_off: usize, v_off: usize, pos0: usize, n: usize, nkv: usize, hd: usize, rot: usize, eps: f32) -> Result<&mut CudaBatch<'a>> {
+        let (np, rp, kp, vp) = (self.gpu.bufs[norm].ptr, self.gpu.bufs[rope].ptr, self.gpu.bufs[kcache].ptr, self.gpu.bufs[vcache].ptr);
+        self.push(Launch::KvPrepare {
+            norm: np, rope: rp, kcache: kp, vcache: vp, sin_off: sin_off as u32,
+            k_off: k_off as u32, v_off: v_off as u32, pos0: pos0 as u32,
+            n: n as u32, nkv: nkv as u32, hd: hd as u32, rot: rot as u32, eps,
+        })
+    }
+
     pub fn submit(&mut self) -> Result<()> {
         if !self.live {
             return Err("batch already submitted".into());
@@ -601,6 +699,14 @@ impl<'a> CudaBatch<'a> {
                 }
                 Launch::GdnRec { w, state, base, out_off, kd, nv, dk, dv, rep, eps } => {
                     (6u8, w, state, base, out_off, kd, nv, dk, dv, rep, eps.to_bits()).hash(&mut hasher)
+                }
+                Launch::AttnChunk { norm, rope, kcache, vcache, sin_off, q_off, attn_off, pos0, n, nh, nkv, hd, rot, q_out, gate, eps, scale } => {
+                    (7u8, norm, rope, kcache, vcache, sin_off, q_off, attn_off, pos0, n, nh).hash(&mut hasher);
+                    (nkv, hd, rot, q_out, gate, eps.to_bits(), scale.to_bits()).hash(&mut hasher)
+                }
+                Launch::KvPrepare { norm, rope, kcache, vcache, sin_off, k_off, v_off, pos0, n, nkv, hd, rot, eps } => {
+                    (8u8, norm, rope, kcache, vcache, sin_off, k_off, v_off, pos0, n, nkv).hash(&mut hasher);
+                    (hd, rot, eps.to_bits()).hash(&mut hasher)
                 }
             }
         }

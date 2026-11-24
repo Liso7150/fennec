@@ -1,11 +1,12 @@
-//! Auto-update system: silent background updates from GitHub releases,
-//! plus `fennec update --experimental` for devs to pull from main branch.
+//! Update checks against GitHub releases, plus `fennec update --experimental`
+//! for devs pulling the latest commit from main.
 //!
-//! Normal mode checks tagged releases and updates silently in the background.
-//! Experimental mode pulls the latest commit from main/origin for developers.
-//! Every download is verified against a SHA-256 checksum before applying.
+//! The engine ships from source: `Liso7150/fennec` publishes no releases, so
+//! what moves this binary is the CLI's `fennec update`, which fast-forwards
+//! the checkout and rebuilds. The release path stays correct for a tag that
+//! does attach binaries, and verifies such a download against the release's
+//! SHA-256 digest list.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -14,15 +15,7 @@ use crate::config::Result;
 
 /// GitHub repository for releases
 const GITHUB_REPO: &str = "Liso7150/fennec";
-
-/// Update channel
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Channel {
-    /// Stable releases from GitHub tags
-    Stable,
-    /// Latest commits from main branch
-    Experimental,
-}
+const EXPERIMENTAL_BRANCH: &str = "main";
 
 /// Platform triple for binary selection
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,17 +83,46 @@ pub struct Asset {
     pub size: u64,
 }
 
-/// Update status
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum UpdateStatus {
-    /// No update available
-    UpToDate,
-    /// Update downloaded and ready to apply
-    UpdateReady { version: String, path: PathBuf },
-    /// Update applied, restart required
-    Applied { version: String },
-    /// Error during update
-    Error(String),
+/// `Some(true)` when `candidate` is a strictly newer dotted version than
+/// `current`, `Some(false)` when it is the same or older, and `None` when
+/// either side is not three plain numbers (a `dev-<sha>` tag, say) so the
+/// caller refuses to guess.
+///
+/// This exists because the published releases run *behind* a working tree: a
+/// 1.0.0 build must not pull the 0.9.0 assets just because the tag differs.
+pub fn is_newer(candidate: &str, current: &str) -> Option<bool> {
+    fn parts(version: &str) -> Option<[u64; 3]> {
+        let version = version.trim().trim_start_matches('v');
+        let mut numbers = [0u64; 3];
+        for (field, slot) in version.split('.').zip(numbers.iter_mut()) {
+            *slot = field.parse().ok()?;
+        }
+        Some(numbers)
+    }
+    let (candidate, current) = (parts(candidate)?, parts(current)?);
+    Some(candidate > current)
+}
+
+/// Release asset that carries the SHA-256 digests of the other assets.
+pub const CHECKSUMS_ASSET: &str = "SHA256SUMS";
+
+/// The digest this release publishes for `asset_name`, `None` when it publishes
+/// no digest list or not one for that asset. `download_asset` takes the digest,
+/// not the URL of the list — handing it the URL compares the binary's hash
+/// against a string and fails every download that is actually intact.
+pub async fn checksum_for(release: &Release, asset_name: &str) -> Option<String> {
+    let url = release.checksums_url.as_deref()?;
+    let text = download_asset(url, None).await.ok()?;
+    let text = String::from_utf8(text).ok()?;
+    // Format: "<64 hex>  <filename>", the filename prefixed with `*` for a
+    // binary-mode read.
+    for line in text.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() == 2 && parts[1].trim_start_matches('*') == asset_name {
+            return Some(parts[0].to_string());
+        }
+    }
+    None
 }
 
 /// Check for updates from GitHub releases
@@ -127,12 +149,14 @@ pub async fn check_stable(current_version: &str) -> Result<Option<Release>> {
         .await
         .map_err(|e| format!("Parse release: {e}"))?;
 
-    // Compare versions
-    if release.tag_name == format!("v{}", current_version) {
+    // Only a release newer than the running binary is an update. The published
+    // ladder runs behind a working tree, so an unequal tag is not enough.
+    let version = release.tag_name.trim_start_matches('v').to_string();
+    if is_newer(&version, current_version) != Some(true) {
         return Ok(None);
     }
 
-    let assets = release
+    let assets: Vec<Asset> = release
         .assets
         .into_iter()
         .map(|a| Asset {
@@ -141,20 +165,24 @@ pub async fn check_stable(current_version: &str) -> Result<Option<Release>> {
             size: a.size,
         })
         .collect();
+    let checksums_url = assets
+        .iter()
+        .find(|a| a.name == CHECKSUMS_ASSET)
+        .map(|a| a.download_url.clone());
 
     Ok(Some(Release {
-        version: release.tag_name.trim_start_matches('v').to_string(),
+        version,
         tag: release.tag_name,
         published_at: release.published_at,
         assets,
-        checksums_url: None,
+        checksums_url,
     }))
 }
 
 /// Check for experimental updates from main branch
 pub async fn check_experimental() -> Result<Option<Release>> {
     let url = format!(
-        "https://api.github.com/repos/{}/commits/master",
+        "https://api.github.com/repos/{}/commits/{EXPERIMENTAL_BRANCH}",
         GITHUB_REPO
     );
     let client = reqwest::Client::builder()
@@ -237,138 +265,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(result)
 }
 
-/// Background update checker
-pub struct BackgroundUpdater {
-    current_version: String,
-    check_interval: Duration,
-}
-
-impl BackgroundUpdater {
-    pub fn new(current_version: String) -> Self {
-        BackgroundUpdater {
-            current_version,
-            check_interval: Duration::from_secs(3600), // Check every hour
-        }
-    }
-
-    /// Run the background update loop
-    pub async fn run(&self) {
-        loop {
-            match check_stable(&self.current_version).await {
-                Ok(Some(release)) => {
-                    eprintln!(
-                        "[updater] New version available: {} (current: {})",
-                        release.version, self.current_version
-                    );
-                    // Download and apply silently
-                    if let Err(e) = self.apply_update(&release).await {
-                        eprintln!("[updater] Failed to apply update: {}", e);
-                    }
-                }
-                Ok(None) => {
-                    // Up to date
-                }
-                Err(e) => {
-                    eprintln!("[updater] Check failed: {}", e);
-                }
-            }
-            tokio::time::sleep(self.check_interval).await;
-        }
-    }
-
-    async fn apply_update(&self, release: &Release) -> Result<()> {
-        let platform = Platform::current();
-        let asset_name = platform.asset_name("fennec");
-
-        let asset = release
-            .assets
-            .iter()
-            .find(|a| a.name == asset_name)
-            .ok_or_else(|| format!("No asset for platform: {}", asset_name))?;
-
-        // Download checksum file if available
-        let checksum = if let Some(checksums_url) = &release.checksums_url {
-            self.download_checksum(checksums_url, &asset_name).await.ok()
-        } else {
-            None
-        };
-
-        // Download the asset
-        let bytes = download_asset(&asset.download_url, checksum.as_deref()).await?;
-
-        // Write to temporary location
-        let temp_path = std::env::temp_dir().join(&asset_name);
-        std::fs::write(&temp_path, &bytes)
-            .map_err(|e| format!("Write temp: {e}"))?;
-
-        // Apply (platform-specific)
-        self.replace_binary(&temp_path).await?;
-
-        eprintln!("[updater] Updated to {} - restart required", release.version);
-        Ok(())
-    }
-
-    async fn download_checksum(&self, url: &str, asset_name: &str) -> Result<String> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .user_agent("fennec-updater")
-            .build()
-            .map_err(|e| format!("HTTP client: {e}"))?;
-
-        let resp = client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| format!("Download checksums: {e}"))?;
-
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| format!("Read checksums: {e}"))?;
-
-        // Parse checksum file (format: "<checksum>  <filename>")
-        for line in text.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() == 2 && parts[1] == asset_name {
-                return Ok(parts[0].to_string());
-            }
-        }
-
-        Err(format!("Checksum not found for {}", asset_name))
-    }
-
-    async fn replace_binary(&self, new_path: &std::path::Path) -> Result<()> {
-        let current_exe = std::env::current_exe().map_err(|e| format!("Current exe: {e}"))?;
-
-        // On Windows, we can't replace a running binary directly.
-        // Rename the current binary, then move the new one into place.
-        if cfg!(target_os = "windows") {
-            let backup = current_exe.with_extension("exe.old");
-            if backup.exists() {
-                std::fs::remove_file(&backup).map_err(|e| format!("Remove backup: {e}"))?;
-            }
-            std::fs::rename(&current_exe, &backup)
-                .map_err(|e| format!("Backup current: {e}"))?;
-            std::fs::copy(new_path, &current_exe)
-                .map_err(|e| format!("Install new: {e}"))?;
-        } else {
-            // On Unix, we can replace directly
-            std::fs::copy(new_path, &current_exe)
-                .map_err(|e| format!("Replace: {e}"))?;
-            // Make executable
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let perms = std::fs::Permissions::from_mode(0o755);
-                std::fs::set_permissions(&current_exe, perms)
-                    .map_err(|e| format!("Chmod: {e}"))?;
-            }
-        }
-
-        Ok(())
-    }
-}
-
 // GitHub API response types
 #[derive(Deserialize)]
 struct GitHubRelease {
@@ -398,4 +294,24 @@ struct GitHubCommitDetail {
 #[derive(Deserialize)]
 struct GitHubAuthor {
     date: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_higher_release_is_an_update_and_an_older_one_is_not() {
+        assert_eq!(is_newer("1.1.0", "1.0.0"), Some(true));
+        assert_eq!(is_newer("1.10.0", "1.9.0"), Some(true));
+        assert_eq!(is_newer("v1.1.0", "1.0.0"), Some(true));
+        assert_eq!(is_newer("1.0.0", "1.0.0"), Some(false));
+        assert_eq!(is_newer("0.9.0", "1.0.0"), Some(false));
+    }
+
+    #[test]
+    fn a_tag_the_comparator_does_not_understand_offers_nothing() {
+        assert_eq!(is_newer("dev-abc1234", "1.0.0"), None);
+        assert_eq!(is_newer("1.0.0", "1.0.0-rc1"), None);
+    }
 }

@@ -31,6 +31,7 @@ pub mod gpu;
 pub mod kernel;
 pub mod mem;
 pub mod model;
+pub mod mtp;
 pub mod npy;
 pub mod ort;
 pub mod plugin;
@@ -44,6 +45,7 @@ pub mod sched;
 pub mod serve;
 pub mod tokenizer;
 pub mod updater;
+pub mod vision;
 pub mod vk;
 
 pub use config::{LayerKind, TextConfig};

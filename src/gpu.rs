@@ -481,6 +481,12 @@ pub enum Op {
     /// The one-row-per-workgroup int4 gemv that `GemvQ4` replaced. Only
     /// `tests/gpu.rs moe_kernel_shapes` records it, to keep the A/B measurable.
     GemvQ4OneRow = 14,
+    /// Full-attention chunk prefill (device K/Q attention, online softmax).
+    /// CUDA-only: PTX kernels, no SPIR-V port.
+    AttnChunk = 15,
+    /// Prefill K/V norm+rope + cache write + V copy for `AttnChunk`.
+    /// CUDA-only: PTX kernels, no SPIR-V port.
+    KvPrepare = 16,
 }
 
 const SPV: [&[u8]; 15] = [
@@ -1188,6 +1194,35 @@ impl VkGpu {
         Ok(())
     }
 
+    pub fn read_buf_at(&mut self, id: usize, at: usize, out: &mut [u8]) -> Result<()> {
+        if at + out.len() > self.bufs[id].size as usize {
+            return Err(format!("read_buf_at: {} bytes at {at} out of a {}-byte buffer", out.len(), self.bufs[id].size));
+        }
+        if out.is_empty() {
+            return Ok(());
+        }
+        if self.staging == usize::MAX {
+            self.staging = self.alloc_host(STAGING_BYTES)?;
+        }
+        let cap = self.bufs[self.staging].size as usize;
+        let mut off = 0usize;
+        while off < out.len() {
+            let n = cap.min(out.len() - off);
+            self.begin()?;
+            unsafe {
+                let cp = BufferCopy { src: (at + off) as u64, dst: 0, size: n as u64 };
+                (self.api.cmd_copy_buffer)(self.cb, self.bufs[id].buffer, self.bufs[self.staging].buffer, 1, &cp);
+            }
+            self.barrier(PIPELINE_STAGE_TRANSFER, PIPELINE_STAGE_HOST, ACCESS_TRANSFER_WRITE, ACCESS_HOST_READ);
+            self.flush()?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.bufs[self.staging].host, out.as_mut_ptr().add(off), n);
+            }
+            off += n;
+        }
+        Ok(())
+    }
+
     pub fn write(&mut self, off: usize, v: &[f32]) {
         assert!(off + v.len() <= self.scratch_floats, "activation arena too small");
         unsafe {
@@ -1790,6 +1825,13 @@ impl Gpu {
         }
     }
 
+    pub fn read_buf_at(&mut self, id: usize, at: usize, out: &mut [u8]) -> Result<()> {
+        match self {
+            Gpu::Vk(g) => g.read_buf_at(id, at, out),
+            Gpu::Cuda(g) => g.read_buf_at(id, at, out),
+        }
+    }
+
     pub fn write(&mut self, off: usize, v: &[f32]) {
         match self {
             Gpu::Vk(g) => g.write(off, v),
@@ -2071,6 +2113,24 @@ impl<'a> Batch<'a> {
         match self {
             Batch::Vk(b) => { b.gdn_rec(w, state, base, out_off, kd, nv, dk, dv, rep, eps)?; }
             Batch::Cuda(b) => { b.gdn_rec(w, state, base, out_off, kd, nv, dk, dv, rep, eps)?; }
+        };
+        Ok(self)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_chunk(&mut self, norm: usize, rope: usize, kcache: usize, vcache: usize, sin_off: usize, q_off: usize, attn_off: usize, pos0: usize, n: usize, nh: usize, nkv: usize, hd: usize, rot: usize, q_out: usize, gate: bool, eps: f32, scale: f32) -> Result<&mut Batch<'a>> {
+        match self {
+            Batch::Vk(_) => return Err("attn_chunk is CUDA-only".into()),
+            Batch::Cuda(b) => { b.attn_chunk(norm, rope, kcache, vcache, sin_off, q_off, attn_off, pos0, n, nh, nkv, hd, rot, q_out, gate, eps, scale)?; }
+        };
+        Ok(self)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_prepare(&mut self, norm: usize, rope: usize, kcache: usize, vcache: usize, sin_off: usize, k_off: usize, v_off: usize, pos0: usize, n: usize, nkv: usize, hd: usize, rot: usize, eps: f32) -> Result<&mut Batch<'a>> {
+        match self {
+            Batch::Vk(_) => return Err("kv_prepare is CUDA-only".into()),
+            Batch::Cuda(b) => { b.kv_prepare(norm, rope, kcache, vcache, sin_off, k_off, v_off, pos0, n, nkv, hd, rot, eps)?; }
         };
         Ok(self)
     }

@@ -605,6 +605,12 @@ mod tests {
             num_experts_per_tok: 10,
             moe_intermediate_size: 1792,
             shared_expert_intermediate_size: 0,
+mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: false,
+            vision: None,
+            image_token_id: None,
+            vision_start_token_id: None,
+            vision_end_token_id: None,
             prefix: "model".to_string(),
             name: "edge0".to_string(),
         };

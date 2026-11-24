@@ -11,6 +11,26 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// `model::bind_prefix` reads it back off the shard index at open time.
 pub const DEFAULT_PREFIX: &str = "model.language_model";
 
+/// Where the speculative drafter lives. Not prefixed by the text stack: a
+/// `qwen3_5_moe` export writes the block at the top of the shard index, and the
+/// tensor names below it otherwise match a decoder layer's exactly, which is
+/// what lets [`crate::mtp::Mtp`] reuse the trunk's layer loader.
+pub const MTP_PREFIX: &str = "mtp";
+
+#[derive(Debug, Clone)]
+pub struct VisionConfig {
+    pub depth: usize,
+    pub hidden_size: usize,
+    pub intermediate_size: usize,
+    pub num_heads: usize,
+    pub num_position_embeddings: usize,
+    pub out_hidden_size: usize,
+    pub patch_size: usize,
+    pub spatial_merge_size: usize,
+    pub temporal_patch_size: usize,
+    pub in_channels: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct TextConfig {
     pub hidden_size: usize,
@@ -45,9 +65,20 @@ pub struct TextConfig {
     pub num_experts_per_tok: usize,
     pub moe_intermediate_size: usize,
     pub shared_expert_intermediate_size: usize,
+    /// Decoder blocks stored under `mtp.layers.N.*`: a drafter the engine can
+    /// run ahead of the trunk for speculative decode. Zero when the checkpoint
+    /// carries no such block.
+    pub mtp_num_hidden_layers: usize,
+    /// Whether the drafter stores its own embedding table (`mtp.embed_tokens`).
+    /// When false - the shipped case - it reads the trunk's table instead.
+    pub mtp_use_dedicated_embeddings: bool,
     /// The common prefix of every text-stack tensor name in this checkpoint.
     pub prefix: String,
     pub name: String,
+    pub vision: Option<VisionConfig>,
+    pub image_token_id: Option<u32>,
+    pub vision_start_token_id: Option<u32>,
+    pub vision_end_token_id: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,6 +276,22 @@ impl TextConfig {
             .unwrap_or("unknown")
             .to_string();
         let zero_centered = !matches!(mtype.as_str(), "qwen3" | "qwen3_moe");
+        let vision = raw.get("vision_config").and_then(Value::as_object).map(|v| {
+            let n = |key: &str| v.get(key).and_then(Value::as_u64).unwrap_or(0) as usize;
+            VisionConfig {
+                depth: n("depth"),
+                hidden_size: n("hidden_size"),
+                intermediate_size: n("intermediate_size"),
+                num_heads: n("num_heads"),
+                num_position_embeddings: n("num_position_embeddings"),
+                out_hidden_size: n("out_hidden_size"),
+                patch_size: n("patch_size"),
+                spatial_merge_size: n("spatial_merge_size"),
+                temporal_patch_size: n("temporal_patch_size"),
+                in_channels: n("in_channels"),
+            }
+        }).filter(|v| v.depth > 0 && v.hidden_size > 0 && v.out_hidden_size > 0);
+        let token = |key: &str| raw.get(key).and_then(Value::as_u64).map(|v| v as u32);
         Ok(TextConfig {
             hidden_size: gi("hidden_size")?,
             num_hidden_layers: n_layers,
@@ -275,8 +322,17 @@ impl TextConfig {
             num_experts_per_tok: go("num_experts_per_tok"),
             moe_intermediate_size: go("moe_intermediate_size"),
             shared_expert_intermediate_size: go("shared_expert_intermediate_size"),
+            mtp_num_hidden_layers: go("mtp_num_hidden_layers"),
+            mtp_use_dedicated_embeddings: tc
+                .get("mtp_use_dedicated_embeddings")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             prefix: DEFAULT_PREFIX.to_string(),
             name: mtype,
+            vision,
+            image_token_id: token("image_token_id"),
+            vision_start_token_id: token("vision_start_token_id"),
+            vision_end_token_id: token("vision_end_token_id"),
         })
     }
 

@@ -13,9 +13,11 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use base64::Engine;
 use serde_json::{json, Value};
 
 use crate::config::TextConfig;
+use crate::mtp::{Mtp, Spec};
 use crate::model::Model;
 use crate::safetensors::Shards;
 use crate::tokenizer::{chat_prompt, Tokenizer};
@@ -23,15 +25,27 @@ use crate::tokenizer::{chat_prompt, Tokenizer};
 /// Prompt tokens per prefill chunk. A chunk is the batch the dense trunk's
 /// weight rows are reused across, so bigger is cheaper until the chunk's own
 /// activations stop fitting a core's L2: at the shipped model's 2048-wide
-/// hidden state the slab is 128 KiB at 16 tokens and 256 KiB at 32, against
-/// 1-2 MB of L2. Long prompts simply run the loop again, and the buffers stay
-/// one chunk wide either way.
+/// hidden state the slab is 1 MB at 128 tokens, against 1-2 MB of L2. Long
+/// prompts simply run the loop again, and the buffers stay one chunk wide
+/// either way.
 ///
-/// 32 beat 16 in every pairing of a four-run session (TTFT 1.875 s twice,
-/// against 1.906 s then 2.015 s at 16) and left TPOT to the session drift, as
-/// it should: the experts a token routes to are per-token work no chunk size
-/// amortises, so this buys back the dense trunk passes and nothing else.
-const PREFILL_CHUNK: usize = 32;
+/// The second reuse is the expert union: a chunk's picks read each distinct
+/// expert's weights once, so amortisation grows with chunk width - 8 picks
+/// per token over 256 experts lands ~1.45 weight-reads per expert at 32 and
+/// ~4 at 128. The early 32-beats-16 pairing predates the union and priced
+/// only the dense trunk; at 128 the expert reads dominate. The env override
+/// exists for paired A/B measurement on one binary.
+const PREFILL_CHUNK: usize = 128;
+
+/// The served chunk width: [`PREFILL_CHUNK`] unless a measurement run pins
+/// another width with `FENNEC_PREFILL_CHUNK` (tokens, 1..=2048).
+fn prefill_chunk() -> usize {
+    std::env::var("FENNEC_PREFILL_CHUNK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0 && n <= 2048)
+        .unwrap_or(PREFILL_CHUNK)
+}
 
 /// Where the token-by-token loop starts. The chunked prefill leaves the prompt
 /// in the layer states up to the last token, so the loop resumes there; a
@@ -45,6 +59,99 @@ fn first_forward(prompt_len: usize, batched: bool) -> usize {
     } else {
         0
     }
+}
+
+/// What happens to a committed token on its way to the client. Both decode paths
+/// - the one-token-at-a-time loop and [`Spec`]'s rounds - feed the same sink, and
+/// the two things that make that delicate have nothing to do with how the token
+/// was produced: one can end mid-character, and a think marker can straddle two.
+struct Turn<'a, F: FnMut(&str, bool) -> bool> {
+    split: ThinkSplit<'a, F>,
+    tok: &'a Tokenizer,
+    raw: Vec<u8>,
+}
+
+impl<F: FnMut(&str, bool) -> bool> Turn<'_, F> {
+    /// Ok(false) means the client hung up mid-turn, which is how a disconnected
+    /// request cancels generation.
+    fn token(&mut self, id: u32) -> Result<bool, String> {
+        // A token can end mid-character. Hold the incomplete tail back as
+        // bytes rather than letting a lossy decode make it permanent.
+        self.raw.extend_from_slice(&self.tok.decode_bytes(&[id], false));
+        let valid = match std::str::from_utf8(&self.raw) {
+            Ok(s) => s.len(),
+            Err(e) => e.valid_up_to(),
+        };
+        let piece = String::from_utf8(self.raw[..valid].to_vec()).map_err(|e| e.to_string())?;
+        self.raw.drain(..valid);
+        if !self.split.push(&piece) {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    fn flush(&mut self) {
+        self.split.finish();
+    }
+}
+
+/// Think-block text belongs in `reasoning_content` and the rest in `content`, with
+/// the markers kept out of both. A marker can be split across any number of
+/// pieces, so a tail that could still become one is held back until a later piece
+/// settles it; only at the end of the turn is such a tail - literal text, it turns
+/// out - released.
+struct ThinkSplit<'a, F: FnMut(&str, bool) -> bool> {
+    emit: &'a mut F,
+    pending: String,
+    think: bool,
+}
+
+impl<F: FnMut(&str, bool) -> bool> ThinkSplit<'_, F> {
+    /// false means the client hung up mid-turn, which is how a disconnected
+    /// request cancels generation.
+    fn push(&mut self, piece: &str) -> bool {
+        self.pending.push_str(piece);
+        loop {
+            let (open, close) = ("<think>", "</think>");
+            let marker = if self.think { close } else { open };
+            if let Some(at) = self.pending.find(marker) {
+                let before = self.pending[..at].to_string();
+                if !before.is_empty() && !(self.emit)(&before, self.think) {
+                    return false;
+                }
+                self.think = !self.think;
+                self.pending = self.pending[at + marker.len()..].to_string();
+                continue;
+            }
+            // Keep any suffix that could still become the marker.
+            let hold = (1..marker.len())
+                .rev()
+                .find(|&n| self.pending.ends_with(&marker[..n]))
+                .unwrap_or(0);
+            let cut = self.pending.len() - hold;
+            if cut > 0 {
+                let out = self.pending[..cut].to_string();
+                self.pending = self.pending[cut..].to_string();
+                if !(self.emit)(&out, self.think) {
+                    return false;
+                }
+            }
+            break;
+        }
+        true
+    }
+
+    fn finish(&mut self) {
+        if !self.pending.is_empty() {
+            (self.emit)(&self.pending, self.think);
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ChatPart {
+    Text(String),
+    Image(Vec<u8>),
 }
 
 pub struct Stats {
@@ -64,6 +171,16 @@ pub struct Server {
     pub stats: Arc<Stats>,
     pub started: Instant,
     pub max_ctx: usize,
+    /// Cached when the checkpoint loads: the vision tower exists or it does not,
+    /// and no request changes it. `/health` must answer while a generation holds
+    /// the model mutex, so it cannot take that lock to find out.
+    pub vision: bool,
+    /// The `mtp.*` decoder block, when the checkpoint carries one and `--mtp` asked
+    /// for it. Loaded once: it is ~50 MB of weights, and a request that drafted
+    /// before it read them would pay that against its own time to first token.
+    pub mtp: Option<Arc<Mtp>>,
+    /// Drafts per speculation round.
+    pub mtp_k: usize,
 }
 
 /// Sampling knobs, defaulted from the checkpoint's `generation_config.json`.
@@ -199,6 +316,7 @@ impl Server {
         api_key: String,
         max_ctx: usize,
     ) -> Server {
+        let vision = model.lock().map(|m| m.vision.is_some()).unwrap_or(false);
         Server {
             model,
             shards,
@@ -214,21 +332,94 @@ impl Server {
             }),
             started: Instant::now(),
             max_ctx,
+            vision,
+            mtp: None,
+            mtp_k: 0,
         }
+    }
+
+    /// Read the `mtp.*` drafter so requests may speculate, `k` proposals per
+    /// round. A no-op when `k` is 0 or when the checkpoint has no block. The
+    /// device tiers decline with the measured reason: the served CUDA ABBA
+    /// (2026-11-23, 2 0 0 2) put a verify round at 71.309 ms/token against
+    /// 59.897 sequential - the chunk wrapper, expert union and readback that a
+    /// 3-token verify pays outweigh the drafts it saves, even at 3.00 accepted
+    /// tokens per round - and Vulkan's chunk was already measured slower per
+    /// prompt token. The host tier keeps it: 91.762 against 116.198. See
+    /// [`crate::mtp`] for the whole ledger.
+    ///
+    /// Returns whether a drafter is now in play, so `--mtp 2` against a checkpoint
+    /// without one says so on the status line instead of silently decoding one
+    /// token at a time forever.
+    pub fn enable_mtp(&mut self, k: usize, group: usize, threads: usize) -> Result<bool, String> {
+        if k == 0 {
+            return Ok(false);
+        }
+        let model = self.model.lock().map_err(|_| "model mutex poisoned")?;
+        if !model.prefill_ready() {
+            eprintln!("[fennec] --mtp {k} stays off this device tier: the served CUDA ABBA put a verify round at 71.309 ms/token against 59.897 sequential, and Vulkan's chunk was already the slower shape");
+            return Ok(false);
+        }
+        let m = Mtp::load(&self.shards, &self.cfg, &model.embed, group, threads, self.max_ctx)?;
+        let Some(m) = m else {
+            eprintln!("[fennec] --mtp {k}: this checkpoint carries no mtp.* block, decoding one token at a time");
+            return Ok(false);
+        };
+        self.mtp_k = k;
+        self.mtp = Some(Arc::new(m));
+        eprintln!("[fennec] mtp: {k} drafts per round from the mtp.* block (greedy, no repeat penalty, host tier)");
+        Ok(true)
     }
 
     fn authorized(&self, head: &str) -> bool {
         bearer_ok(head, &self.api_key)
     }
 
-    /// One completion, token by token. `emit` is called with each decoded piece
-    /// and whether it is inside a think block; returning false stops the turn,
-    /// which is how a disconnected client cancels generation.
+    /// Whether this request may speculate, and the round driver if it may.
+    ///
+    /// Three gates, all of them about the answer rather than the speed: a tier
+    /// that can roll the trunk's recurrent state back - the host copy always
+    /// can; the device tiers decline at [`Self::enable_mtp`] on their chunk
+    /// measurement; and a sampler that reduces to argmax, because acceptance is
+    /// defined as agreeing with what the sequential loop would have picked.
+    /// Temperature, or a repetition penalty that edits the logits from the
+    /// sequence's own history, makes that a different sequence rather than
+    /// merely a slower one - see [`crate::mtp`].
+    fn spec_for(&self, model: &Model, s: &Sample, kv_cap: usize) -> Option<Spec> {
+        let mtp = self.mtp.as_ref()?;
+        if self.mtp_k == 0
+            || !model.prefill_ready()
+            || s.temperature > 0.0
+            || s.repeat_penalty != 1.0
+        {
+            return None;
+        }
+        Some(Spec::new(mtp.clone(), self.mtp_k, kv_cap))
+    }
+
+    /// One completion, token by token unless the drafter is in play, in which case
+    /// the rounds after the first token commit a block at a time. `emit` is called
+    /// with each decoded piece and whether it is inside a think block; returning
+    /// false stops the turn, which is how a disconnected client cancels generation.
     pub fn generate<F>(
         &self,
         prompt_ids: &[u32],
         max_new: usize,
         s: Sample,
+        emit: F,
+    ) -> Result<(usize, String), String>
+    where
+        F: FnMut(&str, bool) -> bool,
+    {
+        self.generate_with_visual(prompt_ids, max_new, s, None, emit)
+    }
+
+    fn generate_with_visual<F>(
+        &self,
+        prompt_ids: &[u32],
+        max_new: usize,
+        s: Sample,
+        visual_rows: Option<&[Option<Vec<f32>>]>,
         mut emit: F,
     ) -> Result<(usize, String), String>
     where
@@ -252,9 +443,11 @@ impl Server {
         let mut hn = vec![0f32; h];
         let mut rng = s.seed;
         let mut ids = prompt_ids.to_vec();
-        let mut think = false;
-        let mut pending = String::new();
-        let mut raw: Vec<u8> = Vec::new();
+        let mut turn = Turn {
+            split: ThinkSplit { emit: &mut emit, pending: String::new(), think: false },
+            tok: &self.tok,
+            raw: Vec::new(),
+        };
         let mut produced = 0usize;
         let mut finish = "length";
 
@@ -288,14 +481,19 @@ impl Server {
         let batched = prompt_len > 1 && (!on_device || model.prefill_device_chunked());
         let first = first_forward(prompt_len, batched);
         if batched {
-            let mut xs = vec![0f32; PREFILL_CHUNK.min(first) * h];
+            let chunk = prefill_chunk();
+            let mut xs = vec![0f32; chunk.min(first) * h];
             let nrow = xs.len() / h;
             let mut c0 = 0usize;
             while c0 < first {
                 let n = nrow.min(first - c0);
                 for (i, &id) in ids[c0..c0 + n].iter().enumerate() {
-                    let row = model.embed_row(&self.shards, id as usize)?;
-                    xs[i * h..(i + 1) * h].copy_from_slice(&row);
+                    if let Some(Some(row)) = visual_rows.and_then(|rows| rows.get(c0 + i)) {
+                        xs[i * h..(i + 1) * h].copy_from_slice(row);
+                    } else {
+                        let row = model.embed_row(&self.shards, id as usize)?;
+                        xs[i * h..(i + 1) * h].copy_from_slice(&row);
+                    }
                 }
                 if on_device {
                     model
@@ -309,8 +507,21 @@ impl Server {
             crate::prof::split(first);
         }
         let end = prompt_len + max_new;
-        for t in first..end {
-            let mut x = model.embed_row(&self.shards, ids[t] as usize)?;
+        // Speculation takes over from the first head the trunk sampled itself: a
+        // round pairs the pending token with the trunk row that produced it, and
+        // that row only exists once something has been fed. So this loop runs the
+        // prompt to its first answer and then hands `x` over as that row.
+        let mut spec = self.spec_for(&model, &s, prompt_ids.len() + max_new + 1);
+        let mut hprev = vec![0f32; h];
+        let mut pos = first;
+        let mut handover = false;
+        let mut t = first;
+        while t < end {
+            let mut x = if let Some(Some(row)) = visual_rows.and_then(|rows| rows.get(t)) {
+                row.clone()
+            } else {
+                model.embed_row(&self.shards, ids[t] as usize)?
+            };
             model.forward(&mut x, &mut st, t);
             // Only the chunked arm has a phase boundary of its own: a prompt run
             // token by token would otherwise leave every prompt stage in the
@@ -321,6 +532,7 @@ impl Server {
                 crate::prof::split(t + 1);
             }
             if t + 1 < ids.len() {
+                t += 1;
                 continue;
             }
             crate::kernel::rmsnorm(&x, &model.norm, eps, &mut hn);
@@ -332,53 +544,61 @@ impl Server {
             }
             produced += 1;
             ids.push(next);
-            // A token can end mid-character. Hold the incomplete tail back as
-            // bytes rather than letting a lossy decode make it permanent.
-            raw.extend_from_slice(&self.tok.decode_bytes(&[next], false));
-            let valid = match std::str::from_utf8(&raw) {
-                Ok(s) => s.len(),
-                Err(e) => e.valid_up_to(),
-            };
-            let piece = String::from_utf8(raw[..valid].to_vec()).map_err(|e| e.to_string())?;
-            raw.drain(..valid);
-            // Route think-block text to `reasoning_content` without leaking the
-            // markers into either field. A marker can straddle two tokens, so
-            // hold back a tail until it is unambiguous.
-            pending.push_str(&piece);
-            loop {
-                let (open, close) = ("<think>", "</think>");
-                let marker = if think { close } else { open };
-                if let Some(at) = pending.find(marker) {
-                    let before = pending[..at].to_string();
-                    if !before.is_empty() && !emit(&before, think) {
-                        return Ok((produced, "cancelled".into()));
-                    }
-                    think = !think;
-                    pending = pending[at + marker.len()..].to_string();
-                    continue;
-                }
-                // Keep any suffix that could still become the marker.
-                let hold = (1..marker.len())
-                    .rev()
-                    .find(|&n| pending.ends_with(&marker[..n]))
-                    .unwrap_or(0);
-                let cut = pending.len() - hold;
-                if cut > 0 {
-                    let out = pending[..cut].to_string();
-                    pending = pending[cut..].to_string();
-                    if !emit(&out, think) {
-                        return Ok((produced, "cancelled".into()));
-                    }
-                }
-                break;
+            if !turn.token(next)? {
+                return Ok((produced, "cancelled".into()));
             }
             if produced >= max_new {
                 break;
             }
+            if spec.is_some() {
+                pos = t + 1;
+                hprev.copy_from_slice(&x);
+                handover = true;
+                break;
+            }
+            t += 1;
         }
-        if !pending.is_empty() {
-            emit(&pending, think);
+        if handover {
+            let sp = spec.as_mut().expect("handover means a drafter");
+            let eos = &self.tok.eos;
+            // One round per block of drafts. `max_new - produced` is the token
+            // budget the round clamps `k` to, `pos` the row the pending token
+            // sits at; both advance by what the trunk actually kept.
+            while produced < max_new && pos < end {
+                let before = ids.len();
+                let m = sp.round(
+                    &model,
+                    &self.shards,
+                    &mut ids,
+                    &mut st,
+                    &mut hprev,
+                    pos,
+                    max_new - produced,
+                    &|x: u32| eos.contains(&x),
+                )?;
+                for i in before..ids.len() {
+                    let id = ids[i];
+                    if !turn.token(id)? {
+                        return Ok((produced, "cancelled".into()));
+                    }
+                }
+                produced += m;
+                pos += m;
+                if m == 0 || sp.stopped() {
+                    finish = "stop";
+                    break;
+                }
+            }
+            // stderr, like the rates line below: stdout of this function is the
+            // answer stream. This is the number the whole feature is priced by -
+            // tokens per round is the speedup, and acceptance is why it is not
+            // higher.
+            let rep = sp.report();
+            if !rep.is_empty() {
+                eprintln!("[fennec] {rep}");
+            }
         }
+        turn.flush();
         // Fold this turn's routing into the history the next plan is ranked by,
         // while the lock is still ours: another thread reading `picks` mid-update
         // would double-count. A few hundred KB of tmp+rename against a turn that
@@ -406,34 +626,56 @@ impl Server {
         Ok((produced, finish.into()))
     }
 
-    fn messages(v: &Value) -> Result<Vec<(String, String)>, String> {
+    fn image_data_url(url: &str) -> Result<Vec<u8>, String> {
+        let (meta, data) = url
+            .split_once(',')
+            .ok_or("image_url must be a base64 data URL")?;
+        if !meta.starts_with("data:") || !meta.split(';').any(|part| part == "base64") {
+            return Err("image_url must be a base64 data URL".into());
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .map_err(|e| format!("invalid image data URL: {e}"))?;
+        if bytes.len() > 64 * 1024 * 1024 {
+            return Err("image data URL exceeds the 64 MiB limit".into());
+        }
+        Ok(bytes)
+    }
+
+    fn messages(v: &Value) -> Result<Vec<(String, Vec<ChatPart>)>, String> {
         let arr = v["messages"].as_array().ok_or("messages must be an array")?;
         let mut out = Vec::with_capacity(arr.len());
         for m in arr {
             let role = m["role"].as_str().ok_or("each message needs a role")?;
-            let content = match &m["content"] {
-                Value::String(s) => s.clone(),
+            let parts = match &m["content"] {
+                Value::String(s) => vec![ChatPart::Text(s.clone())],
                 Value::Array(parts) => {
-                    let mut text = String::new();
+                    let mut out = Vec::with_capacity(parts.len());
                     for part in parts {
-                        match part["text"].as_str() {
-                            Some(t) => text.push_str(t),
-                            // A part without readable text used to be filtered out, so an
-                            // image-bearing request was answered from its caption alone and
-                            // every client showed that as an analyzed image. This checkpoint
-                            // has no vision tower: refuse instead of quietly losing input.
-                            None => return Err(format!(
-                                "content part `{}` is not text: this engine analyzes no images",
+                        if let Some(t) = part["text"].as_str() {
+                            if let Some(ChatPart::Text(last)) = out.last_mut() {
+                                last.push_str(t);
+                            } else {
+                                out.push(ChatPart::Text(t.to_string()));
+                            }
+                        } else if part["type"].as_str() == Some("image_url") {
+                            let url = part["image_url"]["url"]
+                                .as_str()
+                                .ok_or("image_url must contain a url")?;
+                            out.push(ChatPart::Image(Self::image_data_url(url)?));
+                        } else {
+                            return Err(format!(
+                                "content part `{}` is unsupported",
                                 part["type"].as_str().unwrap_or("unknown")
-                            )),
+                            ));
                         }
                     }
-                    text
+                    out
                 }
-                Value::Null => String::new(),
+                Value::Null => Vec::new(),
                 _ => return Err("content must be a string or an array of text parts".into()),
             };
-            out.push((role.to_string(), content));
+            out.push((role.to_string(), parts));
         }
         if out.is_empty() {
             return Err("messages is empty".into());
@@ -442,7 +684,35 @@ impl Server {
     }
 
     fn chat(&self, v: &Value, stream: bool, sock: &mut TcpStream) -> Result<(), String> {
-        let msgs = Self::messages(v)?;
+        let parsed = Self::messages(v)?;
+        let mut msgs = Vec::with_capacity(parsed.len());
+        let mut visual = Vec::new();
+        let model = self.model.lock().map_err(|_| "model mutex poisoned")?;
+        for (role, parts) in parsed {
+            let mut content = String::new();
+            for part in parts {
+                match part {
+                    ChatPart::Text(text) => content.push_str(&text),
+                    ChatPart::Image(image) => {
+                        if model.vision.is_none() {
+                            return Err("this checkpoint has no visual tower".into());
+                        }
+                        let features = model.vision_features(&image)?;
+                        if features.is_empty() {
+                            return Err("visual tower produced no image tokens".into());
+                        }
+                        content.push_str("<|vision_start|>");
+                        for _ in 0..features.len() {
+                            content.push_str("<|image_pad|>");
+                        }
+                        content.push_str("<|vision_end|>");
+                        visual.extend(features);
+                    }
+                }
+            }
+            msgs.push((role, content));
+        }
+        drop(model);
         // Colibri's qwen renderer defaults thinking off unless a reasoning effort
         // asks for it (openai_server.py: `body.get("enable_thinking",
         // reasoning_effort not in (None, "none"))`). Defaulting it on instead made
@@ -454,6 +724,26 @@ impl Server {
         };
         let prompt = chat_prompt(&msgs, thinking);
         let ids = self.tok.encode(&prompt);
+        let visual_rows = if visual.is_empty() {
+            None
+        } else {
+            let pad = self.cfg.image_token_id.ok_or("vision config has no image token id")?;
+            let mut at = 0usize;
+            let mut rows = Vec::with_capacity(ids.len());
+            for &id in &ids {
+                if id == pad {
+                    let row = visual.get(at).ok_or("image token count does not match visual features")?;
+                    rows.push(Some(row.clone()));
+                    at += 1;
+                } else {
+                    rows.push(None);
+                }
+            }
+            if at != visual.len() {
+                return Err("visual features do not map to image tokens".into());
+            }
+            Some(rows)
+        };
         let max_new = v["max_tokens"].as_u64().unwrap_or(2048).min(8192) as usize;
         let s = Sample::from_body(v);
         let n_prompt = ids.len();
@@ -485,7 +775,7 @@ impl Server {
             }
             let t0 = Instant::now();
             crate::prof::reset();
-            let (n, finish) = self.generate(&ids, max_new, s, |piece, think| {
+            let (n, finish) = self.generate_with_visual(&ids, max_new, s, visual_rows.as_deref(), |piece, think| {
                 if think {
                     reasoning.push_str(piece);
                     send(json!({"reasoning_content": piece}), Value::Null)
@@ -514,7 +804,7 @@ impl Server {
         crate::prof::reset();
         let mut content = String::new();
         let mut reasoning = String::new();
-        let (n, finish) = self.generate(&ids, max_new, s, |piece, think| {
+        let (n, finish) = self.generate_with_visual(&ids, max_new, s, visual_rows.as_deref(), |piece, think| {
             if think {
                 reasoning.push_str(piece);
             } else {
@@ -564,7 +854,7 @@ impl Server {
         match (method, path) {
             ("GET", "/health") => write_json(sock, 200, &json!({
                 "status": "ok", "engine": "fennec", "version": crate::VERSION,
-                "vision": false,
+                "vision": self.vision,
                 "model": self.model_id, "uptime_s": self.started.elapsed().as_secs(),
             })),
             ("GET", "/v1/models") => write_json(sock, 200, &json!({
@@ -644,8 +934,11 @@ impl Server {
                 }))
             }
             ("GET", "/diagnostics") => {
-                // Comprehensive diagnostics for desktop app and IDE plugins.
-                // Combines health, metrics, system info, and device status.
+                // One snapshot for a person debugging the box: health, throughput,
+                // per-layer tier hits and the kernel flags in force. Takes the model
+                // lock once for the layer counters, so it waits for an in-flight
+                // generation - nothing polls it on a liveness timeout; /health is the
+                // route that must answer while the model is busy.
                 let m = self.model.lock().map_err(|_| "model mutex poisoned")?;
                 let g = self.stats.generated.load(Relaxed);
                 let busy = self.stats.busy_ns.load(Relaxed) as f64 / 1e9;
@@ -675,7 +968,7 @@ impl Server {
                         "moe_intermediate_size": self.cfg.moe_intermediate_size,
                         "is_moe": self.cfg.is_moe(),
                         "max_context": self.max_ctx,
-                        "vision": false,
+                        "vision": self.vision,
                     },
                     "performance": {
                         "requests": self.stats.requests.load(Relaxed),
@@ -710,11 +1003,15 @@ impl Server {
                                 Connection: close\r\n\r\n";
                     sock.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
                     let mut text = String::new();
+                    let t0 = Instant::now();
                     let (n, finish) = self.generate(&ids, max_new, s, |piece, _| {
                         text.push_str(piece);
                         let line = json!({"model": self.model_id, "response": piece, "done": false});
                         sock.write_all(format!("{line}\n").as_bytes()).is_ok()
                     })?;
+                    self.stats.prompt_tokens.fetch_add(n_prompt as u64, Relaxed);
+                    self.stats.generated.fetch_add(n as u64, Relaxed);
+                    self.stats.busy_ns.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
                     let last = json!({"model": self.model_id, "response": "", "done": true,
                                       "done_reason": finish, "prompt_eval_count": n_prompt,
                                       "eval_count": n});
@@ -722,10 +1019,14 @@ impl Server {
                     return Ok(());
                 }
                 let mut text = String::new();
+                let t0 = Instant::now();
                 let (n, finish) = self.generate(&ids, max_new, s, |piece, _| {
                     text.push_str(piece);
                     true
                 })?;
+                self.stats.prompt_tokens.fetch_add(n_prompt as u64, Relaxed);
+                self.stats.generated.fetch_add(n as u64, Relaxed);
+                self.stats.busy_ns.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
                 write_json(sock, 200, &json!({
                     "model": self.model_id, "response": text, "done": true,
                     "done_reason": finish, "prompt_eval_count": n_prompt, "eval_count": n,
@@ -884,6 +1185,109 @@ pub fn serve(srv: Arc<Server>, host: &str, port: u16) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// Drive the marker machine with the pieces a turn would decode. Index 0 of
+    /// the result is the content channel, index 1 the reasoning channel.
+    fn channels(pieces: &[&str]) -> [String; 2] {
+        let mut out = [String::new(), String::new()];
+        {
+            let mut emit = |piece: &str, think: bool| {
+                out[usize::from(think)].push_str(piece);
+                true
+            };
+            let mut split = ThinkSplit { emit: &mut emit, pending: String::new(), think: false };
+            for p in pieces {
+                assert!(split.push(p), "a sink that keeps going never ends the turn");
+            }
+            split.finish();
+        }
+        out
+    }
+
+    #[test]
+    fn pieces_without_markers_all_go_to_content() {
+        let [content, reasoning] = channels(&["Hello", " wor", "ld"]);
+        assert_eq!((content.as_str(), reasoning.as_str()), ("Hello world", ""));
+    }
+
+    #[test]
+    fn a_block_whose_markers_straddle_pieces_still_routes() {
+        // A token can end anywhere inside a marker, so neither one arrives whole.
+        let [content, reasoning] =
+            channels(&["answer <t", "hink>", "because", "</th", "ink>", " done"]);
+        assert_eq!((content.as_str(), reasoning.as_str()), ("answer  done", "because"));
+    }
+
+    #[test]
+    fn a_marker_split_three_ways_still_routes() {
+        let [content, reasoning] =
+            channels(&["a<t", "hin", "k>b", "c</th", "ink>"]);
+        assert_eq!((content.as_str(), reasoning.as_str()), ("a", "bc"));
+    }
+
+    #[test]
+    fn a_prefix_of_a_marker_is_withheld_until_a_piece_settles_it() {
+        // Emitted as it goes, not merged at the end: streamed, a client would see
+        // "a<t" appear in content and then never be taken back.
+        let mut seen: Vec<(String, bool)> = Vec::new();
+        {
+            let mut emit = |piece: &str, think: bool| {
+                seen.push((piece.to_string(), think));
+                true
+            };
+            let mut split = ThinkSplit { emit: &mut emit, pending: String::new(), think: false };
+            for p in ["a<", "thi", "nk>b"] {
+                assert!(split.push(p));
+            }
+            split.finish();
+        }
+        assert_eq!(seen, vec![("a".to_string(), false), ("b".to_string(), true)]);
+    }
+
+    #[test]
+    fn a_marker_the_model_never_finishes_is_released_as_text() {
+        // One character short of the opener is a prefix of it, so the machine
+        // holds it back waiting for a piece that never comes. The end of the turn
+        // settles it: it was literal text all along.
+        let [content, reasoning] = channels(&["text", "<think"]);
+        assert_eq!((content.as_str(), reasoning.as_str()), ("text<think", ""));
+    }
+
+    #[test]
+    fn an_unclosed_block_stays_reasoning_to_the_end() {
+        let [content, reasoning] = channels(&["<think>", "hmm"]);
+        assert_eq!((content.as_str(), reasoning.as_str()), ("", "hmm"));
+    }
+
+    #[test]
+    fn a_opener_inside_a_block_is_reasoning_not_a_second_depth() {
+        // While inside, only the closer is searched, so a stray opener is text and
+        // the closer that follows ends the one block there is.
+        let [content, reasoning] = channels(&["<think>", "a<think>b", "</think>", "c"]);
+        assert_eq!((content.as_str(), reasoning.as_str()), ("c", "a<think>b"));
+    }
+
+    #[test]
+    fn a_closer_with_no_opener_stays_content() {
+        // Flipping on an unmatched closer would send the whole reply to reasoning
+        // and leave the client an empty message.
+        let [content, reasoning] = channels(&["x</think>y"]);
+        assert_eq!((content.as_str(), reasoning.as_str()), ("x</think>y", ""));
+        let [content, reasoning] = channels(&["a", "</think", "b"]);
+        assert_eq!((content.as_str(), reasoning.as_str()), ("a</thinkb", ""));
+    }
+
+    #[test]
+    fn a_sink_that_hangs_up_ends_the_turn_once() {
+        let mut calls = 0;
+        let mut emit = |_: &str, _: bool| {
+            calls += 1;
+            false
+        };
+        let mut split = ThinkSplit { emit: &mut emit, pending: String::new(), think: false };
+        assert!(!split.push("first"));
+        assert_eq!(calls, 1, "the piece the client refused is not retried");
+    }
+
     #[test]
     fn bearer_survives_header_and_scheme_case() {
         // The whole header block used to be lowercased before this check, which
@@ -916,6 +1320,40 @@ mod tests {
         let logits = [0.1, 9.0, -3.0, 2.0];
         let s = Sample { temperature: 0.0, ..Sample::default() };
         assert_eq!(s.pick(&logits, &[], &mut 1), 1);
+    }
+
+    #[test]
+    fn the_drafter_and_the_sampler_have_one_argmax() {
+        // Speculation is lossless only while the acceptance test is this function's
+        // own rule, and `mtp::argmax` is a second copy of that rule. So the two are
+        // cross-checked here rather than each tested alone: same winner, including
+        // on an exact tie, where the loop that breaks first-by-strict-greater is
+        // what makes index 1 win `[1, 7, 7, 7]` and an all-equal row return 0.
+        let s = Sample { temperature: 0.0, ..Sample::default() };
+        for logits in [
+            vec![0.1, 9.0, -3.0, 2.0],
+            vec![1.0, 7.0, 7.0, 7.0],
+            vec![4.0],
+            vec![-2.0, -2.0, -5.0],
+            vec![f32::NEG_INFINITY; 5],
+        ] {
+            assert_eq!(s.pick(&logits, &[], &mut 1), crate::mtp::argmax(&logits), "{logits:?}");
+        }
+    }
+
+    #[test]
+    fn a_repeat_penalty_puts_the_sampler_outside_the_argmax() {
+        // The gate on `Spec` is not caution about floating point: with a penalty the
+        // next token depends on the sequence, so the block cannot be checked against
+        // the logits the sequential loop would have used. Damping happens before the
+        // scan, so `pick` and `mtp::argmax` part ways on the same row - which is
+        // exactly the disagreement a round would have to reject a correct draft over.
+        let mut logits = vec![0.0f32; 8];
+        logits[3] = 2.0;
+        logits[4] = 1.9;
+        let s = Sample { temperature: 0.0, repeat_penalty: 1.2, ..Sample::default() };
+        assert_eq!(s.pick(&logits, &[3], &mut 1), 4);
+        assert_eq!(crate::mtp::argmax(&logits), 3);
     }
 
     #[test]
@@ -972,21 +1410,23 @@ mod tests {
     }
 
     #[test]
-    fn text_parts_join_and_an_image_part_refuses_to_be_ignored() {
+    fn text_and_local_image_parts_are_parsed_without_silent_loss() {
         let plain = json!({"messages": [{"role": "user", "content": [
             {"type": "text", "text": "look at "}, {"type": "input_text", "text": "this"}]}]});
-        assert_eq!(Server::messages(&plain).unwrap(),
-                   vec![("user".to_string(), "look at this".to_string())]);
+        let parsed = Server::messages(&plain).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert!(matches!(&parsed[0].1[..], [ChatPart::Text(text)] if text == "look at this"));
 
-        for image in [
-            json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}),
-            json!({"type": "input_image", "url": "data:image/png;base64,AAAA"}),
-        ] {
-            let body = json!({"messages": [{"role": "user", "content": [
-                {"type": "text", "text": "what is in this?"}, image]}]});
-            let error = Server::messages(&body).unwrap_err();
-            assert!(error.contains("analyzes no images"), "{error}");
-        }
+        let image = json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is in this?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}]});
+        let parsed = Server::messages(&image).unwrap();
+        assert!(matches!(&parsed[0].1[..], [ChatPart::Text(_), ChatPart::Image(bytes)] if bytes == &[0, 0, 0]));
+
+        let unsupported = json!({"messages": [{"role": "user", "content": [
+            {"type": "input_image", "url": "data:image/png;base64,AAAA"}]}]});
+        let error = Server::messages(&unsupported).unwrap_err();
+        assert!(error.contains("unsupported"), "{error}");
     }
 
     #[test]

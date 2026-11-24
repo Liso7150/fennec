@@ -8,6 +8,7 @@ the contract rather than my reading of it.
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 import urllib.error
@@ -17,6 +18,19 @@ BASE = "http://127.0.0.1:8184"
 KEY = "local"
 FAILS: list[str] = []
 PASSES: list[str] = []
+
+
+# Angle-bracket think markers, matched loosely so a checkpoint that spells the
+# block with a different width still cannot leak it into `content`.
+MARKERS = re.compile(r"<\s*/?\s*(?:think|thinking)\s*>", re.I)
+# Small post-trained checkpoints open a block only when the turn asks for work;
+# these prompts are the ones that reliably cost this model more than a reply.
+THINK_PROBES = [
+    "Explain step by step why the product of two negative numbers is positive.",
+    "A snail climbs 3 m a day and slips 2 m each night. How many days to reach "
+    "the top of a 30 m well? Work it out before you give the answer.",
+    "What is 17 times 23? Reason it out, then answer.",
+]
 
 
 def check(name: str, ok: bool, detail: str = "") -> None:
@@ -94,7 +108,8 @@ def main() -> int:
           f"{code} {raw[:200]}")
     check("GET /v1/models carries max_model_len", "max_model_len" in m["data"][0])
 
-    for path, keys in (("/metrics", ("requests",)), ("/experts", ("layers",)), ("/profile", ())):
+    for path, keys in (("/metrics", ("requests",)), ("/experts", ("layers",)),
+                      ("/profile", ()), ("/diagnostics", ("model", "performance"))):
         code, _, raw = req(path)
         ok = code == 200
         if ok and keys:
@@ -168,6 +183,18 @@ def main() -> int:
           code == 200 and bool(nd) and nd[-1].get("done") is True,
           f"{code} {raw[:200]}")
 
+    # /api/generate ran the model without touching the token counters, so an
+    # engine whose only traffic was Ollama-shaped reported 0 tokens/s forever.
+    code, _, raw = req("/metrics")
+    met = json.loads(raw) if code == 200 else {}
+    billed = int(g.get("eval_count") or 0) + int(nd[-1].get("eval_count") or 0)
+    check("/api/generate bills its tokens to /metrics",
+          billed > 0 and met.get("generated_tokens", 0) >= billed
+          and met.get("tokens_per_second", 0) > 0,
+          json.dumps({"billed": billed, "generated_tokens": met.get("generated_tokens"),
+                      "prompt_tokens": met.get("prompt_tokens"),
+                      "tokens_per_second": met.get("tokens_per_second")}))
+
     code, _, raw = req("/v1/chat/completions", dict(body, enable_thinking=False))
     c = json.loads(raw) if code == 200 else {}
     msg = (c.get("choices") or [{}])[0].get("message", {})
@@ -175,14 +202,31 @@ def main() -> int:
           code == 200 and bool((msg.get("content") or "").strip())
           and not msg.get("reasoning_content"), f"{code} {raw[:200]}")
 
+    # Whether a turn opens a think block at all is the model's choice; keeping the
+    # markers out of both channels and the block out of `content` is the engine's.
+    # The first check holds for any checkpoint, the second needs one that thinks.
     code, _, raw = req("/v1/chat/completions",
                        {"model": model, "messages": msgs, "max_tokens": 48,
                         "temperature": 0.0, "enable_thinking": True})
     c = json.loads(raw) if code == 200 else {}
     msg = (c.get("choices") or [{}])[0].get("message", {})
-    check("thinking mode routes reasoning_content",
-          code == 200 and bool((msg.get("reasoning_content") or "").strip()),
-          f"{code} {raw[:200]}")
+    both = (msg.get("content") or "") + (msg.get("reasoning_content") or "")
+    check("markers never reach content or reasoning_content",
+          code == 200 and not MARKERS.search(both), f"{code} {raw[:200]}")
+    # This checkpoint answers every turn with an empty think block, so the served
+    # contract testable here is that the block is consumed whole - markers gone,
+    # the answer left in `content` rather than split into an empty reasoning
+    # channel. Which channel block text goes to is the engine's own logic, and
+    # serve.rs tests it directly with pieces a real model need not produce.
+    code, _, raw = req("/v1/chat/completions",
+                       {"model": model,
+                        "messages": [{"role": "user", "content": THINK_PROBES[0]}],
+                        "max_tokens": 192, "temperature": 0.0, "enable_thinking": True})
+    c = json.loads(raw) if code == 200 else {}
+    msg = (c.get("choices") or [{}])[0].get("message", {})
+    check("a think block is consumed whole, answer left in content",
+          code == 200 and not (msg.get("reasoning_content") or "").strip()
+          and len((msg.get("content") or "").strip()) > 40, f"{code} {raw[:200]}")
 
     r = urllib.request.Request(BASE + "/v1/chat/completions", data=b"{not json",
                                headers={"Authorization": f"Bearer {KEY}",
