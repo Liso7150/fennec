@@ -225,11 +225,33 @@ impl Shards {
                     return Err(format!("{}: {k} claims bytes {o0}..{o1} past the {}-byte file", path.display(), mmap.len()));
                 }
                 let dtype = DType::parse(v.get("dtype").and_then(|d| d.as_str()).unwrap_or(""))?;
-                let shape = v
+                let dims = v
                     .get("shape")
                     .and_then(|s| s.as_array())
-                    .map(|a| a.iter().filter_map(|x| x.as_u64()).map(|x| x as usize).collect())
-                    .unwrap_or_default();
+                    .ok_or_else(|| format!("{k}: no shape"))?;
+                let mut shape = Vec::with_capacity(dims.len());
+                let mut elems = 1usize;
+                for dim in dims {
+                    let dim = dim
+                        .as_u64()
+                        .and_then(|d| usize::try_from(d).ok())
+                        .ok_or_else(|| format!("{k}: invalid shape dimension"))?;
+                    elems = elems
+                        .checked_mul(dim)
+                        .ok_or_else(|| format!("{k}: shape element count overflows usize"))?;
+                    shape.push(dim);
+                }
+                let bytes = elems
+                    .checked_mul(dtype.size())
+                    .ok_or_else(|| format!("{k}: tensor byte count overflows usize"))?;
+                if bytes != o1 - o0 {
+                    return Err(format!(
+                        "{}: {k} shape {dtype:?} {:?} needs {bytes} bytes, but data_offsets span {}",
+                        path.display(),
+                        shape,
+                        o1 - o0
+                    ));
+                }
                 // a tensor only belongs to this dir if the index says so, or there is no index
                 infos.insert(
                     k.clone(),
@@ -528,6 +550,29 @@ mod tests {
         out.extend_from_slice(&[0u8; 16]);
         std::fs::write(&p, out).unwrap();
         assert!(Shards::open(&d).is_err(), "payload past EOF");
+
+        let cases: &[(&[u8], &str)] = &[
+            (
+                br#"{"a":{"dtype":"F32","shape":[5],"data_offsets":[0,16]}}"#,
+                "needs 20 bytes",
+            ),
+            (
+                br#"{"a":{"dtype":"F32","shape":["4"],"data_offsets":[0,16]}}"#,
+                "invalid shape dimension",
+            ),
+            (
+                br#"{"a":{"dtype":"F32","shape":[18446744073709551615,2],"data_offsets":[0,16]}}"#,
+                "overflows usize",
+            ),
+        ];
+        for (json, expected) in cases {
+            let mut out = (json.len() as u64).to_le_bytes().to_vec();
+            out.extend_from_slice(json);
+            out.extend_from_slice(&[0u8; 16]);
+            std::fs::write(&p, out).unwrap();
+            let error = Shards::open(&d).err().expect("malformed shape must fail");
+            assert!(error.contains(expected), "{error}");
+        }
 
         std::fs::remove_dir_all(&d).ok();
     }
