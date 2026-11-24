@@ -1,15 +1,15 @@
 ![Fennec](docs/hero.png)
 
-**A high-performance LLM inference engine written in Rust, supporting Qwen3.5-MoE and Edge0-145B models with Vulkan, CUDA, Metal, and ONNX Runtime backends.**
+**A high-performance LLM inference engine written in Rust, running Qwen3.5/3.6 MoE, dense Qwen3 and Edge0-family latent-MoE checkpoints with Vulkan, CUDA, Metal, and ONNX Runtime backends.**
 
-Fennec replaces multiple inference engines with one codebase: raw Vulkan through `vulkan-1.dll`, CUDA through the driver API with hand-written PTX, Metal via MoltenVK, and ONNX Runtime for portability. Features int4 quantization, four-tier expert routing (device/NPU/host/cold), batched GPU prefill with grouped expert union, and an OpenAI-compatible HTTP API.
+Fennec replaces multiple inference engines with one codebase: raw Vulkan through `vulkan-1.dll`, CUDA through the driver API with hand-written PTX, Metal via MoltenVK, and ONNX Runtime for portability. Features int4 quantization, three-tier expert routing (device/host/disk), batched GPU prefill with grouped expert union, and an OpenAI-compatible HTTP API.
 
 ## Features
 
 - **Multi-backend support**: Vulkan, CUDA, Metal, ONNX Runtime, and CPU
-- **Model support**: Qwen3.5-MoE (30B-A3B) and Edge0-145B architectures
+- **Model support**: Qwen3.5-MoE (30B-A3B) and Qwen3.6-35B-A3B, dense `qwen3_5` / `qwen3` checkpoints, and Edge0-family latent MoE read from the converted int4 container — raw Edge0 NVFP4 GGUF is not a loadable path
 - **Int4 quantization**: Hand-written quantizer with group-64 amax scaling
-- **Four-tier expert routing**: Hot experts in VRAM, warm experts on NPU, system RAM, or cold on NVMe
+- **Three-tier expert routing**: Hot experts in VRAM, warm experts in system RAM with zero-copy borrow, cold experts streamed from NVMe
 - **Batched GPU prefill**: Grouped expert union reduces repeated expert reads; the served path is enabled only on the backend where measurement supports it
 - **Plugin architecture**: Extensible system for backends, models, tokenizers, and servers
 - **OpenAI-compatible API**: `/v1/chat/completions`, `/v1/models`, streaming SSE
@@ -45,21 +45,22 @@ fennec bench     # Run benchmarks
 fennec decode    # Decode a single prompt
 fennec run       # Interactive REPL
 fennec serve     # Start HTTP server
-fennec help      # Show help
+fennec --help    # Show help (also `help`, `-h`)
+fennec --version # Print the version (also `version`, `-V`, `-v`)
 ```
 
 ## Architecture
 
-![Four-tier expert routing architecture](docs/architecture.png)
+![Three-tier expert routing architecture](docs/architecture.png)
 
-**CPU, GPU, and NPU run concurrently.** The device tier holds hot experts in VRAM (FQ4 format over SPIR-V or PTX), the NPU tier holds warm experts in dedicated AI accelerator memory (Intel AI Boost via OpenVINO), the host pool holds warm experts in system RAM with zero-copy borrow, and cold experts stream from NVMe on demand.
+**The device and host tiers run concurrently.** The device tier holds hot experts in VRAM (FQ4 format over SPIR-V or PTX), the host pool holds warm experts in system RAM with zero-copy borrow, and cold experts stream from NVMe on demand. There is no NPU tier: `src/sched.rs:19` names exactly three (`Device`, `Host`, `Disk`), because an expert is computed either by Fennec's own device kernels or by its host threads — an accelerator with no expert kernel would hold host experts under a different name, and a plan that priced that tier would read the rate off a device that never does the work.
 
 The routing pipeline:
 1. **Route**: Router picks top-8 of 256 experts per layer
-2. **Bucket**: Picks grouped by residency (device/NPU/host/cold)
+2. **Bucket**: Picks grouped by residency (device/host/disk)
 3. **Execute**: Single `VkBatch` with three barrier-free phases (gate_up → silu_mul → down)
 4. **Reduce**: `moe_reduce` kernel weighted-sums top-k slots and shared expert
-5. **Overlap**: NPU experts, host experts, and disk fetches run while device is busy
+5. **Overlap**: Host experts and disk fetches run while the device is busy
 
 ### Batched GPU Prefill
 
@@ -219,7 +220,7 @@ A missing column is not a tie. These were attempted and could not run on this bo
 | **AMD** | ✅ Supported | Same Vulkan code path, no vendor extensions |
 | **Apple Silicon** | ✅ Compile-verified | Metal via MoltenVK, SPIR-V runs unchanged |
 | **Intel Arc iGPU** | ✅ Enumerated | Ranked below dGPU by planner |
-| **Intel NPU** | ✅ OpenVINO | DirectML refused, OpenVINO measured working |
+| **Intel NPU** | ⚠️ Detected, no expert lane | DirectML refused (0x887a0004); OpenVINO runs dense projections as an ONNX Runtime provider, but no NPU expert kernel exists, so warm experts stay in the host tier |
 | **CPU** | ✅ Measured | AVX2 int4, 22+ logical cores |
 
 ### Backend Selection
@@ -239,7 +240,7 @@ fennec serve --cpu --model <model-dir>          # CPU-only
 
 ## ONNX Runtime Integration
 
-ORT runs dense F16 projections (lm_head, delta-net, attention, shared expert, router gate) as ONNX MatMul graphs on accelerators without hand-written kernels. The int4 routed experts and four-tier residency stay on Fennec's own kernels.
+ORT runs dense F16 projections (lm_head, delta-net, attention, shared expert, router gate) as ONNX MatMul graphs on accelerators without hand-written kernels — DirectML, OpenVINO or CoreML per vendor (`src/ort.rs:284`). The int4 routed experts and three-tier residency stay on Fennec's own kernels.
 
 ```bash
 # Use ORT backend for portability
@@ -252,7 +253,7 @@ fennec serve --backend ort --model <model-dir>
 ## Testing
 
 ```bash
-# Run all tests (220 passing)
+# Run all tests (224 passing)
 cargo test --release --offline
 
 # Backend-specific tests
@@ -266,7 +267,7 @@ FENNEC_GOLDEN_MODEL=<model-dir> cargo test --release --offline --test golden
 python tools/smoke_serve.py  # 30 checks against running server
 ```
 
-**Test coverage**: 220 passed, 0 failed, 6 ignored across 11 suites
+**Test coverage**: 224 passed, 0 failed, 6 ignored across 12 suites
 - `src/` unit tests: quantizer, kernels, auth, samplers, device discovery, memory
 - golden tests against the pinned transformers 5.22.2 reference (`tests/golden.rs`)
 - device-vs-CPU integration tests (`tests/gpu.rs`, run once per backend)
@@ -350,7 +351,7 @@ Fennec includes a BPE tokenizer id-for-id identical to Hugging Face:
 > - **Planner optimism**: Bytes-only pricing doesn't model DRAM-resident expert compute
 > - **CUDA moe_reduce**: CUDA path lacks phase-batched `moe_reduce` kernel (uses per-expert chain)
 > - **Apple Metal**: Compile-verified but not performance-measured
-> - **NPU DirectML**: Refused by driver; use OpenVINO backend instead
+> - **NPU**: DirectML refuses the AI Boost (0x887a0004) and the OpenVINO provider only reaches the dense ONNX projections — no NPU expert kernel exists, so the scheduler has no NPU tier and warm experts stay in system RAM
 > - **Chat template**: Some checkpoints expect a think opener that their template supplies; Fennec currently emits no implicit opener
 > - **Served device prefill**: the batched device path is served on CUDA and withheld on Vulkan, where the same paired run measured it 27.5 ms/prompt-token slower; Vulkan keeps the per-token path
 
