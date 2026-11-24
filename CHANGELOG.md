@@ -4,25 +4,14 @@ All notable changes to fennec, the native Rust LLM inference engine that runs
 Qwen3.5/3.6 MoE, dense Qwen3 and Edge0-family latent-MoE checkpoints over
 Vulkan, CUDA, Metal, ONNX Runtime and CPU backends.
 
-This repo publishes no tags and no releases — `git tag` lists none, and GitHub
-has no release for `Liso7150/fennec`. The version number below is therefore a
-commit date range, not a tag date range: history begins 2026-11-13 (`a772431`)
-and head is 2026-11-24 (77 commits). The published `v0.1.0` … `v0.9.0` ladder
-lives in the suite repos, whose newest release is `v0.9.0` (2026-11-11); the
-engine binary is built from source. One commit subject carries a `2.5.0` number
-(`a772431`, "three-tier Rust MoE engine"): that ladder was retired before
-publishing, exists only as local tags in other repos, and never applied here — so
-the subject is quoted as a literal message, not as a release.
+Version 1.0.0 is published as `v1.0.0`. Earlier engine history was source-only; the `v0.1.0` … `v0.9.0` ladder belongs to the suite products. Dates below are commit dates unless a release date is shown. A commit subject carrying `2.5.0` is quoted as a literal historical message, not as a release.
 
-## [Unreleased] — 1.0.0 in preparation
-
-Nothing at 1.0.0 is published. This repo publishes no tags and no releases
-(verified 2026-11-24 with `git tag` and `gh release list --repo Liso7150/fennec`,
-both empty).
-Measured on the working tree: **224 passed, 0 failed** — the results hub in the
+## [1.0.0] - 2026-11-24
+Version 1.0.0 is the current release.
+Measured on the working tree: **234 passed, 0 failed** — the results hub in the
 suite checkout (`benchmarks/artifacts/hub/RESULTS.json`, `updated_at`
-2026-11-24T07:29:28Z) lists this repo's lane as status `measured`, 224 passed,
-0 failed. The README records the same run as 224 passed, 0 failed, 6 ignored
+2026-11-24T13:27:28Z) lists this repo's lane as status `measured`, 234 passed,
+0 failed. The README records the same run as 234 passed, 0 failed, 6 ignored
 across 12 suites for `cargo test --release --offline`. `Cargo.toml`
 says `version = "1.0.0"`, edition 2024, `rust-version = 1.85`.
 
@@ -43,10 +32,12 @@ says `version = "1.0.0"`, edition 2024, `rust-version = 1.85`.
   `input_router_plugin`, `model_router_plugin`, `research_router_plugin`, and an
   expanded `tokenizer_plugin`, registered through `src/plugin.rs` (`61dbebd`,
   `34767ca`)
-- `src/updater.rs`: update checks driven from `src/main.rs`. Because this repo
-  publishes nothing, the stable channel rides the git fetch path against
-  `Liso7150/fennec`; the `/releases/latest` query it still carries is inert
-  (`eac405e`, reworked in `e1f1614`)
+- Tag-triggered Windows/macOS/Linux release packaging publishes updater-compatible
+  `fennec-<os>-<arch>` binaries and basename-only `SHA256SUMS`; Windows assets are
+  explicitly unsigned because SAC remains off
+- `src/updater.rs`: stable binary installation now requires the exact checksums
+  asset, one exact basename entry, a 64-hex digest and a matching hash before the
+  current executable is replaced; the experimental channel follows `master`
 - Profiler stage splits: prefill stages broken out so chunk cost is attributable
   (`5e919ae`), and `MIXER_DEV` split into upload / compute / readback (`893dd75`);
   the stage profiler is billed on decode steps rather than prompt passes
@@ -114,6 +105,9 @@ says `version = "1.0.0"`, edition 2024, `rust-version = 1.85`.
   rewritten by `python benchmarks/results.py sync`
 
 ### Fixed
+- Safetensors headers now prove that each declared shape and dtype exactly span
+  its `data_offsets` byte range, with checked element/byte arithmetic; malformed,
+  overflowing and truncated tensors are rejected before loading
 - GPU serve deadlock on the first request: `prefill_device` held the GPU mutex
   across the layer loop while the device-expert fallback re-locked it inside
   `forward`; the device tier now prefills token by token (`ca8c963`)

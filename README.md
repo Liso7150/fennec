@@ -1,4 +1,4 @@
-![Fennec](docs/hero.png)
+![Fennec 1.0.0 — a native Rust inference engine for Qwen3.5/3.6 MoE, dense Qwen3, and converted Edge0 checkpoints, with Vulkan, CUDA, Metal, optional ONNX Runtime, and CPU backends. 234 tests passed and 6 ignored; Windows, macOS, Linux.](docs/hero.png)
 
 **A high-performance LLM inference engine written in Rust, running Qwen3.5/3.6 MoE, dense Qwen3 and Edge0-family latent-MoE checkpoints with Vulkan, CUDA, Metal, and ONNX Runtime backends.**
 
@@ -6,15 +6,16 @@ Fennec replaces multiple inference engines with one codebase: raw Vulkan through
 
 ## Features
 
-- **Multi-backend support**: Vulkan, CUDA, Metal, ONNX Runtime, and CPU
+- **Multi-backend support**: Vulkan, CUDA, Metal, optional ONNX Runtime, and CPU
 - **Model support**: Qwen3.5-MoE (30B-A3B) and Qwen3.6-35B-A3B, dense `qwen3_5` / `qwen3` checkpoints, and Edge0-family latent MoE read from the converted int4 container — raw Edge0 NVFP4 GGUF is not a loadable path
 - **Int4 quantization**: Hand-written quantizer with group-64 amax scaling
 - **Three-tier expert routing**: Hot experts in VRAM, warm experts in system RAM with zero-copy borrow, cold experts streamed from NVMe
 - **Batched GPU prefill**: Grouped expert union reduces repeated expert reads; the served path is enabled only on the backend where measurement supports it
+- **MTP speculative decoding**: The 1.0.0 code reads the checkpoint's `mtp.*` block behind `--mtp N`; greedy host-tier decoding is supported, while device-tier speculation remains gated off after measurement
 - **Plugin architecture**: Extensible system for backends, models, tokenizers, and servers
 - **OpenAI-compatible API**: `/v1/chat/completions`, `/v1/models`, streaming SSE
 - **Zero-copy cold start**: Memory-mapped expert pool with borrowed nibbles
-- **Cross-platform**: Windows, Linux, macOS (full suite runs in CI on all three)
+- **Cross-platform**: Windows, Linux, macOS; release builds and unit/synthetic tests run in CI on all three
 - **Offline build**: No toolkit required, SPIR-V shaders checked in
 
 ## Quick Start
@@ -32,6 +33,29 @@ fennec serve --cpu --threads 8 --model <model-dir>
 
 > [!IMPORTANT]
 > `--auto-tier` (or `--gpu N`) enables the device tier. Without a tier flag, the engine loads CPU-only. Use `--host` for bind address and `--host-gb` for system-RAM expert pool size. Non-loopback binds require `--allow-remote` (no TLS, model lives in RAM).
+>
+> The default build does not include ONNX Runtime. ORT is optional: build with `cargo build --release --features ort --offline` before using `--backend ort`.
+
+## Model format
+
+The supported Qwen serving path is a safetensors checkpoint or a Fennec-converted int4
+container. The suite can provision the Fennec-ready `Liso/qwen36-35b-colibri` checkpoint
+(22.78 GiB) into `<models-root>/qwen36-35b`:
+
+```bash
+fennec setup --yes --download-model
+fennec serve --auto-tier --model <models-root>/qwen36-35b --host 127.0.0.1 --port 8184
+```
+
+The loader memory-maps safetensors shards and validates each file before inference. It checks
+the header length and JSON object, supported dtype, shape dimensions, element-count and byte-count
+overflow, start/end ordering within each tensor's `data_offsets`, and the exact byte span implied
+by shape and dtype.
+Malformed or truncated shards fail with an error; loading does not use pickle deserialization.
+
+GGUF is not the supported Qwen serving path. Raw Edge0 NVFP4 GGUF is not loadable; Edge0 uses
+the converted int4 container. Packed Edge0 weights with separate `.scales` or `.biases` require
+conversion before serving.
 
 ## Available Commands
 
@@ -118,11 +142,35 @@ Two protocols appear here and they answer different questions:
 | CPU decode | `2026-11-21T01:39:40Z` | **143.6 ms/token** | Colibri 169.4 ms/token | **Fennec faster** - 15.2% median gap against a 14.6% run-to-run spread, ahead in 4 of 4 paired rounds |
 | Vulkan decode | `2026-11-21T20:22:21Z` | **67.6 ms/token** | Colibri 58.4 ms/token | **behind** - 15.7% median gap against a 5.0% run-to-run spread, 4 of 4 paired rounds to Colibri; coverage is counted now, and it does not carry this gap. The harness snapshots each engine's expert counters per visit: Fennec answers a median of 20,514 of 31,040 routed picks on the card (66.1%, `results-backend-matrix.vulkan-experts-2026-11-21T2122Z.json`; 66.4% in the paired session below), where Colibri's log accounts `device 23503 of 33600 routed experts (69.9%)`. Each engine counts its own turn, so the percentages compare and the counts do not - and #486 priced the points instead of allocating the host bill to them: one binary, four device budgets, 1,597 slots against 1,230 (7.7 coverage points) worth 0.254 ms/token, orders disagreeing, inside that session's own 2.23 ms reference-arm spread (benchmarks/artifacts/raw/ab-2026-11-21-devbudget-vulkan/). So the 3.5 points between these engines cost under 0.3 ms, and #471 (the int8 trunk Colibri buys slots with: `362 matrices resident, 1863.9 MiB; placed int8 291` against Fennec's f16 `dense 68.2 MiB/layer`) is worth doing for the smaller trunk reads (#470), never for the coverage. The direct proof: three Fennec builds in ONE session. The Vulkan int4 gemv rewrite (`b4715b4`) is worth +18.341 ms/token over the commit before it (`e4d0ec9`) - 4 of 4 rounds, both orders agreed, pick counts 8 apart out of 31,040 - and the 35 commits after it -0.246 ms, split 2 of 2 (benchmarks/artifacts/raw/ab-2026-11-21-gemvq4-vulkan/; the 41-commit pair, 67.460 against 81.841, is in ab-2026-11-21-binaries-vulkan/). Nor is it the card the plan committed (#460), which #486 prices at 0.254 ms for 367 slots. Both retire this row's other candidate, that Fennec fell 17.9% since the 57.302 session: that tree already carried the kernel - its own artifact says `postkernel`, committed 3h18m later - and it reads 65.8-68.9 today. What is left is per-pass cost and concurrency: Colibri hides its host lane (`waited 123.3 ms (91% of device time hidden)`) while Fennec's plan bills 14.31 ms of cpu lane with 1.19 ms of it concurrent (#437), and the kernels underneath both lanes are the Vulkan f16 gemv and f32 GDN residual of #472. |
 | Served time to first token (device tier) | `2026-11-21T20:22:21Z` | **1.992 s** | Colibri 0.797 s | **behind** - 149.9% median gap against a 9.7% run-to-run spread, 4 of 4 paired rounds to Colibri; the prompt still goes through this tier one token at a time, and that is a measured choice: the batched device chunk served on CUDA (8.1-8.4 ms off every prompt token at 34, 126 and 531 tokens, both orders) lost the identical run on Vulkan by 27.5 ms per prompt token at the served length, +0.730 s in one order and +0.987 s in the other, with its decode step unmoved (benchmarks/artifacts/raw/ab-2026-11-21-prefill-201-vulkan/picklevel.json), so `Model::prefill_device_chunked` answers CUDA and not the tier test. Colibri instead runs the prompt as one batched step - its log says `a step of 36 rows` for a 36-token prompt - so each expert it reads serves the whole prompt. Why the chunk pays on SPIR-V what it does not pay through the CUDA driver is not measured. |
-| CUDA decode vs Strata (ctx 8192) | `2026-11-21T20:53:29Z` | **58.9 ms/token** | Strata 38.6 ms/token | **parity, not a win** - 52.7% gap sits inside the 58.6% spread of the same pair (0/4 rounds to Fennec); the gap left after speculation is per-pass cost. #481 priced Strata's drafter at 1.53x - the cell that changed nothing but `--mtp` measured 23.81 ms/token with it and 36.46 without (engine-bench/raw/strata-mtp-attribution.json) - and the drafter is on in this row (`drafts accepted 43 of 44 (length)`, Strata's own accounting), yet the paired cell reads 38.6 ms/token against Fennec's 58.9, i.e. its un-speculated level, over four visits spread 29.5 to 52.3. What is on the table is therefore the host expert read #464 found issue-limited rather than bandwidth-limited, plus a draft block Fennec's own checkpoint already carries unread - 529 `mtp.*` tensors, 0.50 GiB, `mtp_num_hidden_layers: 1` - that no code path uses (#482). Two disclosures: every Strata token came back in `reasoning_content` instead of the answer field, and it needed a `{% generation %}` chat-template pack plus 81.3 s of cold start against Fennec's 28.5 s. The attribution cell ran alone while this row is paired, so its ratio travels and its levels do not. |
+| CUDA decode vs Strata (ctx 8192) | `2026-11-21T20:53:29Z` | **58.9 ms/token** | Strata 38.6 ms/token | **parity, not a win** - 52.7% gap sits inside the 58.6% spread of the same pair (0/4 rounds to Fennec); the gap left after speculation is per-pass cost. #481 priced Strata's drafter at 1.53x - the cell that changed nothing but `--mtp` measured 23.81 ms/token with it and 36.46 without (engine-bench/raw/strata-mtp-attribution.json) - and the drafter is on in this row (`drafts accepted 43 of 44 (length)`, Strata's own accounting), yet the paired cell reads 38.6 ms/token against Fennec's 58.9, i.e. its un-speculated level, over four visits spread 29.5 to 52.3. What is on the table is therefore the host expert read #464 found issue-limited rather than bandwidth-limited, plus Fennec's own draft block, which 1.0.0 now reads: 529 `mtp.*` tensors, 0.50 GiB, `mtp_num_hidden_layers: 1`. Host-tier MTP measured 1.27x faster and lossless; the served CUDA arm was lossless but 1.19x slower, so device tiers stay gated off. Two disclosures: every Strata token came back in `reasoning_content` instead of the answer field, and it needed a `{% generation %}` chat-template pack plus 81.3 s of cold start against Fennec's 28.5 s. The attribution cell ran alone while this row is paired, so its ratio travels and its levels do not. |
 | CUDA decode vs llama.cpp | `2026-11-21T01:39:40Z` | **65.2 ms/token** | llama.cpp 47.9 ms/token | both rows are block medians of the same session, so this is a level difference and not an ABBA verdict; llama.cpp reads a Q4_K_M GGUF of the checkpoint while Fennec reads the suite's int4 container, which is the first thing to hold constant before calling it a kernel gap (open as task #459) |
 
 Every row is re-derived from the ABBA session file it names; the medians are the median of paired visits after two discarded full-length warm-ups, and the spread is the run-to-run range of the same pair on this box. Sources: `results-backend-matrix.abba-2026-11-15T0941Z.json`, `results-backend-matrix.abba-vulkan-postkernel-2026-11-15T1047Z.json`, `results-backend-matrix.abba-2026-11-21T0139Z.json`, `results-backend-matrix.abba-2026-11-21T1655Z.json`, `results-backend-matrix.blocked-2026-11-21T1830Z.json`, `results-backend-matrix.abba-vulkan-tokengate-2026-11-21T2022Z.json`, `results-backend-matrix.abba-cuda-chunk-2026-11-21T2053Z.json`.
 <!-- /fennec-results:bench -->
+
+### MTP speculative decoding
+
+MTP is implemented in the 1.0.0 code and available through `--mtp N`. It reads the
+checkpoint's `mtp.*` block, proposes drafts, and verifies them in one trunk pass.
+It is greedy-only: temperature or a repetition penalty disables speculation for
+that turn.
+
+- **Host tier — supported.** The 2026-11-23 ABBA attribution changed only `--mtp`:
+  116.198 ms/token without drafts against 91.762 with `--mtp 2`, a **1.27x speedup**.
+  The order was `2, 0, 0, 2`, with loopback HTTP, an 8-thread cap and two discarded
+  warm-ups per arm (`engine-bench/raw/fennec-mtp-attribution.json`, session
+  `2026-11-23T09:25:51Z`).
+- **CUDA device tier — lossless, but gated off.** The pre-gate device implementation
+  was byte-identical to sequential greedy decoding across eight 128-token visits,
+  with a repeated `--mtp 0` control also identical
+  (`engine-bench/raw/fennec-mtp-device-lossless.json`, `2026-11-23T10:15:15Z`). Its
+  valid ABBA arms measured 71.309 ms/token with drafts against 59.897 without, about
+  **1.19x slower** (`engine-bench/raw/fennec-mtp-attribution-cuda.json`,
+  `2026-11-23T10:18:59Z`). The served device path therefore declines `--mtp` rather
+  than trading correctness for a measured regression.
+
+These are attribution sessions, not replacements for the historical paired engine
+rows above. Their ratios travel; their absolute levels do not.
 
 ### Fennec against llama.cpp 1.0.0
 
@@ -181,31 +229,33 @@ A missing column is not a tie. These were attempted and could not run on this bo
   host compiler, neither of which is installed.
 - **Basalt** - needs an NVIDIA Blackwell (sm_120) device, the CUDA 13 runtime and
   `.basalt` packs. This box has sm_89 and no pack exists for either suite model.
-- **Strata** - its `strata.exe` loads `cublas64_13.dll` at start and dies with
-  0xC0000135 without VS 2022 + CUDA Toolkit 13; its shipped launch configs are
-  Edge0-120B/145B only.
+- **Strata** - the old missing-CUDA-runtime blocker is superseded by the measured
+  2026-11-23 session. Its CUDA engine placed **4.40 GiB in 6.9 s** and warmed up in
+  **10.8 s** (`engine-bench/logs/matrix-strata-cuda.engine.log`). This was a hybrid,
+  host-heavy placement, not full device-expert residency: the log reports **0 of 256
+  per-layer experts in VRAM** and all 18.75 GiB in pageable host memory. The recorded
+  4622-token prompt took 80.232 s and generated only eight tokens; the hub records
+  81.3 s cold start against Fennec's 28.5 s, output in `reasoning_content`, and a
+  required `{% generation %}` chat-template pack. The later session proves the cell
+  can run; it does not erase the earlier paired loss (Strata 38.6 against Fennec's
+  58.9 ms/token), whose 52.7% gap remained inside its 58.6% spread — parity, not a win.
 - **Maple** - `deepgrove/maple-preview` is a 20B-A1B ternary MoE *model*, not an
   engine: there is no server to launch and no flag to align with the other rows.
 
-### Still open, measured
+### Measured constraints
 
-- **Served time to first token trails Colibri on the Vulkan tier** (the `loss` row in
-  the table above). The batched device prompt is now wired into `serve` and served where
-  it won: CUDA took 8.1-8.4 ms off every prompt token at 34, 126 and 531 tokens, both
-  orders. Vulkan refused the same chunk in the same script - 27.5 ms per prompt token
-  *slower* at the served length, both orders - so its gate stays on the per-token loop,
-  and that loop pays a full expert read per prompt token. Colibri does not: its own log
-  describes the prompt as one step of 36 rows, so the weight it reads serves 36 tokens.
-  **Why the chunk costs time on SPIR-V and buys it through the CUDA driver is not
-  measured** - that is the open question, and the next TTFT lever on this tier.
-- **The CUDA decode deficit against llama.cpp**, described above.
-- **Kernel headroom on Vulkan**: the device-timing probe
-  `tests/gpu.rs::mixer_kernel_shapes` - `#[ignore]`d, so it runs under
-  `cargo test --release --offline --test gpu -- --ignored`, and it prints rather than
-  asserts, so these are one run's levels rather than a fixed pair - read 1134.1 us for
-  one GDN layer's mixer as seven separate dispatches against 446.4 us as one
-  barrier-free submit on 2026-11-15. Across the 30 GDN layers in a token that is 35.4 ms
-  against 13.4 ms.
+- **Vulkan time to first token trails Colibri.** The batched device prompt is served on CUDA,
+  where it saved 8.1–8.4 ms per prompt token at 34, 126, and 531 tokens in both orders. The same
+  Vulkan run was 27.5 ms per prompt token slower at the served length, so Vulkan keeps the
+  per-token loop and reads a full expert set for each prompt token. The SPIR-V/CUDA difference
+  is not attributed to a measured stage.
+- **CUDA decode trails llama.cpp** in the block comparison above. The compared models use
+  different weight formats, so the gap is a level difference rather than a controlled kernel
+  verdict.
+- **Vulkan mixer dispatch has measured headroom.** The ignored
+  `tests/gpu.rs::mixer_kernel_shapes` probe read 1134.1 µs for one GDN layer as seven dispatches
+  against 446.4 µs as one barrier-free submit on 2026-11-15. Across 30 GDN layers, that is
+  35.4 ms against 13.4 ms per token. This is one host run, not a fixed paired result.
 
 > [!NOTE]
 > Quote the paired per-round result, never a level carried over from another session,
@@ -216,12 +266,12 @@ A missing column is not a tie. These were attempted and could not run on this bo
 
 | Device | Status | Notes |
 |--------|--------|-------|
-| **NVIDIA** | ✅ Measured | Vulkan 1.4+ and CUDA, compute capability 8.9+ |
-| **AMD** | ✅ Supported | Same Vulkan code path, no vendor extensions |
-| **Apple Silicon** | ✅ Compile-verified | Metal via MoltenVK, SPIR-V runs unchanged |
-| **Intel Arc iGPU** | ✅ Enumerated | Ranked below dGPU by planner |
-| **Intel NPU** | ⚠️ Detected, no expert lane | DirectML refused (0x887a0004); OpenVINO runs dense projections as an ONNX Runtime provider, but no NPU expert kernel exists, so warm experts stay in the host tier |
-| **CPU** | ✅ Measured | AVX2 int4, 22+ logical cores |
+| **NVIDIA** | Measured | Vulkan 1.4+ and CUDA, compute capability 8.9+ |
+| **AMD** | Supported | Same Vulkan code path, no vendor extensions |
+| **Apple Silicon** | Compile-verified | Metal via MoltenVK, SPIR-V runs unchanged |
+| **Intel Arc iGPU** | Enumerated | Ranked below dGPU by planner |
+| **Intel NPU** | Detected, no expert lane | DirectML refused (0x887a0004); OpenVINO runs dense projections as an ONNX Runtime provider, but no NPU expert kernel exists, so warm experts stay in the host tier |
+| **CPU** | Measured | AVX2 int4, 22+ logical cores |
 
 ### Backend Selection
 
@@ -240,20 +290,21 @@ fennec serve --cpu --model <model-dir>          # CPU-only
 
 ## ONNX Runtime Integration
 
-ORT runs dense F16 projections (lm_head, delta-net, attention, shared expert, router gate) as ONNX MatMul graphs on accelerators without hand-written kernels — DirectML, OpenVINO or CoreML per vendor (`src/ort.rs:284`). The int4 routed experts and three-tier residency stay on Fennec's own kernels.
+ORT is an optional backend, compiled only with the Cargo `ort` feature. It runs dense F16 projections (lm_head, delta-net, attention, shared expert, router gate) as ONNX MatMul graphs on accelerators without hand-written kernels — DirectML, OpenVINO or CoreML per vendor (`src/ort.rs:284`). The int4 routed experts and three-tier residency stay on Fennec's own kernels.
 
 ```bash
-# Use ORT backend for portability
+# Build the optional backend, then use it
+cargo build --release --features ort --offline
 fennec serve --backend ort --model <model-dir>
 ```
 
 > [!IMPORTANT]
-> ORT is integrated for portability, not as a competing engine. The lm_head and dense projections become MatMul sessions; routed experts remain on Fennec's kernels.
+> ORT is integrated for portability, not as a competing engine. A default build has no ORT backend. When enabled, the lm_head and dense projections become MatMul sessions; routed experts remain on Fennec's kernels.
 
 ## Testing
 
 ```bash
-# Run all tests (224 passing)
+# Run all tests (234 passing)
 cargo test --release --offline
 
 # Backend-specific tests
@@ -267,7 +318,7 @@ FENNEC_GOLDEN_MODEL=<model-dir> cargo test --release --offline --test golden
 python tools/smoke_serve.py  # 30 checks against running server
 ```
 
-**Test coverage**: 224 passed, 0 failed, 6 ignored across 12 suites
+**Test coverage**: 234 passed, 0 failed, 6 ignored across 12 suites
 - `src/` unit tests: quantizer, kernels, auth, samplers, device discovery, memory
 - golden tests against the pinned transformers 5.22.2 reference (`tests/golden.rs`)
 - device-vs-CPU integration tests (`tests/gpu.rs`, run once per backend)
@@ -289,7 +340,7 @@ than assuming x86.
 
 ## Build Requirements
 
-- **Rust**: Edition 2021, stable toolchain
+- **Rust**: Edition 2024, stable toolchain
 - **Vulkan**: SDK not required (SPIR-V shaders checked in)
 - **CUDA**: Driver API only (no toolkit, PTX kernels checked in)
 - **Platform**: Windows, Linux, macOS
@@ -383,14 +434,14 @@ Fennec builds on ideas and code from:
 - **[Colibri](https://github.com/JustVugg/colibri)**: Three-tier usage-ranked placement, `.coli_usage` router histogram, `COLI_*` environment, `serve` contract
 - **[fox](https://github.com/ferrumox/fox)**: Map-don't-copy cold start, Rust front-end over Vulkan device tier
 
-## License
+## Release
 
-MIT License - see LICENSE file for details.
+Fennec **1.0.0** is the current release. The version in `Cargo.toml`
+is 1.0.0, and the measured test result for this tree is 234 passed and 6 ignored.
 
-## Version
-
-**1.0.0** - the working version in `Cargo.toml`. Nothing at 1.0.0 has been published:
-this repo carries no tags and no releases, and the published Fennec ladder (`v0.1.0` …
-`v0.9.0`, newest 2026-11-11T19:29Z) lives in the nine suite repos. The test count above
-is generated from the suite's results hub, so it is the current run of
-`cargo test --release --offline` on this tree rather than a remembered one.
+`.github/workflows/engine.yml` builds and tests release binaries on Windows, macOS, and Ubuntu.
+Path-filtered pushes and manual dispatches run verification. A `v1.0.0` tag also packages
+platform-named engine assets, generates and validates `SHA256SUMS`, and publishes those assets
+to the GitHub release. Hosted runners do not carry the GPU or 22.78 GiB checkpoint, so local
+model and performance measurements remain separate from CI. Windows release binaries are
+unsigned, and SAC remains disabled.

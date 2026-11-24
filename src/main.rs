@@ -212,7 +212,7 @@ fn usage() {
          \x20 --dense-i8        one byte per weight for the host dense projections; on by default, --no-dense-i8 restores the exact bf16/f16 dot\n\
          \x20 --host-int2       quantise host-resident experts to int2: 40% of the tier's bytes for ~3% slower decode, opt-in, and a no-op when the tier borrows the file mapping\n\
          \x20 --mtp N           draft N tokens per round from the checkpoint's mtp.* block and verify them in one trunk pass; greedy only, host tier only, 0 turns it off\n\
-         \x20 --experimental    check for updates from main branch instead of releases\n\n\
+         \x20 --experimental    check for updates from master branch instead of releases\n\n\
          model dir: pass --model <dir>, or set FENNEC_MODEL",
         fennec::VERSION
     );
@@ -1932,17 +1932,15 @@ fn update_cmd(opts: &Opts) -> Result<(), String> {
 
     rt.block_on(async {
         if experimental {
-            eprintln!("[update] Checking experimental channel (main branch)...");
+            eprintln!("[update] Checking experimental channel (master branch)...");
             match fennec::updater::check_experimental().await {
                 Ok(Some(release)) => {
                     eprintln!("[update] New commit available: {}", &release.version[..8.min(release.version.len())]);
                     let platform = fennec::updater::Platform::current();
                     let asset_name = platform.asset_name("fennec");
-                    let asset = release.assets.iter().find(|a| a.name == asset_name);
-                    if let Some(asset) = asset {
+                    if release.assets.iter().any(|asset| asset.name == asset_name) {
                         eprintln!("[update] Downloading {}...", asset_name);
-                        let checksum = fennec::updater::checksum_for(&release, &asset_name).await;
-                        match fennec::updater::download_asset(&asset.download_url, checksum.as_deref()).await {
+                        match fennec::updater::download_release_asset(&release, &asset_name).await {
                             Ok(bytes) => {
                                 let temp_path = std::env::temp_dir().join(&asset_name);
                                 std::fs::write(&temp_path, &bytes).map_err(|e| format!("Write: {e}"))?;
@@ -1974,11 +1972,9 @@ fn update_cmd(opts: &Opts) -> Result<(), String> {
                     eprintln!("[update] New version available: {} (current: {})", release.version, current);
                     let platform = fennec::updater::Platform::current();
                     let asset_name = platform.asset_name("fennec");
-                    let asset = release.assets.iter().find(|a| a.name == asset_name);
-                    if let Some(asset) = asset {
+                    if release.assets.iter().any(|asset| asset.name == asset_name) {
                         eprintln!("[update] Downloading {}...", asset_name);
-                        let checksum = fennec::updater::checksum_for(&release, &asset_name).await;
-                        match fennec::updater::download_asset(&asset.download_url, checksum.as_deref()).await {
+                        match fennec::updater::download_release_asset(&release, &asset_name).await {
                             Ok(bytes) => {
                                 let current_exe = std::env::current_exe().map_err(|e| format!("Exe path: {e}"))?;
                                 if cfg!(target_os = "windows") {
